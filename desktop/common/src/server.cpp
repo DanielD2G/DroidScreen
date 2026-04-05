@@ -1,0 +1,189 @@
+/*
+ * DroidScreen Desktop - TCP client implementation
+ */
+
+#include "droidscreen/server.h"
+
+#include <cstring>
+#include <cstdio>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#endif
+
+namespace droidscreen {
+
+#ifdef _WIN32
+bool TCPClient::wsa_initialized_ = false;
+
+bool TCPClient::init_wsa() {
+    if (wsa_initialized_) return true;
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "[tcp] WSAStartup failed: %d\n", WSAGetLastError());
+        return false;
+    }
+    wsa_initialized_ = true;
+    return true;
+}
+#endif
+
+TCPClient::TCPClient() : fd_(kInvalidSocket) {}
+
+TCPClient::~TCPClient() {
+    close();
+}
+
+bool TCPClient::connect(uint16_t port) {
+#ifdef _WIN32
+    if (!init_wsa()) return false;
+#endif
+
+    fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd_ == kInvalidSocket) {
+        fprintf(stderr, "[tcp] socket() failed\n");
+        return false;
+    }
+
+    // Set TCP_NODELAY to disable Nagle's algorithm for low latency.
+    int flag = 1;
+#ifdef _WIN32
+    setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&flag), sizeof(flag));
+#else
+    setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+#endif
+
+    // Set send and receive buffer sizes to 256 KB.
+    int buf_size = 256 * 1024;
+#ifdef _WIN32
+    setsockopt(fd_, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char*>(&buf_size), sizeof(buf_size));
+    setsockopt(fd_, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&buf_size), sizeof(buf_size));
+#else
+    setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+#endif
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr),
+                  sizeof(addr)) != 0) {
+#ifdef _WIN32
+        fprintf(stderr, "[tcp] connect() to 127.0.0.1:%u failed: %d\n",
+                port, WSAGetLastError());
+        closesocket(fd_);
+#else
+        fprintf(stderr, "[tcp] connect() to 127.0.0.1:%u failed: %s\n",
+                port, strerror(errno));
+        ::close(fd_);
+#endif
+        fd_ = kInvalidSocket;
+        return false;
+    }
+
+    fprintf(stderr, "[tcp] connected to 127.0.0.1:%u\n", port);
+    return true;
+}
+
+bool TCPClient::send_all(const void* data, size_t len) {
+    if (fd_ == kInvalidSocket) return false;
+
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    size_t remaining = len;
+
+    while (remaining > 0) {
+#ifdef _WIN32
+        int sent = ::send(fd_, reinterpret_cast<const char*>(ptr),
+                          static_cast<int>(remaining), 0);
+#else
+        ssize_t sent = ::send(fd_, ptr, remaining, MSG_NOSIGNAL);
+#endif
+        if (sent <= 0) {
+            fprintf(stderr, "[tcp] send() failed\n");
+            return false;
+        }
+        ptr += sent;
+        remaining -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+bool TCPClient::recv_exact(void* buf, size_t len) {
+    if (fd_ == kInvalidSocket) return false;
+
+    uint8_t* ptr = static_cast<uint8_t*>(buf);
+    size_t remaining = len;
+
+    while (remaining > 0) {
+#ifdef _WIN32
+        int recvd = ::recv(fd_, reinterpret_cast<char*>(ptr),
+                           static_cast<int>(remaining), 0);
+#else
+        ssize_t recvd = ::recv(fd_, ptr, remaining, 0);
+#endif
+        if (recvd <= 0) {
+            if (recvd == 0) {
+                fprintf(stderr, "[tcp] connection closed by peer\n");
+            } else {
+                fprintf(stderr, "[tcp] recv() failed\n");
+            }
+            return false;
+        }
+        ptr += recvd;
+        remaining -= static_cast<size_t>(recvd);
+    }
+    return true;
+}
+
+bool TCPClient::recv_header(ds_header_t* header) {
+    uint8_t buf[DS_HEADER_SIZE];
+    if (!recv_exact(buf, DS_HEADER_SIZE)) return false;
+    ds_header_deserialize(buf, header);
+    return true;
+}
+
+bool TCPClient::send_message(uint8_t type, uint8_t flags,
+                             const void* data, size_t len) {
+    ds_header_t header;
+    header.type = type;
+    header.flags = flags;
+    header.length = static_cast<uint32_t>(len);
+
+    uint8_t hdr_buf[DS_HEADER_SIZE];
+    ds_header_serialize(hdr_buf, &header);
+
+    if (!send_all(hdr_buf, DS_HEADER_SIZE)) return false;
+    if (len > 0 && data != nullptr) {
+        if (!send_all(data, len)) return false;
+    }
+    return true;
+}
+
+void TCPClient::close() {
+    if (fd_ != kInvalidSocket) {
+#ifdef _WIN32
+        ::shutdown(fd_, SD_BOTH);
+        closesocket(fd_);
+#else
+        ::shutdown(fd_, SHUT_RDWR);
+        ::close(fd_);
+#endif
+        fd_ = kInvalidSocket;
+    }
+}
+
+} // namespace droidscreen

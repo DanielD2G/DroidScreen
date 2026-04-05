@@ -1,0 +1,367 @@
+/*
+ * DroidScreen Desktop - Pipeline implementation
+ *
+ * Orchestrates capture -> encode -> send, plus recv and ping threads.
+ * The frame queue has bounded capacity (3); when full, oldest frames
+ * are dropped to keep latency low.
+ */
+
+#include "droidscreen/pipeline.h"
+
+#include <cstdio>
+#include <cstring>
+#include <chrono>
+#include <vector>
+
+extern "C" {
+#include "droidscreen/protocol.h"
+#include "droidscreen/handshake.h"
+#include "droidscreen/touch.h"
+}
+
+namespace droidscreen {
+
+static int64_t now_us() {
+    auto tp = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        tp.time_since_epoch()).count();
+}
+
+Pipeline::Pipeline(Capturer* capturer, Encoder* encoder,
+                   TCPClient* client, TouchInjector* touch)
+    : capturer_(capturer)
+    , encoder_(encoder)
+    , client_(client)
+    , touch_(touch)
+{
+}
+
+Pipeline::~Pipeline() {
+    stop();
+}
+
+bool Pipeline::handshake(uint32_t width, uint32_t height,
+                         uint32_t fps, uint32_t bitrate_kbps,
+                         bool touch_enabled) {
+    // Desktop sends HANDSHAKE_REQ to Android.
+    ds_handshake_req_t req{};
+    req.protocol_version = DS_PROTOCOL_VERSION;
+    req.width            = static_cast<uint16_t>(width);
+    req.height           = static_cast<uint16_t>(height);
+    req.fps              = static_cast<uint8_t>(fps);
+    req.codec            = DS_CODEC_H264;
+    req.max_bitrate_kbps = bitrate_kbps;
+    req.touch_enabled    = touch_enabled ? 1 : 0;
+
+    uint8_t req_buf[DS_HANDSHAKE_REQ_SIZE];
+    ds_handshake_req_serialize(req_buf, &req);
+
+    if (!client_->send_message(DS_MSG_HANDSHAKE_REQ, 0,
+                               req_buf, DS_HANDSHAKE_REQ_SIZE)) {
+        fprintf(stderr, "[pipeline] failed to send handshake request\n");
+        return false;
+    }
+
+    fprintf(stderr, "[pipeline] handshake sent: %ux%u@%u fps, %u kbps\n",
+            width, height, fps, bitrate_kbps);
+
+    // Wait for Android's HANDSHAKE_RESP.
+    ds_header_t hdr;
+    if (!client_->recv_header(&hdr)) {
+        fprintf(stderr, "[pipeline] failed to receive handshake response header\n");
+        return false;
+    }
+
+    if (hdr.type != DS_MSG_HANDSHAKE_RESP ||
+        hdr.length != DS_HANDSHAKE_RESP_SIZE) {
+        fprintf(stderr, "[pipeline] unexpected message type=0x%02x len=%u "
+                "(expected handshake resp)\n", hdr.type, hdr.length);
+        return false;
+    }
+
+    uint8_t resp_buf[DS_HANDSHAKE_RESP_SIZE];
+    if (!client_->recv_exact(resp_buf, DS_HANDSHAKE_RESP_SIZE)) {
+        fprintf(stderr, "[pipeline] failed to receive handshake response body\n");
+        return false;
+    }
+
+    ds_handshake_resp_t resp;
+    ds_handshake_resp_deserialize(resp_buf, &resp);
+
+    fprintf(stderr, "[pipeline] handshake complete: peer accepted %ux%u@%u, "
+            "codec=%u, max_bitrate=%u kbps, touch=%u\n",
+            resp.accepted_width, resp.accepted_height, resp.accepted_fps,
+            resp.accepted_codec, resp.decoder_max_bitrate, resp.touch_supported);
+
+    return true;
+}
+
+bool Pipeline::start(uint32_t width, uint32_t height,
+                     uint32_t fps, uint32_t bitrate_kbps,
+                     bool touch_enabled) {
+    if (running_.load()) {
+        fprintf(stderr, "[pipeline] already running\n");
+        return false;
+    }
+
+    // Perform protocol handshake.
+    if (!handshake(width, height, fps, bitrate_kbps, touch_enabled)) {
+        return false;
+    }
+
+    // Initialize encoder.
+    if (!encoder_->init(width, height, fps, bitrate_kbps)) {
+        fprintf(stderr, "[pipeline] encoder init failed\n");
+        return false;
+    }
+
+    // Initialize rate controller.
+    rate_ctrl_ = std::make_unique<RateController>(
+        encoder_, bitrate_kbps, 500, 25000);
+
+    // Initialize touch injector.
+    if (touch_enabled) {
+        touch_->init(width, height);
+    }
+
+    running_.store(true);
+    frames_encoded_.store(0);
+    bytes_sent_.store(0);
+
+    // Start capture -- frames get pushed into the queue.
+    capturer_->start([this](const CapturedFrame& frame) {
+        if (!running_.load()) return;
+
+        // Skip idle frames (content unchanged).
+        if (frame.is_idle) return;
+
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+
+        // Drop oldest if queue is full to keep latency bounded.
+        while (frame_queue_.size() >= kMaxQueueSize) {
+            frame_queue_.pop_front();
+        }
+        frame_queue_.push_back(frame);
+        queue_cv_.notify_one();
+    });
+
+    // Launch worker threads.
+    encode_thread_ = std::thread(&Pipeline::encode_send_loop, this);
+    recv_thread_   = std::thread(&Pipeline::recv_loop, this);
+    ping_thread_   = std::thread(&Pipeline::ping_loop, this);
+
+    fprintf(stderr, "[pipeline] started\n");
+    return true;
+}
+
+void Pipeline::stop() {
+    if (!running_.exchange(false)) return;
+
+    fprintf(stderr, "[pipeline] stopping...\n");
+
+    // Stop capture first (no more frames enqueued).
+    capturer_->stop();
+
+    // Wake the encode thread so it can exit.
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        queue_cv_.notify_all();
+    }
+
+    // Close the socket to unblock recv().
+    client_->close();
+
+    // Join threads.
+    if (encode_thread_.joinable()) encode_thread_.join();
+    if (recv_thread_.joinable()) recv_thread_.join();
+    if (ping_thread_.joinable()) ping_thread_.join();
+
+    // Shut down encoder and touch.
+    encoder_->shutdown();
+    touch_->shutdown();
+
+    fprintf(stderr, "[pipeline] stopped (encoded %llu frames, sent %llu bytes)\n",
+            static_cast<unsigned long long>(frames_encoded_.load()),
+            static_cast<unsigned long long>(bytes_sent_.load()));
+}
+
+void Pipeline::encode_send_loop() {
+    fprintf(stderr, "[encode] thread started\n");
+
+    while (running_.load()) {
+        CapturedFrame frame;
+
+        // Wait for a frame.
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait(lock, [this] {
+                return !frame_queue_.empty() || !running_.load();
+            });
+            if (!running_.load()) break;
+            frame = frame_queue_.front();
+            frame_queue_.pop_front();
+        }
+
+        // Encode the frame and send each output packet.
+        bool ok = encoder_->encode(
+            frame.native_handle, frame.timestamp_us,
+            [this](const EncodedPacket& pkt) {
+                uint8_t flags = 0;
+                if (pkt.is_keyframe) flags |= DS_FLAG_KEYFRAME;
+                if (pkt.is_config)   flags |= DS_FLAG_CONFIG;
+
+                if (client_->send_message(DS_MSG_VIDEO_FRAME, flags,
+                                          pkt.data, pkt.size)) {
+                    bytes_sent_.fetch_add(DS_HEADER_SIZE + pkt.size);
+                } else {
+                    fprintf(stderr, "[encode] send failed\n");
+                    running_.store(false);
+                }
+            });
+
+        if (ok) {
+            frames_encoded_.fetch_add(1);
+        } else {
+            fprintf(stderr, "[encode] encode failed\n");
+        }
+
+        // Periodically update rate controller.
+        if (rate_ctrl_ && (frames_encoded_.load() % 30 == 0)) {
+            rate_ctrl_->update();
+        }
+    }
+
+    fprintf(stderr, "[encode] thread exiting\n");
+}
+
+void Pipeline::recv_loop() {
+    fprintf(stderr, "[recv] thread started\n");
+
+    while (running_.load()) {
+        ds_header_t hdr;
+        if (!client_->recv_header(&hdr)) {
+            if (running_.load()) {
+                fprintf(stderr, "[recv] connection lost\n");
+            }
+            running_.store(false);
+            break;
+        }
+
+        // Read the payload if any.
+        std::vector<uint8_t> payload;
+        if (hdr.length > 0) {
+            payload.resize(hdr.length);
+            if (!client_->recv_exact(payload.data(), hdr.length)) {
+                fprintf(stderr, "[recv] failed to read payload\n");
+                running_.store(false);
+                break;
+            }
+        }
+
+        switch (hdr.type) {
+            case DS_MSG_PONG: {
+                int64_t now = now_us();
+                int64_t sent = ping_sent_us_.load();
+                int64_t rtt = now - sent;
+                last_rtt_us_.store(rtt);
+                if (rate_ctrl_) {
+                    rate_ctrl_->on_pong(rtt);
+                }
+                break;
+            }
+
+            case DS_MSG_TOUCH_EVENT: {
+                if (hdr.length >= DS_TOUCH_EVENT_SIZE) {
+                    ds_touch_event_t ev;
+                    ds_touch_deserialize(payload.data(), &ev);
+                    touch_->inject(ev.action, ev.pointer_id,
+                                   ev.x_frac, ev.y_frac, ev.pressure);
+                }
+                break;
+            }
+
+            case DS_MSG_CONTROL: {
+                if (hdr.length > 0) {
+                    handle_control(payload.data(), payload.size());
+                }
+                break;
+            }
+
+            default:
+                fprintf(stderr, "[recv] unknown message type 0x%02x\n",
+                        hdr.type);
+                break;
+        }
+    }
+
+    fprintf(stderr, "[recv] thread exiting\n");
+}
+
+void Pipeline::ping_loop() {
+    fprintf(stderr, "[ping] thread started\n");
+
+    while (running_.load()) {
+        // Sleep 2 seconds between pings.
+        for (int i = 0; i < 20 && running_.load(); i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!running_.load()) break;
+
+        ping_sent_us_.store(now_us());
+        if (!client_->send_message(DS_MSG_PING, 0, nullptr, 0)) {
+            if (running_.load()) {
+                fprintf(stderr, "[ping] send failed\n");
+            }
+            running_.store(false);
+            break;
+        }
+    }
+
+    fprintf(stderr, "[ping] thread exiting\n");
+}
+
+void Pipeline::handle_control(const uint8_t* data, size_t len) {
+    if (len < 1) return;
+
+    uint8_t ctrl_type = data[0];
+
+    switch (ctrl_type) {
+        case DS_CTRL_REQUEST_KEYFRAME:
+            fprintf(stderr, "[ctrl] keyframe requested\n");
+            encoder_->force_keyframe();
+            break;
+
+        case DS_CTRL_BITRATE_CHANGE:
+            if (len >= 5) {
+                uint32_t new_bitrate =
+                    static_cast<uint32_t>(data[1])
+                    | (static_cast<uint32_t>(data[2]) << 8)
+                    | (static_cast<uint32_t>(data[3]) << 16)
+                    | (static_cast<uint32_t>(data[4]) << 24);
+                fprintf(stderr, "[ctrl] bitrate change -> %u kbps\n",
+                        new_bitrate);
+                encoder_->set_bitrate(new_bitrate);
+            }
+            break;
+
+        case DS_CTRL_DISCONNECT:
+            fprintf(stderr, "[ctrl] disconnect requested\n");
+            running_.store(false);
+            break;
+
+        case DS_CTRL_DISPLAY_OFF:
+            fprintf(stderr, "[ctrl] display off (ignoring on desktop)\n");
+            break;
+
+        case DS_CTRL_DISPLAY_ON:
+            fprintf(stderr, "[ctrl] display on (ignoring on desktop)\n");
+            break;
+
+        default:
+            fprintf(stderr, "[ctrl] unknown control type 0x%02x\n",
+                    ctrl_type);
+            break;
+    }
+}
+
+} // namespace droidscreen
