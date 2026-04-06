@@ -36,6 +36,11 @@
 #include "droidscreen/pipeline.h"
 #include "droidscreen/server.h"
 
+extern "C" {
+#include "droidscreen/protocol.h"
+#include "droidscreen/handshake.h"
+}
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -81,6 +86,7 @@ static constexpr UINT IDC_DISPLAY_COMBO  = 5003;
 static constexpr UINT IDC_PORT_EDIT      = 5004;
 static constexpr UINT IDC_TOUCH_CHECK    = 5005;
 static constexpr UINT IDC_APPLY_BTN      = 5006;
+static constexpr UINT IDC_AUTODETECT_BTN = 5007;
 
 // Bitrate presets (kbps).
 static const int kBitrates[]     = { 5000, 10000, 15000, 20000, 25000, 30000 };
@@ -602,7 +608,7 @@ static void show_settings_dialog() {
     g_app.displays = enumerate_displays();
 
     const int dlgW = 420;
-    const int dlgH = 340;
+    const int dlgH = 380;
 
     // Center on screen.
     int screenW = GetSystemMetrics(SM_CXSCREEN);
@@ -645,14 +651,16 @@ static void show_settings_dialog() {
         hwnd, (HMENU)(UINT_PTR)IDC_FPS_COMBO, g_app.hinstance, nullptr);
     SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"30 fps");
     SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"60 fps");
-    SendMessageW(fpsCombo, CB_SETCURSEL, (s.fps == 30) ? 0 : 1, 0);
+    SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"120 fps");
+    int fpsSel = (s.fps == 30) ? 0 : (s.fps == 120) ? 2 : 1;
+    SendMessageW(fpsCombo, CB_SETCURSEL, fpsSel, 0);
     cy += rowHeight + 8;
 
     // --- Bitrate ---
     makeLabel(L"Bitrate:", cy);
     HWND brCombo = CreateWindowExW(0, L"COMBOBOX", nullptr,
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-        ctrlLeft, cy, ctrlWidth, 200,
+        ctrlLeft, cy, 175, 200,
         hwnd, (HMENU)(UINT_PTR)IDC_BITRATE_COMBO, g_app.hinstance, nullptr);
     int brSel = 2; // default 15 Mbps
     for (int i = 0; i < kBitrateCount; i++) {
@@ -660,6 +668,11 @@ static void show_settings_dialog() {
         if (kBitrates[i] == (int)s.bitrate_kbps) brSel = i;
     }
     SendMessageW(brCombo, CB_SETCURSEL, brSel, 0);
+    // Auto-detect bitrate button.
+    CreateWindowExW(0, L"BUTTON", L"Auto",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        ctrlLeft + 185, cy, 70, 26,
+        hwnd, (HMENU)(UINT_PTR)IDC_AUTODETECT_BTN, g_app.hinstance, nullptr);
     cy += rowHeight + 8;
 
     // --- Display ---
@@ -724,7 +737,11 @@ static void apply_settings_from_dialog(HWND dlg) {
     // FPS.
     HWND fpsCombo = GetDlgItem(dlg, IDC_FPS_COMBO);
     int fpsSel = (int)SendMessageW(fpsCombo, CB_GETCURSEL, 0, 0);
-    s.fps = (fpsSel == 0) ? 30 : 60;
+    switch (fpsSel) {
+        case 0: s.fps = 30; break;
+        case 2: s.fps = 120; break;
+        default: s.fps = 60; break;
+    }
 
     // Bitrate.
     HWND brCombo = GetDlgItem(dlg, IDC_BITRATE_COMBO);
@@ -767,6 +784,33 @@ static void apply_settings_from_dialog(HWND dlg) {
     g_app.settingsDialog = nullptr;
 }
 
+/// Perform a handshake with the given TCPClient (used by speed test).
+static bool speed_test_handshake(droidscreen::TCPClient* client) {
+    ds_handshake_req_t req{};
+    req.protocol_version = DS_PROTOCOL_VERSION;
+    req.width            = 1920;
+    req.height           = 1200;
+    req.fps              = 60;
+    req.codec            = DS_CODEC_H264;
+    req.max_bitrate_kbps = 15000;
+    req.touch_enabled    = 0;
+
+    uint8_t req_buf[DS_HANDSHAKE_REQ_SIZE];
+    ds_handshake_req_serialize(req_buf, &req);
+    if (!client->send_message(DS_MSG_HANDSHAKE_REQ, 0,
+                              req_buf, DS_HANDSHAKE_REQ_SIZE)) {
+        return false;
+    }
+
+    ds_header_t hdr;
+    if (!client->recv_header(&hdr)) return false;
+    if (hdr.type != DS_MSG_HANDSHAKE_RESP || hdr.length != DS_HANDSHAKE_RESP_SIZE)
+        return false;
+
+    uint8_t resp_buf[DS_HANDSHAKE_RESP_SIZE];
+    return client->recv_exact(resp_buf, DS_HANDSHAKE_RESP_SIZE);
+}
+
 static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_COMMAND:
@@ -774,7 +818,76 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             apply_settings_from_dialog(hwnd);
             return 0;
         }
+        if (LOWORD(wParam) == IDC_AUTODETECT_BTN && HIWORD(wParam) == BN_CLICKED) {
+            HWND btn = GetDlgItem(hwnd, IDC_AUTODETECT_BTN);
+            EnableWindow(btn, FALSE);
+            SetWindowTextW(btn, L"...");
+
+            HWND dlgCapture = hwnd;
+            std::thread([dlgCapture, btn]() {
+                Settings settings = load_settings();
+
+                // Set up ADB forward.
+                if (!adb_forward_setup(settings.port)) {
+                    PostMessage(dlgCapture, WM_APP + 10, 0, 0);
+                    return;
+                }
+
+                // Connect TCP.
+                auto client = std::make_unique<droidscreen::TCPClient>();
+                if (!client->connect(settings.port)) {
+                    PostMessage(dlgCapture, WM_APP + 10, 0, 0);
+                    return;
+                }
+
+                // Handshake.
+                if (!speed_test_handshake(client.get())) {
+                    client->close();
+                    PostMessage(dlgCapture, WM_APP + 10, 0, 0);
+                    return;
+                }
+
+                // Run speed test (2 seconds).
+                uint32_t throughput_kbps = droidscreen::run_speed_test(client.get(), 2000);
+                client->close();
+
+                // Select best bitrate at ~70%.
+                uint32_t target_kbps = throughput_kbps * 70 / 100;
+                int bestIdx = 0;
+                for (int i = kBitrateCount - 1; i >= 0; i--) {
+                    if (kBitrates[i] <= (int)target_kbps) {
+                        bestIdx = i;
+                        break;
+                    }
+                }
+
+                log_msg("[SpeedTest] throughput=%u kbps, target=%u kbps, selected=%d kbps",
+                        throughput_kbps, target_kbps, kBitrates[bestIdx]);
+
+                // Post result back to UI thread.
+                PostMessage(dlgCapture, WM_APP + 11, (WPARAM)bestIdx, 0);
+            }).detach();
+            return 0;
+        }
         break;
+
+    // Speed test failure — re-enable button.
+    case WM_APP + 10: {
+        HWND btn = GetDlgItem(hwnd, IDC_AUTODETECT_BTN);
+        SetWindowTextW(btn, L"Fail");
+        EnableWindow(btn, TRUE);
+        return 0;
+    }
+
+    // Speed test success — update bitrate combo and re-enable button.
+    case WM_APP + 11: {
+        HWND brCombo = GetDlgItem(hwnd, IDC_BITRATE_COMBO);
+        SendMessageW(brCombo, CB_SETCURSEL, wParam, 0);
+        HWND btn = GetDlgItem(hwnd, IDC_AUTODETECT_BTN);
+        SetWindowTextW(btn, L"Auto");
+        EnableWindow(btn, TRUE);
+        return 0;
+    }
 
     case WM_CLOSE:
         DestroyWindow(hwnd);

@@ -55,7 +55,8 @@ typedef enum {
     DS_CTRL_REQUEST_KEYFRAME   = 0x03,
     DS_CTRL_DISCONNECT         = 0x04,
     DS_CTRL_DISPLAY_OFF        = 0x05,
-    DS_CTRL_DISPLAY_ON         = 0x06
+    DS_CTRL_DISPLAY_ON         = 0x06,
+    DS_CTRL_SPEED_TEST         = 0x07
 } ds_ctrl_type_t;
 
 /*

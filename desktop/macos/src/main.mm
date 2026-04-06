@@ -20,6 +20,11 @@
 #include "droidscreen/server.h"
 #include "droidscreen/touch_injector.h"
 
+extern "C" {
+#include "droidscreen/protocol.h"
+#include "droidscreen/handshake.h"
+}
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -403,6 +408,8 @@ static NSImage* CreateStatusBarIcon() {
 @property (nonatomic, strong) NSPopUpButton* scalePopup;       // unused, kept for compat
 @property (nonatomic, strong) NSButton*      retinaCheckbox;
 @property (nonatomic, strong) NSTextField*   portField;
+@property (nonatomic, strong) NSButton*      autoDetectButton;
+@property (nonatomic, strong) NSProgressIndicator* speedTestSpinner;
 
 // State.
 @property (nonatomic, assign) BOOL isStreaming;
@@ -558,7 +565,7 @@ static NSImage* CreateStatusBarIcon() {
 // -----------------------------------------------------------------------------
 
 - (void)buildSettingsWindow {
-    NSRect frame = NSMakeRect(0, 0, 400, 330);
+    NSRect frame = NSMakeRect(0, 0, 400, 370);
     NSWindowStyleMask style = NSWindowStyleMaskTitled
                             | NSWindowStyleMaskClosable;
 
@@ -593,13 +600,17 @@ static NSImage* CreateStatusBarIcon() {
     self.fpsPopup = [self addPopUpButton:contentView atX:controlLeft y:y width:controlWidth];
     [self.fpsPopup addItemWithTitle:@"30 fps"];
     [self.fpsPopup addItemWithTitle:@"60 fps"];
+    [self.fpsPopup addItemWithTitle:@"120 fps"];
     NSInteger savedFPS = [[NSUserDefaults standardUserDefaults] integerForKey:kSettingFPS];
-    [self.fpsPopup selectItemAtIndex:(savedFPS == 30 ? 0 : 1)];
+    NSInteger fpsIdx = 1; // default: 60
+    if (savedFPS == 30) fpsIdx = 0;
+    else if (savedFPS == 120) fpsIdx = 2;
+    [self.fpsPopup selectItemAtIndex:fpsIdx];
 
     // --- Row 2: Bitrate ---
     y -= rowHeight + 8;
     [self addLabel:@"Bitrate:" toView:contentView atX:leftMargin y:y width:labelWidth];
-    self.bitratePopup = [self addPopUpButton:contentView atX:controlLeft y:y width:controlWidth];
+    self.bitratePopup = [self addPopUpButton:contentView atX:controlLeft y:y width:155];
     for (int i = 0; i < kBitrateCount; i++) {
         [self.bitratePopup addItemWithTitle:@(kBitrateLabels[i])];
     }
@@ -609,6 +620,24 @@ static NSImage* CreateStatusBarIcon() {
         if (kBitrates[i] == (int)savedBitrate) { bitrateIdx = i; break; }
     }
     [self.bitratePopup selectItemAtIndex:bitrateIdx];
+
+    // Auto-detect bitrate button.
+    self.autoDetectButton = [[NSButton alloc] initWithFrame:
+        NSMakeRect(controlLeft + 165, y, 65, 26)];
+    self.autoDetectButton.title = @"Auto";
+    self.autoDetectButton.bezelStyle = NSBezelStyleRounded;
+    [self.autoDetectButton setFont:[NSFont systemFontOfSize:11]];
+    self.autoDetectButton.target = self;
+    self.autoDetectButton.action = @selector(runSpeedTest:);
+    [contentView addSubview:self.autoDetectButton];
+
+    // Spinner shown during speed test (hidden by default).
+    self.speedTestSpinner = [[NSProgressIndicator alloc] initWithFrame:
+        NSMakeRect(controlLeft + 165, y + 3, 60, 20)];
+    self.speedTestSpinner.style = NSProgressIndicatorStyleBar;
+    self.speedTestSpinner.indeterminate = YES;
+    self.speedTestSpinner.hidden = YES;
+    [contentView addSubview:self.speedTestSpinner];
 
     // --- Row 3: Resolution ---
     y -= rowHeight + 8;
@@ -686,7 +715,12 @@ static NSImage* CreateStatusBarIcon() {
 
     // FPS.
     NSInteger fpsIdx = self.fpsPopup.indexOfSelectedItem;
-    NSInteger fps = (fpsIdx == 0) ? 30 : 60;
+    NSInteger fps;
+    switch (fpsIdx) {
+        case 0: fps = 30; break;
+        case 2: fps = 120; break;
+        default: fps = 60; break;
+    }
     [defaults setInteger:fps forKey:kSettingFPS];
 
     // Bitrate.
@@ -720,11 +754,161 @@ static NSImage* CreateStatusBarIcon() {
         NSLog(@"[Settings] Restarting pipeline with new settings...");
         dispatch_async(_streamQueue, ^{
             [self disconnectSync];
+            // Wait for the Android side to finish cleaning up the old
+            // connection and re-accept. Without this delay, adb forward
+            // fails because the old socket is still in TIME_WAIT.
+            usleep(500000);  // 500ms
             [self connectSync];
         });
     }
 
     [self.settingsWindow close];
+}
+
+/// Perform a handshake with the given TCPClient (used by speed test).
+static bool speed_test_handshake(droidscreen::TCPClient* client) {
+    ds_handshake_req_t req{};
+    req.protocol_version = DS_PROTOCOL_VERSION;
+    req.width            = 1920;
+    req.height           = 1200;
+    req.fps              = 60;
+    req.codec            = DS_CODEC_H264;
+    req.max_bitrate_kbps = 15000;
+    req.touch_enabled    = 0;
+
+    uint8_t req_buf[DS_HANDSHAKE_REQ_SIZE];
+    ds_handshake_req_serialize(req_buf, &req);
+    if (!client->send_message(DS_MSG_HANDSHAKE_REQ, 0,
+                              req_buf, DS_HANDSHAKE_REQ_SIZE)) {
+        return false;
+    }
+
+    ds_header_t hdr;
+    if (!client->recv_header(&hdr)) return false;
+    if (hdr.type != DS_MSG_HANDSHAKE_RESP || hdr.length != DS_HANDSHAKE_RESP_SIZE)
+        return false;
+
+    uint8_t resp_buf[DS_HANDSHAKE_RESP_SIZE];
+    return client->recv_exact(resp_buf, DS_HANDSHAKE_RESP_SIZE);
+}
+
+- (void)runSpeedTest:(id)sender {
+    // Show spinner, hide button.
+    self.autoDetectButton.hidden = YES;
+    self.speedTestSpinner.hidden = NO;
+    [self.speedTestSpinner startAnimation:nil];
+
+    // If currently streaming, disconnect first (the speed test needs
+    // its own TCP connection to the Android app).
+    BOOL wasStreaming = _isStreaming;
+
+    dispatch_async(_streamQueue, ^{
+        @autoreleasepool {
+            if (wasStreaming) {
+                NSLog(@"[SpeedTest] Pausing stream for speed test...");
+                [self disconnectSync];
+                usleep(500000);  // 500ms for Android to re-open server socket
+            }
+
+            uint16_t port = (uint16_t)[[NSUserDefaults standardUserDefaults]
+                                        integerForKey:kSettingPort];
+
+            // Set up ADB forward.
+            if (!adb_forward_setup(port)) {
+                NSLog(@"[SpeedTest] ADB forward failed");
+                [self speedTestFinished:0 wasStreaming:wasStreaming];
+                return;
+            }
+
+            // Connect TCP.
+            auto client = std::make_unique<droidscreen::TCPClient>();
+            if (!client->connect(port)) {
+                NSLog(@"[SpeedTest] TCP connect failed");
+                adb_forward_remove(port);
+                [self speedTestFinished:0 wasStreaming:wasStreaming];
+                return;
+            }
+
+            // Handshake (so Android enters message loop).
+            if (!speed_test_handshake(client.get())) {
+                NSLog(@"[SpeedTest] Handshake failed");
+                client->close();
+                adb_forward_remove(port);
+                [self speedTestFinished:0 wasStreaming:wasStreaming];
+                return;
+            }
+
+            // Run speed test (2 seconds).
+            uint32_t throughput_kbps = droidscreen::run_speed_test(client.get(), 2000);
+
+            // Disconnect and clean up.
+            client->close();
+            adb_forward_remove(port);
+
+            [self speedTestFinished:throughput_kbps wasStreaming:wasStreaming];
+        }
+    });
+}
+
+- (void)speedTestFinished:(uint32_t)throughput_kbps wasStreaming:(BOOL)wasStreaming {
+    // Select best bitrate at ~70% of measured throughput.
+    uint32_t target_kbps = throughput_kbps * 70 / 100;
+    int bestIdx = 0;
+    if (throughput_kbps > 0) {
+        for (int i = kBitrateCount - 1; i >= 0; i--) {
+            if (kBitrates[i] <= (int)target_kbps) {
+                bestIdx = i;
+                break;
+            }
+        }
+    }
+
+    NSLog(@"[SpeedTest] throughput=%u kbps, target=%u kbps, selected=%d kbps",
+          throughput_kbps, target_kbps, kBitrates[bestIdx]);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // Stop spinner, show button.
+        [self.speedTestSpinner stopAnimation:nil];
+        self.speedTestSpinner.hidden = YES;
+        self.autoDetectButton.hidden = NO;
+
+        if (throughput_kbps == 0) {
+            self.autoDetectButton.title = @"Failed";
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                self.autoDetectButton.title = @"Auto";
+            });
+            return;
+        }
+
+        // Show result briefly.
+        NSString* resultStr = [NSString stringWithFormat:@"%.0f Mbps",
+                               throughput_kbps / 1000.0];
+        self.autoDetectButton.title = resultStr;
+
+        // Update the bitrate popup and save to defaults.
+        [self.bitratePopup selectItemAtIndex:bestIdx];
+        [[NSUserDefaults standardUserDefaults] setInteger:kBitrates[bestIdx]
+                                                   forKey:kSettingBitrate];
+
+        NSLog(@"[SpeedTest] Set bitrate to %d kbps (USB throughput: %u kbps)",
+              kBitrates[bestIdx], throughput_kbps);
+
+        // Reset button title after 3 seconds.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            self.autoDetectButton.title = @"Auto";
+        });
+    });
+
+    // If we were streaming before the test, reconnect.
+    if (wasStreaming) {
+        NSLog(@"[SpeedTest] Resuming stream...");
+        dispatch_async(_streamQueue, ^{
+            usleep(300000);  // 300ms
+            [self connectSync];
+        });
+    }
 }
 
 /// Read current settings into a struct for the streaming code.
@@ -924,7 +1108,8 @@ struct StreamSettings {
         _capturer = std::make_unique<droidscreen::SCKCapturer>();
 
         if (!_capturer->init_with_display_id(_virtualDisplay->display_id(),
-                                             capture_w, capture_h)) {
+                                             capture_w, capture_h,
+                                             settings.fps)) {
             NSLog(@"[Stream] Capturer init failed");
             [self updateStatusText:@"Status: Capture init failed"];
             [self updateConnectMenuTitle:@"Connect"];

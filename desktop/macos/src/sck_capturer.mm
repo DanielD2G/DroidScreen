@@ -119,7 +119,8 @@ SCKCapturer::~SCKCapturer() {
 
 bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
                                        uint32_t capture_width,
-                                       uint32_t capture_height) {
+                                       uint32_t capture_height,
+                                       uint32_t target_fps) {
     __block bool success = false;
     __block SCDisplay* chosen_display = nil;
 
@@ -180,10 +181,13 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
     SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
     config.width  = width_;
     config.height = height_;
-    config.minimumFrameInterval = CMTimeMake(1, 60);
+    config.minimumFrameInterval = CMTimeMake(1, target_fps > 0 ? target_fps : 60);
     config.queueDepth = 4;
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.showsCursor = YES;
+
+    fprintf(stderr, "[sck] initialized for display ID %u (capture=%ux%u, fps=%u)\n",
+            cg_display_id, width_, height_, target_fps);
 
     stream_ = [[SCStream alloc] initWithFilter:filter
                                  configuration:config

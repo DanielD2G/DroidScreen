@@ -70,6 +70,14 @@ static pthread_t         g_decode_thread;
 static DecoderContext*   g_decoder   = nullptr;
 static std::atomic<uint32_t> g_stream_frame_interval_us{16667};
 
+/* ---- Stats tracking (read from JNI, written from recv/decode threads) ---- */
+static std::atomic<uint64_t> g_stats_bytes_received{0};
+static std::atomic<uint64_t> g_stats_frames_decoded{0};
+static std::atomic<uint64_t> g_stats_frames_fed{0};
+static std::atomic<uint64_t> g_stats_feed_errors{0};
+static std::atomic<int64_t>  g_stats_last_frame_arrival_us{0};
+static std::atomic<int64_t>  g_stats_frame_jitter_us{0};
+
 /* ---- JNI callback state ---- */
 static JavaVM*           g_jvm      = nullptr;
 static jobject           g_activity = nullptr;   /* global ref */
@@ -248,6 +256,31 @@ static void* recv_thread_func(void* /*arg*/) {
 
             switch (hdr.type) {
                 case DS_MSG_VIDEO_FRAME: {
+                    /* Stats: track bytes received */
+                    g_stats_bytes_received.fetch_add(
+                        DS_HEADER_SIZE + hdr.length, std::memory_order_relaxed);
+
+                    /* Stats: track frame pacing (jitter via EWMA) */
+                    {
+                        struct timespec ts;
+                        clock_gettime(CLOCK_MONOTONIC, &ts);
+                        int64_t now_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+                        int64_t last = g_stats_last_frame_arrival_us.exchange(
+                            now_us, std::memory_order_relaxed);
+                        if (last > 0) {
+                            int64_t interval = now_us - last;
+                            int64_t expected = (int64_t)g_stream_frame_interval_us.load(
+                                std::memory_order_relaxed);
+                            int64_t deviation = (interval > expected)
+                                ? (interval - expected) : (expected - interval);
+                            int64_t prev = g_stats_frame_jitter_us.load(
+                                std::memory_order_relaxed);
+                            int64_t smoothed = prev + (deviation - prev) / 10;
+                            g_stats_frame_jitter_us.store(
+                                smoothed, std::memory_order_relaxed);
+                        }
+                    }
+
                     /* Preserve protocol flags; Android must not infer config/keyframe
                      * from the first NAL because Windows keyframes may start with SPS. */
                     video_msg_buf[0] = hdr.flags;
@@ -301,6 +334,14 @@ static void* recv_thread_func(void* /*arg*/) {
 
         /* Signal decode thread to pause */
         g_decoder_configured.store(false, std::memory_order_release);
+
+        /* Reset stats for next session */
+        g_stats_bytes_received.store(0, std::memory_order_relaxed);
+        g_stats_frames_decoded.store(0, std::memory_order_relaxed);
+        g_stats_frames_fed.store(0, std::memory_order_relaxed);
+        g_stats_feed_errors.store(0, std::memory_order_relaxed);
+        g_stats_last_frame_arrival_us.store(0, std::memory_order_relaxed);
+        g_stats_frame_jitter_us.store(0, std::memory_order_relaxed);
 
         /* Give decode thread time to notice and stop touching the decoder */
         usleep(5000);  /* 5ms — decode thread polls at 100us */
@@ -388,7 +429,10 @@ static void* decode_thread_func(void* /*arg*/) {
 
         /* Always try to drain first — output may be ready even without new input */
         int r = decoder_drain(g_decoder);
-        if (r > 0) frames_rendered += r;
+        if (r > 0) {
+            frames_rendered += r;
+            g_stats_frames_decoded.fetch_add(r, std::memory_order_relaxed);
+        }
 
         /* Try to read a NAL unit from the ring buffer */
         size_t msg_len = ring_buffer_read_message(g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
@@ -424,14 +468,19 @@ static void* decode_thread_func(void* /*arg*/) {
         int ret = decoder_feed(g_decoder, video_data, nal_len, pts_us, flags);
         if (ret == 0) {
             frames_fed++;
+            g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
         } else {
             feed_errors++;
+            g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
         }
         pts_us += g_stream_frame_interval_us.load(std::memory_order_acquire);
 
         /* Immediately drain again after feeding */
         r = decoder_drain(g_decoder);
-        if (r > 0) frames_rendered += r;
+        if (r > 0) {
+            frames_rendered += r;
+            g_stats_frames_decoded.fetch_add(r, std::memory_order_relaxed);
+        }
 
         /* Log stats every ~2 seconds */
         if ((frames_fed % 120) == 0 && frames_fed > 0) {
@@ -640,6 +689,22 @@ Java_com_droidscreen_app_MainActivity_nativeSendMouse(
     }
 
     mouse_sender_send(g_client_fd, action, buttons, xFrac, yFrac);
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_com_droidscreen_app_MainActivity_nativeGetStats(
+        JNIEnv* env, jobject /*thiz*/) {
+    jlong stats[6];
+    stats[0] = static_cast<jlong>(g_stats_bytes_received.load(std::memory_order_relaxed));
+    stats[1] = static_cast<jlong>(g_stats_frames_decoded.load(std::memory_order_relaxed));
+    stats[2] = static_cast<jlong>(g_stats_frames_fed.load(std::memory_order_relaxed));
+    stats[3] = static_cast<jlong>(g_stats_feed_errors.load(std::memory_order_relaxed));
+    stats[4] = static_cast<jlong>(g_stats_frame_jitter_us.load(std::memory_order_relaxed));
+    stats[5] = static_cast<jlong>(g_stream_frame_interval_us.load(std::memory_order_relaxed));
+
+    jlongArray result = env->NewLongArray(6);
+    env->SetLongArrayRegion(result, 0, 6, stats);
+    return result;
 }
 
 } /* extern "C" */

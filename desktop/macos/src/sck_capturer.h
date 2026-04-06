@@ -35,9 +35,11 @@ public:
     /// @param cg_display_id  The CGDirectDisplayID to capture.
     /// @param capture_width  Output pixel width (0 = use display's native).
     /// @param capture_height Output pixel height (0 = use display's native).
+    /// @param target_fps     Target frame rate (default 60).
     bool init_with_display_id(uint32_t cg_display_id,
                               uint32_t capture_width = 0,
-                              uint32_t capture_height = 0);
+                              uint32_t capture_height = 0,
+                              uint32_t target_fps = 60);
     bool start(std::function<void(const CapturedFrame&)> on_frame) override;
     void stop() override;
 

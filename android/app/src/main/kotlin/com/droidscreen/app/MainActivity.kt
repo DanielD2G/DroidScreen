@@ -52,7 +52,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var nativeStarted = false
     private var controlsVisible = true
     private lateinit var inputSettings: InputSettings
+    private lateinit var statsToggleButton: Button
+    private lateinit var statsPanel: LinearLayout
+    private lateinit var statsBitrate: TextView
+    private lateinit var statsFps: TextView
+    private lateinit var statsPacing: TextView
+    private lateinit var statsStability: TextView
+    private var statsVisible = false
+    private var lastBytesReceived = 0L
+    private var lastFramesDecoded = 0L
+    private var lastStatsTime = 0L
     private val uiHandler = Handler(Looper.getMainLooper())
+    private val statsUpdateRunnable = object : Runnable {
+        override fun run() {
+            if (statsVisible) {
+                updateStats()
+                uiHandler.postDelayed(this, 500)
+            }
+        }
+    }
     private val hideControlsRunnable = Runnable {
         if (statusOverlay.visibility == View.GONE && controlsVisible) {
             setControlsVisible(false)
@@ -76,6 +94,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         fingerModeSpinner = findViewById(R.id.finger_mode_spinner)
         stylusModeSpinner = findViewById(R.id.stylus_mode_spinner)
         unknownModeSpinner = findViewById(R.id.unknown_mode_spinner)
+        statsToggleButton = findViewById(R.id.stats_toggle)
+        statsPanel = findViewById(R.id.stats_panel)
+        statsBitrate = findViewById(R.id.stats_bitrate)
+        statsFps = findViewById(R.id.stats_fps)
+        statsPacing = findViewById(R.id.stats_pacing)
+        statsStability = findViewById(R.id.stats_stability)
 
         inputSettings = InputSettingsStore.load(this)
 
@@ -93,6 +117,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // Show initial waiting state
         updateStatusUI(STATUS_WAITING)
         bindInputSettingsUi()
+        bindStatsUi()
 
         setImmersiveMode()
     }
@@ -104,6 +129,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onDestroy() {
         uiHandler.removeCallbacks(hideControlsRunnable)
+        uiHandler.removeCallbacks(statsUpdateRunnable)
         if (nativeStarted) {
             nativeStop()
             nativeStarted = false
@@ -112,6 +138,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onBackPressed() {
+        if (statsVisible) {
+            closeStatsPanel()
+            return
+        }
+
         if (inputPanel.visibility == View.VISIBLE) {
             closeInputPanel()
             return
@@ -311,6 +342,71 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         scheduleControlsAutoHide()
     }
 
+    private fun bindStatsUi() {
+        statsToggleButton.setOnClickListener {
+            toggleStatsPanel()
+            scheduleControlsAutoHide()
+        }
+    }
+
+    private fun toggleStatsPanel() {
+        if (statsVisible) {
+            closeStatsPanel()
+        } else {
+            statsPanel.visibility = View.VISIBLE
+            statsToggleButton.text = "Close"
+            statsVisible = true
+            val stats = nativeGetStats()
+            lastBytesReceived = stats[0]
+            lastFramesDecoded = stats[1]
+            lastStatsTime = System.nanoTime()
+            uiHandler.post(statsUpdateRunnable)
+        }
+    }
+
+    private fun closeStatsPanel() {
+        if (!statsVisible) return
+        statsPanel.visibility = View.GONE
+        statsToggleButton.text = "Stats"
+        statsVisible = false
+        uiHandler.removeCallbacks(statsUpdateRunnable)
+    }
+
+    private fun updateStats() {
+        val stats = nativeGetStats()
+        val now = System.nanoTime()
+        val elapsed = (now - lastStatsTime) / 1_000_000_000.0
+
+        if (elapsed > 0.1) {
+            val deltaBytes = stats[0] - lastBytesReceived
+            val bitrateMbps = (deltaBytes * 8.0) / elapsed / 1_000_000.0
+            statsBitrate.text = String.format("Bitrate: %.1f Mbps", bitrateMbps)
+
+            val deltaFrames = stats[1] - lastFramesDecoded
+            val fps = deltaFrames / elapsed
+            statsFps.text = String.format("FPS: %.1f", fps)
+
+            val jitterUs = stats[4]
+            val expectedIntervalUs = stats[5]
+            val jitterMs = jitterUs / 1000.0
+            val pacingQuality = if (expectedIntervalUs > 0) {
+                ((1.0 - (jitterUs.toDouble() / expectedIntervalUs)).coerceIn(0.0, 1.0) * 100).toInt()
+            } else 0
+            statsPacing.text = String.format("Pacing: %d%% (%.1fms)", pacingQuality, jitterMs)
+
+            val totalFed = stats[2]
+            val errors = stats[3]
+            val stability = if (totalFed > 0) {
+                ((1.0 - (errors.toDouble() / totalFed)).coerceIn(0.0, 1.0) * 100).toInt()
+            } else 100
+            statsStability.text = String.format("Stability: %d%%", stability)
+        }
+
+        lastBytesReceived = stats[0]
+        lastFramesDecoded = stats[1]
+        lastStatsTime = now
+    }
+
     private fun setControlsVisible(visible: Boolean) {
         controlsVisible = visible
         controlsContainer.visibility = if (visible) View.VISIBLE else View.GONE
@@ -343,6 +439,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun updateStatusUI(status: Int) {
         when (status) {
             STATUS_WAITING -> {
+                closeStatsPanel()
                 setControlsVisible(true)
                 uiHandler.removeCallbacks(hideControlsRunnable)
                 statusOverlay.visibility = View.VISIBLE
@@ -354,6 +451,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 statusOverlay.visibility = View.GONE
             }
             STATUS_DISCONNECTED -> {
+                closeStatsPanel()
                 setControlsVisible(true)
                 uiHandler.removeCallbacks(hideControlsRunnable)
                 statusOverlay.visibility = View.VISIBLE
@@ -361,6 +459,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 statusDetail.text = "Reconnecting..."
             }
             STATUS_ERROR -> {
+                closeStatsPanel()
                 setControlsVisible(true)
                 uiHandler.removeCallbacks(hideControlsRunnable)
                 statusOverlay.visibility = View.VISIBLE
@@ -400,4 +499,5 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         xFrac: Int,
         yFrac: Int
     )
+    private external fun nativeGetStats(): LongArray
 }

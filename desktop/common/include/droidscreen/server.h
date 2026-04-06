@@ -65,4 +65,12 @@ private:
 #endif
 };
 
+/// Run a speed test over an established TCP connection.
+/// Sends burst data and measures throughput.
+/// The connection must have already completed the protocol handshake.
+/// @param client  Connected TCPClient (post-handshake).
+/// @param duration_ms  How long to run the burst (default 2 seconds).
+/// @return Estimated throughput in kbps, or 0 on failure.
+uint32_t run_speed_test(TCPClient* client, uint32_t duration_ms = 2000);
+
 } // namespace droidscreen

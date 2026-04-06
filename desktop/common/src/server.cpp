@@ -4,8 +4,10 @@
 
 #include "droidscreen/server.h"
 
-#include <cstring>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -234,6 +236,45 @@ void TCPClient::close() {
 #endif
         fd_ = kInvalidSocket;
     }
+}
+
+uint32_t run_speed_test(TCPClient* client, uint32_t duration_ms) {
+    if (!client || !client->is_connected()) return 0;
+
+    // 64 KB payload per control message.
+    constexpr size_t kChunkSize = 64 * 1024;
+    std::vector<uint8_t> payload(kChunkSize, 0);
+    payload[0] = DS_CTRL_SPEED_TEST;  // control sub-type
+
+    auto start = std::chrono::steady_clock::now();
+    uint64_t total_bytes = 0;
+
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - start).count();
+        if (elapsed_ms >= (int64_t)duration_ms) break;
+
+        if (!client->send_message(DS_MSG_CONTROL, 0,
+                                  payload.data(), payload.size())) {
+            break;  // Connection error — return what we measured so far.
+        }
+        total_bytes += DS_HEADER_SIZE + payload.size();
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    double elapsed_sec = std::chrono::duration<double>(end - start).count();
+    if (elapsed_sec <= 0.0) return 0;
+
+    // Convert bytes to kilobits per second.
+    uint64_t bits = total_bytes * 8;
+    uint32_t kbps = static_cast<uint32_t>(bits / elapsed_sec / 1000.0);
+
+    fprintf(stderr, "[speed_test] sent %llu bytes in %.2f s -> %u kbps (%.1f Mbps)\n",
+            (unsigned long long)total_bytes, elapsed_sec,
+            kbps, kbps / 1000.0);
+
+    return kbps;
 }
 
 } // namespace droidscreen
