@@ -64,16 +64,23 @@ bool NvencEncoder::load_nvenc_library() {
     memset(&nvenc_, 0, sizeof(nvenc_));
     nvenc_.version = NV_ENCODE_API_FUNCTION_LIST_VER;
 
+    fprintf(stderr, "[nvenc] requesting API version %d.%d (ver=0x%x)\n",
+            NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION,
+            (unsigned)nvenc_.version);
+
     NVENCSTATUS status = create_instance(&nvenc_);
     if (status != NV_ENC_SUCCESS) {
-        fprintf(stderr, "[nvenc] NvEncodeAPICreateInstance failed: %d\n",
-                (int)status);
+        fprintf(stderr, "[nvenc] NvEncodeAPICreateInstance failed: %d "
+                "(15=INVALID_VERSION: driver too old for API %d.%d, "
+                "update NVIDIA drivers)\n",
+                (int)status, NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
         FreeLibrary(nvenc_lib_);
         nvenc_lib_ = nullptr;
         return false;
     }
 
-    fprintf(stderr, "[nvenc] API loaded successfully\n");
+    fprintf(stderr, "[nvenc] API %d.%d loaded successfully\n",
+            NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
     return true;
 }
 

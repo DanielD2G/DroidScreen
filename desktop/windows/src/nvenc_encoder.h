@@ -152,8 +152,11 @@ static const GUID NV_ENC_H264_PROFILE_MAIN_GUID =
 #define NV_ENC_PIC_FLAG_EOS            0x04
 
 // API version.
+// Use NVENC API 12.0 (compatible with NVIDIA driver R530+ / ~2023).
+// Avoid 12.1+ which requires very recent drivers (R535+).
+// If even 12.0 fails on older drivers, try 11.1 (R460+ / ~2021).
 #define NVENCAPI_MAJOR_VERSION  12
-#define NVENCAPI_MINOR_VERSION  1
+#define NVENCAPI_MINOR_VERSION  0
 #define NVENCAPI_VERSION        ((NVENCAPI_MAJOR_VERSION) | ((NVENCAPI_MINOR_VERSION) << 24))
 #define NV_ENCODE_API_FUNCTION_LIST_VER \
     (sizeof(NV_ENCODE_API_FUNCTION_LIST) | (NVENCAPI_VERSION << 16))
