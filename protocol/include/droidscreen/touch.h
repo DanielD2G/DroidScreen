@@ -23,7 +23,8 @@ typedef enum {
     DS_TOUCH_CANCEL      = 3,
     DS_TOUCH_HOVER       = 4,
     DS_TOUCH_HOVER_LEAVE = 5,
-    DS_TOUCH_BUTTON_ONLY = 6
+    DS_TOUCH_BUTTON_ONLY = 6,
+    DS_TOUCH_CANCEL_ALL  = 7
 } ds_touch_action_t;
 
 typedef enum {

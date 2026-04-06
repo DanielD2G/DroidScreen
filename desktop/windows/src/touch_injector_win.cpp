@@ -26,6 +26,7 @@ static constexpr uint8_t kTouchCancel = 3;
 static constexpr uint8_t kTouchHover = 4;
 static constexpr uint8_t kTouchHoverLeave = 5;
 static constexpr uint8_t kTouchButtonOnly = 6;
+static constexpr uint8_t kTouchCancelAll = 7;
 
 } // extern "C"
 
@@ -151,6 +152,11 @@ bool WinTouchInjector::inject_touch_locked(uint8_t action, uint8_t ptr_id,
                                            uint16_t touch_major,
                                            uint16_t touch_minor,
                                            uint16_t orientation) {
+    if (action == kTouchCancelAll) {
+        cancel_all_touches_locked();
+        return true;
+    }
+
     POINTER_TYPE_INFO* pointer = touch_pointer_by_id_locked(ptr_id, action);
     if (!pointer) {
         fprintf(stderr, "[touch] no unused pointer entries; cancelling active touches\n");
@@ -183,6 +189,11 @@ bool WinTouchInjector::inject_pen_locked(uint8_t action, uint8_t ptr_id,
                                          uint16_t distance,
                                          uint16_t tilt,
                                          uint16_t rotation) {
+    if (action == kTouchCancelAll) {
+        cancel_active_pen_locked();
+        return true;
+    }
+
     (void)ptr_id;
     (void)distance;
 

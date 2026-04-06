@@ -2,6 +2,11 @@ package com.droidscreen.app
 
 import android.view.InputDevice
 import android.view.MotionEvent
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.math.roundToInt
 
 /**
@@ -18,6 +23,7 @@ object InputRouter {
     private const val DS_TOUCH_HOVER = 4
     private const val DS_TOUCH_HOVER_LEAVE = 5
     private const val DS_TOUCH_BUTTON_ONLY = 6
+    private const val DS_TOUCH_CANCEL_ALL = 7
 
     private const val DS_TOUCH_TOOL_STYLUS = 2
     private const val DS_TOUCH_TOOL_ERASER = 3
@@ -54,38 +60,40 @@ object InputRouter {
         settings: InputSettings,
         activity: MainActivity
     ): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            activeMousePointerId = null
+            return routeCancelAll(event, surfaceWidth, surfaceHeight, settings, activity)
+        }
+
         val actionMasked = event.actionMasked
         val pointerIndex = event.actionIndex
         var handled = false
+        val pointerAction = actionForTouchEvent(event)
+        if (pointerAction < 0) {
+            return false
+        }
 
         when (actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                handled = routePointer(event, 0, surfaceWidth, surfaceHeight, DS_TOUCH_DOWN, settings, activity)
+                handled = routePointer(event, 0, surfaceWidth, surfaceHeight, pointerAction, settings, activity)
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                handled = routePointer(event, pointerIndex, surfaceWidth, surfaceHeight, DS_TOUCH_DOWN, settings, activity)
+                handled = routePointer(event, pointerIndex, surfaceWidth, surfaceHeight, pointerAction, settings, activity)
             }
 
             MotionEvent.ACTION_MOVE -> {
                 for (i in 0 until event.pointerCount) {
-                    handled = routePointer(event, i, surfaceWidth, surfaceHeight, DS_TOUCH_MOVE, settings, activity) || handled
+                    handled = routePointer(event, i, surfaceWidth, surfaceHeight, pointerAction, settings, activity) || handled
                 }
             }
 
             MotionEvent.ACTION_UP -> {
-                handled = routePointer(event, 0, surfaceWidth, surfaceHeight, DS_TOUCH_UP, settings, activity)
+                handled = routePointer(event, 0, surfaceWidth, surfaceHeight, pointerAction, settings, activity)
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                handled = routePointer(event, pointerIndex, surfaceWidth, surfaceHeight, DS_TOUCH_UP, settings, activity)
-            }
-
-            MotionEvent.ACTION_CANCEL -> {
-                for (i in 0 until event.pointerCount) {
-                    handled = routePointer(event, i, surfaceWidth, surfaceHeight, DS_TOUCH_CANCEL, settings, activity) || handled
-                }
-                activeMousePointerId = null
+                handled = routePointer(event, pointerIndex, surfaceWidth, surfaceHeight, pointerAction, settings, activity)
             }
         }
 
@@ -129,7 +137,7 @@ object InputRouter {
         }
         return when (target) {
             InputTarget.TOUCH -> {
-                sendTouch(event, pointerIndex, surfaceWidth, surfaceHeight, action, source, activity)
+                sendTouch(event, pointerIndex, surfaceWidth, surfaceHeight, activity)
                 true
             }
 
@@ -141,6 +149,68 @@ object InputRouter {
             InputTarget.MOUSE -> sendMouse(event, pointerIndex, surfaceWidth, surfaceHeight, action, source, activity)
             InputTarget.IGNORE -> false
         }
+    }
+
+    private fun routeCancelAll(
+        event: MotionEvent,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        settings: InputSettings,
+        activity: MainActivity
+    ): Boolean {
+        var sentTouch = false
+        var sentPen = false
+        var sentMouse = false
+
+        for (i in 0 until event.pointerCount) {
+            val source = classifyPointerSource(event, i, settings.unknownPointerFallback)
+            when (targetForSource(source, settings)) {
+                InputTarget.TOUCH -> {
+                    if (!sentTouch) {
+                        activity.nativeSendTouch(
+                            DS_TOUCH_CANCEL_ALL,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            ORIENTATION_UNKNOWN
+                        )
+                        sentTouch = true
+                    }
+                }
+
+                InputTarget.PEN -> {
+                    if (!sentPen) {
+                        activity.nativeSendPen(
+                            DS_TOUCH_CANCEL_ALL,
+                            0,
+                            DS_TOUCH_TOOL_STYLUS,
+                            0,
+                            0,
+                            0,
+                            0,
+                            DISTANCE_UNKNOWN,
+                            TILT_UNKNOWN,
+                            ORIENTATION_UNKNOWN
+                        )
+                        sentPen = true
+                    }
+                }
+
+                InputTarget.MOUSE -> {
+                    if (!sentMouse) {
+                        activity.nativeSendMouse(DS_TOUCH_CANCEL, 0, 0, 0)
+                        sentMouse = true
+                    }
+                }
+
+                InputTarget.IGNORE -> Unit
+            }
+        }
+
+        return sentTouch || sentPen || sentMouse
     }
 
     private fun classifyPointerSource(
@@ -187,30 +257,28 @@ object InputRouter {
         pointerIndex: Int,
         surfaceWidth: Int,
         surfaceHeight: Int,
-        action: Int,
-        source: PointerSource,
         activity: MainActivity
     ) {
+        val action = actionForTouchEvent(event)
+        if (action < 0) {
+            return
+        }
+
         val pointerId = event.getPointerId(pointerIndex)
         val xFrac = normalizePosition(event.getX(pointerIndex), surfaceWidth)
         val yFrac = normalizePosition(event.getY(pointerIndex), surfaceHeight)
-        val pressureFrac = normalizeUnit(event.getPressure(pointerIndex))
-        val touchMajorFrac = normalizeContact(event.getTouchMajor(pointerIndex), surfaceWidth)
-        val touchMinorFrac = normalizeContact(event.getTouchMinor(pointerIndex), surfaceHeight)
-        val orientation = normalizeRotation(event.getOrientation(pointerIndex))
-        if (source == PointerSource.FINGER &&
-            (action == DS_TOUCH_HOVER || action == DS_TOUCH_HOVER_LEAVE || action == DS_TOUCH_BUTTON_ONLY)) {
-            return
-        }
+        val pressureOrDistance = getPressureOrDistance(event, pointerIndex)
+        val normalizedContactArea = getNormalizedContactArea(event, pointerIndex, surfaceWidth, surfaceHeight)
+        val orientation = getRotationDegrees(event, pointerIndex)
 
         activity.nativeSendTouch(
             action,
             pointerId,
             xFrac,
             yFrac,
-            pressureFrac,
-            touchMajorFrac,
-            touchMinorFrac,
+            pressureOrDistance,
+            normalizedContactArea.first,
+            normalizedContactArea.second,
             orientation
         )
     }
@@ -227,10 +295,9 @@ object InputRouter {
         val pointerId = event.getPointerId(pointerIndex)
         val xFrac = normalizePosition(event.getX(pointerIndex), surfaceWidth)
         val yFrac = normalizePosition(event.getY(pointerIndex), surfaceHeight)
-        val pressureFrac = normalizeUnit(event.getPressure(pointerIndex))
-        val distance = normalizeAxis(event, pointerIndex, MotionEvent.AXIS_DISTANCE, DISTANCE_UNKNOWN)
+        val pressureOrDistance = getPressureOrDistance(event, pointerIndex)
         val tilt = normalizeTilt(event, pointerIndex)
-        val rotation = normalizeRotation(event.getOrientation(pointerIndex))
+        val rotation = getRotationDegrees(event, pointerIndex)
         val toolType = if (source == PointerSource.ERASER) DS_TOUCH_TOOL_ERASER else DS_TOUCH_TOOL_STYLUS
         val buttons = mapStylusButtons(event.buttonState)
 
@@ -241,8 +308,8 @@ object InputRouter {
             buttons,
             xFrac,
             yFrac,
-            pressureFrac,
-            distance,
+            pressureOrDistance,
+            pressureOrDistance,
             tilt,
             rotation
         )
@@ -350,22 +417,6 @@ object InputRouter {
         return (value.coerceIn(0f, 1f) * FRAC_MAX).roundToInt().coerceIn(0, FRAC_MAX)
     }
 
-    private fun normalizeAxis(
-        event: MotionEvent,
-        pointerIndex: Int,
-        axis: Int,
-        unknown: Int
-    ): Int {
-        if (!supportsAxis(event, axis)) {
-            return unknown
-        }
-        val value = event.getAxisValue(axis, pointerIndex)
-        if (!value.isFinite()) {
-            return unknown
-        }
-        return normalizeUnit(value)
-    }
-
     private fun normalizeTilt(event: MotionEvent, pointerIndex: Int): Int {
         if (!supportsAxis(event, MotionEvent.AXIS_TILT)) {
             return TILT_UNKNOWN
@@ -385,6 +436,107 @@ object InputRouter {
             .roundToInt()
             .coerceIn(0, 359)
     }
+
+    private fun actionForTouchEvent(event: MotionEvent): Int =
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_POINTER_DOWN -> DS_TOUCH_DOWN
+
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_POINTER_UP -> {
+                if ((event.flags and MotionEvent.FLAG_CANCELED) != 0) {
+                    DS_TOUCH_CANCEL
+                } else {
+                    DS_TOUCH_UP
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> DS_TOUCH_MOVE
+            MotionEvent.ACTION_HOVER_ENTER,
+            MotionEvent.ACTION_HOVER_MOVE -> DS_TOUCH_HOVER
+            MotionEvent.ACTION_HOVER_EXIT -> DS_TOUCH_HOVER_LEAVE
+            MotionEvent.ACTION_BUTTON_PRESS,
+            MotionEvent.ACTION_BUTTON_RELEASE -> DS_TOUCH_BUTTON_ONLY
+            MotionEvent.ACTION_CANCEL -> DS_TOUCH_CANCEL_ALL
+            else -> -1
+        }
+
+    private fun getPressureOrDistance(event: MotionEvent, pointerIndex: Int): Int {
+        val device = event.device
+        return when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER,
+            MotionEvent.ACTION_HOVER_MOVE,
+            MotionEvent.ACTION_HOVER_EXIT -> {
+                val range = device?.getMotionRange(MotionEvent.AXIS_DISTANCE, event.source)
+                if (range != null) {
+                    normalizeValueInRange(event.getAxisValue(MotionEvent.AXIS_DISTANCE, pointerIndex), range)
+                } else {
+                    0
+                }
+            }
+
+            else -> normalizeUnit(event.getPressure(pointerIndex))
+        }
+    }
+
+    private fun getRotationDegrees(event: MotionEvent, pointerIndex: Int): Int {
+        val device = event.device
+        return if (device?.getMotionRange(MotionEvent.AXIS_ORIENTATION, event.source) != null) {
+            normalizeRotation(event.getOrientation(pointerIndex))
+        } else {
+            ORIENTATION_UNKNOWN
+        }
+    }
+
+    private fun getNormalizedContactArea(
+        event: MotionEvent,
+        pointerIndex: Int,
+        surfaceWidth: Int,
+        surfaceHeight: Int
+    ): Pair<Int, Int> {
+        if (surfaceWidth <= 0 || surfaceHeight <= 0) {
+            return 0 to 0
+        }
+
+        val device = event.device
+        val orientation = if (device?.getMotionRange(MotionEvent.AXIS_ORIENTATION, event.source) == null) {
+            (Math.PI / 4.0).toFloat()
+        } else {
+            event.getOrientation(pointerIndex)
+        }
+
+        val (contactAreaMajor, contactAreaMinor) = when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER,
+            MotionEvent.ACTION_HOVER_MOVE,
+            MotionEvent.ACTION_HOVER_EXIT -> event.getToolMajor(pointerIndex) to event.getToolMinor(pointerIndex)
+
+            else -> event.getTouchMajor(pointerIndex) to event.getTouchMinor(pointerIndex)
+        }
+
+        val majorCartesian = polarToCartesian(contactAreaMajor, orientation)
+        val minorCartesian = polarToCartesian(contactAreaMinor, orientation + (Math.PI / 2.0).toFloat())
+
+        majorCartesian[0] = min(abs(majorCartesian[0]), surfaceWidth.toFloat()) / surfaceWidth.toFloat()
+        minorCartesian[0] = min(abs(minorCartesian[0]), surfaceWidth.toFloat()) / surfaceWidth.toFloat()
+        majorCartesian[1] = min(abs(majorCartesian[1]), surfaceHeight.toFloat()) / surfaceHeight.toFloat()
+        minorCartesian[1] = min(abs(minorCartesian[1]), surfaceHeight.toFloat()) / surfaceHeight.toFloat()
+
+        return normalizeUnit(cartesianToRadius(majorCartesian)) to
+            normalizeUnit(cartesianToRadius(minorCartesian))
+    }
+
+    private fun normalizeValueInRange(value: Float, range: InputDevice.MotionRange): Int {
+        if (!value.isFinite() || range.range == 0f) {
+            return 0
+        }
+        return normalizeUnit((value - range.min) / range.range)
+    }
+
+    private fun polarToCartesian(r: Float, theta: Float): FloatArray =
+        floatArrayOf((r * cos(theta)), (r * sin(theta)))
+
+    private fun cartesianToRadius(point: FloatArray): Float =
+        sqrt((point[0] * point[0]) + (point[1] * point[1]))
 
     private fun supportsAxis(event: MotionEvent, axis: Int): Boolean =
         event.device?.motionRanges?.any { range ->
