@@ -243,6 +243,21 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
     auto* bgra_texture = static_cast<ID3D11Texture2D*>(native_frame);
     if (!bgra_texture) return false;
 
+    // Verify source texture dimensions match encoder expectations.
+    D3D11_TEXTURE2D_DESC src_desc = {};
+    bgra_texture->GetDesc(&src_desc);
+    if (src_desc.Width != width_ || src_desc.Height != height_) {
+        // Log once then skip — resolution mismatch causes corruption.
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "[ffmpeg] WARNING: source texture %ux%u != "
+                    "encoder %ux%u — skipping frame\n",
+                    src_desc.Width, src_desc.Height, width_, height_);
+            warned = true;
+        }
+        return false;
+    }
+
     // Step 1: Copy the GPU texture to the staging texture.
     context_->CopyResource(staging_texture_.Get(), bgra_texture);
 
