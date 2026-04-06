@@ -103,10 +103,19 @@ bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
 
     // Convert fractional coordinates (0..65535) to pixel coordinates
     // on the surface, then offset to virtual desktop coordinates.
-    int32_t pixel_x = offset_x_ +
-        static_cast<int32_t>((static_cast<uint64_t>(x) * surface_w_) / 65535);
-    int32_t pixel_y = offset_y_ +
-        static_cast<int32_t>((static_cast<uint64_t>(y) * surface_h_) / 65535);
+    uint32_t local_x = 0;
+    uint32_t local_y = 0;
+    if (surface_w_ > 1) {
+        local_x = static_cast<uint32_t>(
+            (static_cast<uint64_t>(x) * (surface_w_ - 1)) / 65535);
+    }
+    if (surface_h_ > 1) {
+        local_y = static_cast<uint32_t>(
+            (static_cast<uint64_t>(y) * (surface_h_ - 1)) / 65535);
+    }
+
+    int32_t pixel_x = offset_x_ + static_cast<int32_t>(local_x);
+    int32_t pixel_y = offset_y_ + static_cast<int32_t>(local_y);
 
     // Update per-pointer state.
     auto& ptr = pointers_[ptr_id];

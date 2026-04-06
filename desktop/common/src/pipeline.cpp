@@ -133,11 +133,6 @@ bool Pipeline::start(uint32_t width, uint32_t height,
         return false;
     }
 
-    // Initialize touch injector.
-    if (touch_enabled) {
-        touch_->init(width, height);
-    }
-
     running_.store(true);
     frames_encoded_.store(0);
     frames_captured_.store(0);

@@ -886,9 +886,27 @@ static void connect_sync() {
     // 6. Create touch injector.
     g_app.touch = std::make_unique<droidscreen::WinTouchInjector>();
     if (settings.touch) {
-        if (!g_app.touch->init(cap_w, cap_h)) {
+        MONITORINFOEXW mi = {};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(g_app.vdisplay->monitor_handle(), &mi)) {
+            log_msg("[Stream] GetMonitorInfo failed for virtual display: %lu",
+                    GetLastError());
+            log_msg("[Stream] Touch injector disabled");
+            settings.touch = false;
+        } else if (!g_app.touch->init(
+                cap_w,
+                cap_h,
+                mi.rcMonitor.left,
+                mi.rcMonitor.top)) {
             log_msg("[Stream] Touch injector init failed, continuing without touch");
             settings.touch = false;
+        } else {
+            log_msg("[Stream] Touch target rect: %ls (%ld,%ld)-(%ld,%ld)",
+                    mi.szDevice,
+                    mi.rcMonitor.left,
+                    mi.rcMonitor.top,
+                    mi.rcMonitor.right,
+                    mi.rcMonitor.bottom);
         }
     }
 
