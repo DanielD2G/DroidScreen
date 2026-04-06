@@ -45,8 +45,10 @@ extern "C" NTSTATUS DriverEntry(
 // ===========================================================================
 // EvtDeviceAdd
 //
-// Called by PnP when a new device instance is found. We set up the WDF device
-// and initialize the IddCx adapter.
+// Called by PnP when a new device instance is found. We configure IddCx
+// callbacks and PnP power callbacks on the PWDFDEVICE_INIT, then create
+// the WDF device. All init-config calls must happen BEFORE WdfDeviceCreate
+// because it consumes (invalidates) the PWDFDEVICE_INIT.
 // ===========================================================================
 
 extern "C" NTSTATUS EvtDeviceAdd(
@@ -59,20 +61,37 @@ extern "C" NTSTATUS EvtDeviceAdd(
 
     NTSTATUS status;
 
-    // Let IddCx hook into the device init
-    IddCxDeviceInitConfig initConfig;
-    initConfig.EvtIddCxDeviceIoControl = nullptr; // No custom IOCTL handling
+    // ------- Pre-creation configuration (pDeviceInit is still valid) -------
 
-    status = IddCxDeviceInitialize(&pDeviceInit, &initConfig);
+    // Register IddCx client callbacks
+    IDD_CX_CLIENT_CONFIG iddConfig = {};
+    iddConfig.Size = sizeof(iddConfig);
+
+    iddConfig.EvtIddCxAdapterInitFinished               = EvtAdapterInitFinished;
+    iddConfig.EvtIddCxAdapterCommitModes                 = EvtAdapterCommitModes;
+    iddConfig.EvtIddCxParseMonitorDescription             = EvtParseMonitorDescription;
+    iddConfig.EvtIddCxMonitorGetDefaultDescriptionModes   = EvtMonitorGetDefaultModes;
+    iddConfig.EvtIddCxMonitorQueryTargetModes             = EvtMonitorQueryTargetModes;
+    iddConfig.EvtIddCxMonitorAssignSwapChain              = EvtMonitorAssignSwapChain;
+    iddConfig.EvtIddCxMonitorUnassignSwapChain            = EvtMonitorUnassignSwapChain;
+
+    status = IddCxDeviceInitConfig(pDeviceInit, &iddConfig);
     if (!NT_SUCCESS(status))
     {
-        DS_ERR("IddCxDeviceInitialize failed: 0x%08X", status);
+        DS_ERR("IddCxDeviceInitConfig failed: 0x%08X", status);
         return status;
     }
 
-    // Create the WDF device with our AdapterContext
+    // Register PnP power callbacks (we need D0Entry to start adapter init)
+    WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
+    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
+    pnpCallbacks.EvtDeviceD0Entry = EvtDeviceD0Entry;
+    WdfDeviceInitSetPnpPowerEventCallbacks(pDeviceInit, &pnpCallbacks);
+
+    // ------- Create the device (consumes pDeviceInit) -------
+
     WDF_OBJECT_ATTRIBUTES deviceAttribs;
-    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttribs, AdapterContext);
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttribs, DeviceContext);
 
     WDFDEVICE device = nullptr;
     status = WdfDeviceCreate(&pDeviceInit, &deviceAttribs, &device);
@@ -82,34 +101,9 @@ extern "C" NTSTATUS EvtDeviceAdd(
         return status;
     }
 
-    // Store the device handle in our context
-    auto* pContext = GetAdapterContext(device);
-    pContext->Device = device;
-
-    // Configure IddCx adapter callbacks
-    IDD_CX_CLIENT_CONFIG iddConfig = {};
-    iddConfig.Size = sizeof(iddConfig);
-
-    iddConfig.EvtIddCxAdapterInitFinished         = EvtAdapterInitFinished;
-    iddConfig.EvtIddCxAdapterCommitModes           = EvtAdapterCommitModes;
-    iddConfig.EvtIddCxParseMonitorDescription      = EvtParseMonitorDescription;
-    iddConfig.EvtIddCxMonitorGetDefaultDescriptionModes = EvtMonitorGetDefaultModes;
-    iddConfig.EvtIddCxMonitorQueryTargetModes      = EvtMonitorQueryTargetModes;
-    iddConfig.EvtIddCxMonitorAssignSwapChain       = EvtMonitorAssignSwapChain;
-    iddConfig.EvtIddCxMonitorUnassignSwapChain     = EvtMonitorUnassignSwapChain;
-
-    status = IddCxDeviceInitConfig(device, &iddConfig);
-    if (!NT_SUCCESS(status))
-    {
-        DS_ERR("IddCxDeviceInitConfig failed: 0x%08X", status);
-        return status;
-    }
-
-    // Configure power management — we need D0Entry to init the adapter
-    WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
-    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
-    pnpCallbacks.EvtDeviceD0Entry = EvtDeviceD0Entry;
-    WdfDeviceInitSetPnpPowerEventCallbacks(pDeviceInit, &pnpCallbacks);
+    // Initialize our device context
+    auto* pDevCtx = GetDeviceContext(device);
+    pDevCtx->Device = device;
 
     return status;
 }
@@ -118,7 +112,11 @@ extern "C" NTSTATUS EvtDeviceAdd(
 // EvtDeviceD0Entry
 //
 // Called when the device enters the D0 (working) power state. We initialize
-// the IddCx adapter here.
+// the IddCx adapter here, which triggers the async adapter init flow.
+//
+// We attach an AdapterContext (with a back-pointer to the WDFDEVICE) to the
+// adapter object so EvtAdapterInitFinished can navigate back to our
+// DeviceContext.
 // ===========================================================================
 
 extern "C" NTSTATUS EvtDeviceD0Entry(
@@ -129,9 +127,9 @@ extern "C" NTSTATUS EvtDeviceD0Entry(
 
     DS_LOG("EvtDeviceD0Entry");
 
-    auto* pContext = GetAdapterContext(Device);
+    auto* pDevCtx = GetDeviceContext(Device);
 
-    // Set up the adapter attributes
+    // Configure adapter capabilities
     IDDCX_ADAPTER_CAPS caps = {};
     caps.Size = sizeof(caps);
     caps.MaxMonitorsSupported = 1;
@@ -142,19 +140,29 @@ extern "C" NTSTATUS EvtDeviceD0Entry(
     caps.EndPointDiagnostics.pEndPointManufacturerName = L"DroidScreen";
     caps.EndPointDiagnostics.pEndPointModelName = L"DroidScreen Virtual Display";
 
-    // Initialize the adapter asynchronously
+    // Attach an AdapterContext to the adapter so we can navigate back to
+    // the WDFDEVICE in EvtAdapterInitFinished.
+    WDF_OBJECT_ATTRIBUTES adapterAttribs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&adapterAttribs, AdapterContext);
+
+    // Start async adapter initialization
     IDARG_IN_ADAPTER_INIT adapterInit = {};
     adapterInit.WdfDevice = Device;
     adapterInit.pCaps = &caps;
-    adapterInit.ObjectAttributes = WDF_NO_OBJECT_ATTRIBUTES;
+    adapterInit.ObjectAttributes = &adapterAttribs;
 
     IDARG_OUT_ADAPTER_INIT adapterInitOut = {};
     NTSTATUS status = IddCxAdapterInitAsync(&adapterInit, &adapterInitOut);
 
     if (NT_SUCCESS(status))
     {
-        pContext->Adapter = adapterInitOut.AdapterObject;
-        DS_LOG("IddCxAdapterInitAsync succeeded, adapter=%p", pContext->Adapter);
+        pDevCtx->Adapter = adapterInitOut.AdapterObject;
+
+        // Store the back-pointer in the adapter's context
+        auto* pAdapterCtx = GetAdapterContext(adapterInitOut.AdapterObject);
+        pAdapterCtx->ParentDevice = Device;
+
+        DS_LOG("IddCxAdapterInitAsync succeeded, adapter=%p", pDevCtx->Adapter);
     }
     else
     {
@@ -167,8 +175,9 @@ extern "C" NTSTATUS EvtDeviceD0Entry(
 // ===========================================================================
 // EvtAdapterInitFinished
 //
-// Called when adapter initialization is complete. Now we create our single
-// virtual monitor.
+// Called when adapter initialization is complete. We retrieve the parent
+// WDFDEVICE from the AdapterContext we attached to the adapter, then
+// create our single virtual monitor.
 // ===========================================================================
 
 extern "C" NTSTATUS EvtAdapterInitFinished(
@@ -183,16 +192,15 @@ extern "C" NTSTATUS EvtAdapterInitFinished(
         return pInArgs->AdapterInitStatus;
     }
 
-    // Get our device from the adapter's parent
-    WDFDEVICE device = WdfObjectGetTypedContext<AdapterContext>(
-        IddCxAdapterGetWdfDevice(Adapter))->Device;
-    auto* pContext = GetAdapterContext(device);
+    // Navigate: IDDCX_ADAPTER -> AdapterContext -> ParentDevice -> DeviceContext
+    auto* pAdapterCtx = GetAdapterContext(Adapter);
+    auto* pDevCtx = GetDeviceContext(pAdapterCtx->ParentDevice);
 
     // Create the IndirectMonitor helper
-    pContext->Monitor = std::make_unique<IndirectMonitor>();
+    pDevCtx->Monitor = std::make_unique<IndirectMonitor>();
 
     // Create the IddCx monitor and signal its arrival
-    NTSTATUS status = pContext->Monitor->CreateMonitor(Adapter);
+    NTSTATUS status = pDevCtx->Monitor->CreateMonitor(Adapter);
     if (!NT_SUCCESS(status))
     {
         DS_ERR("CreateMonitor failed: 0x%08X", status);
@@ -222,8 +230,8 @@ extern "C" NTSTATUS EvtAdapterCommitModes(
 // ===========================================================================
 // EvtParseMonitorDescription
 //
-// Called by IddCx to parse our EDID. We tell it the monitor supports the
-// modes we defined and return them.
+// Called by IddCx to parse our EDID. We report the supported modes that
+// correspond to our EDID data.
 // ===========================================================================
 
 extern "C" NTSTATUS EvtParseMonitorDescription(
@@ -253,7 +261,7 @@ extern "C" NTSTATUS EvtParseMonitorDescription(
         return STATUS_BUFFER_TOO_SMALL;
     }
 
-    // Fill in the monitor modes from EDID
+    // Fill in the monitor modes parsed from our EDID
     IndirectMonitor::GetDefaultModes(
         pInArgs->pMonitorModes,
         pInArgs->MonitorModeBufferInputCount,
@@ -269,7 +277,7 @@ extern "C" NTSTATUS EvtParseMonitorDescription(
 // EvtMonitorGetDefaultModes
 //
 // Called to get the default display modes when EDID is not available.
-// We always provide EDID, but implement this as a fallback.
+// We always provide EDID, but implement this as a required fallback.
 // ===========================================================================
 
 extern "C" NTSTATUS EvtMonitorGetDefaultModes(
@@ -344,7 +352,7 @@ extern "C" NTSTATUS EvtMonitorQueryTargetModes(
 // EvtMonitorAssignSwapChain
 //
 // Called when the compositor assigns a swap chain to our monitor. We create
-// a SwapChainProcessor to drain frames.
+// a SwapChainProcessor to drain frames and keep the compositor happy.
 // ===========================================================================
 
 extern "C" NTSTATUS EvtMonitorAssignSwapChain(
@@ -355,7 +363,7 @@ extern "C" NTSTATUS EvtMonitorAssignSwapChain(
 
     auto* pMonCtx = GetMonitorContext(Monitor);
 
-    // Create a DXGI device from the rendering device provided by IddCx
+    // Get the DXGI device from the D3D rendering device provided by IddCx
     ComPtr<IDXGIDevice> dxgiDevice;
     HRESULT hr = pInArgs->pRenderDevice->QueryInterface(
         IID_PPV_ARGS(&dxgiDevice));
@@ -366,7 +374,7 @@ extern "C" NTSTATUS EvtMonitorAssignSwapChain(
         return STATUS_UNSUCCESSFUL;
     }
 
-    // Create the swap chain processor - it starts its thread immediately
+    // Create the swap chain processor — it starts its draining thread immediately
     pMonCtx->Processor = std::make_unique<SwapChainProcessor>(
         pInArgs->hSwapChain, dxgiDevice);
 
@@ -377,7 +385,8 @@ extern "C" NTSTATUS EvtMonitorAssignSwapChain(
 // ===========================================================================
 // EvtMonitorUnassignSwapChain
 //
-// Called when the compositor removes the swap chain. Destroy the processor.
+// Called when the compositor removes the swap chain. Destroy the processor,
+// which stops its thread and releases resources.
 // ===========================================================================
 
 extern "C" NTSTATUS EvtMonitorUnassignSwapChain(
@@ -387,7 +396,7 @@ extern "C" NTSTATUS EvtMonitorUnassignSwapChain(
 
     auto* pMonCtx = GetMonitorContext(Monitor);
 
-    // Destroying the processor stops its thread and cleans up
+    // Destroying the processor joins its thread and cleans up
     pMonCtx->Processor.reset();
 
     DS_LOG("SwapChainProcessor destroyed");

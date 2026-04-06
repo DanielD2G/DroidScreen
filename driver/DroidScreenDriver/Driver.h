@@ -47,13 +47,26 @@ class IndirectMonitor;
 // Adapter context — one per IddCx adapter (i.e. one per device instance)
 // ---------------------------------------------------------------------------
 
-struct AdapterContext
+struct DeviceContext
 {
-    IDDCX_ADAPTER Adapter = nullptr;
     WDFDEVICE     Device  = nullptr;
+    IDDCX_ADAPTER Adapter = nullptr;
 
     // The single virtual monitor we create
     std::unique_ptr<IndirectMonitor> Monitor;
+};
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DeviceContext, GetDeviceContext);
+
+// ---------------------------------------------------------------------------
+// Adapter context — stored on the IDDCX_ADAPTER WDF object.
+// Contains a back-pointer to the parent WDFDEVICE so we can navigate
+// from adapter callbacks back to our DeviceContext.
+// ---------------------------------------------------------------------------
+
+struct AdapterContext
+{
+    WDFDEVICE ParentDevice = nullptr;
 };
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(AdapterContext, GetAdapterContext);
