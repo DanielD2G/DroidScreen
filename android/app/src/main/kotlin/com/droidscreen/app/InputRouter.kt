@@ -2,7 +2,6 @@ package com.droidscreen.app
 
 import android.view.InputDevice
 import android.view.MotionEvent
-import android.view.ViewConfiguration
 import kotlin.math.roundToInt
 
 /**
@@ -46,16 +45,7 @@ object InputRouter {
         IGNORE
     }
 
-    private data class FingerTouchState(
-        val downRawX: Float,
-        val downRawY: Float,
-        val downXFrac: Int,
-        val downYFrac: Int,
-        var exceededSlop: Boolean = false
-    )
-
     private var activeMousePointerId: Int? = null
-    private val activeFingerTouches = mutableMapOf<Int, FingerTouchState>()
 
     fun forwardTouch(
         event: MotionEvent,
@@ -202,52 +192,15 @@ object InputRouter {
         activity: MainActivity
     ) {
         val pointerId = event.getPointerId(pointerIndex)
-        val rawX = event.getX(pointerIndex)
-        val rawY = event.getY(pointerIndex)
-        var xFrac = normalizePosition(rawX, surfaceWidth)
-        var yFrac = normalizePosition(rawY, surfaceHeight)
+        val xFrac = normalizePosition(event.getX(pointerIndex), surfaceWidth)
+        val yFrac = normalizePosition(event.getY(pointerIndex), surfaceHeight)
         val pressureFrac = normalizeUnit(event.getPressure(pointerIndex))
         val touchMajorFrac = normalizeContact(event.getTouchMajor(pointerIndex), surfaceWidth)
         val touchMinorFrac = normalizeContact(event.getTouchMinor(pointerIndex), surfaceHeight)
         val orientation = normalizeRotation(event.getOrientation(pointerIndex))
-        val touchSlop = ViewConfiguration.get(activity).scaledTouchSlop.toFloat()
-
-        if (source == PointerSource.FINGER) {
-            when (action) {
-                DS_TOUCH_DOWN -> {
-                    activeFingerTouches[pointerId] = FingerTouchState(
-                        downRawX = rawX,
-                        downRawY = rawY,
-                        downXFrac = xFrac,
-                        downYFrac = yFrac
-                    )
-                }
-
-                DS_TOUCH_MOVE -> {
-                    val state = activeFingerTouches[pointerId]
-                    if (state != null && !state.exceededSlop) {
-                        val dx = rawX - state.downRawX
-                        val dy = rawY - state.downRawY
-                        if ((dx * dx) + (dy * dy) < touchSlop * touchSlop) {
-                            return
-                        }
-                        state.exceededSlop = true
-                    }
-                }
-
-                DS_TOUCH_UP -> {
-                    val state = activeFingerTouches.remove(pointerId)
-                    if (state != null && !state.exceededSlop) {
-                        xFrac = state.downXFrac
-                        yFrac = state.downYFrac
-                    }
-                }
-
-                DS_TOUCH_CANCEL,
-                DS_TOUCH_HOVER_LEAVE -> {
-                    activeFingerTouches.remove(pointerId)
-                }
-            }
+        if (source == PointerSource.FINGER &&
+            (action == DS_TOUCH_HOVER || action == DS_TOUCH_HOVER_LEAVE || action == DS_TOUCH_BUTTON_ONLY)) {
+            return
         }
 
         activity.nativeSendTouch(
