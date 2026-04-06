@@ -379,6 +379,17 @@ static bool adb_device_connected() {
     return false;
 }
 
+/// Returns true if the DroidScreen Android app is currently running on the device.
+static bool adb_droidscreen_running() {
+    std::string output;
+    if (adb_run("shell pidof com.droidscreen.app", &output) != 0) return false;
+    // pidof returns the PID (a number) if the process is running, empty otherwise.
+    for (char c : output) {
+        if (c >= '0' && c <= '9') return true;
+    }
+    return false;
+}
+
 // ============================================================================
 // Debug Logging
 // ============================================================================
@@ -438,6 +449,7 @@ struct AppState {
     std::atomic<bool> isStreaming{false};
     std::atomic<bool> isBusy{false};
     std::atomic<bool> wantQuit{false};
+    std::atomic<bool> userDisconnected{false};  // Suppresses auto-connect until device is re-plugged or user clicks Connect.
 
     // Pipeline components.
     std::unique_ptr<droidscreen::VirtualDisplayWin> vdisplay;
@@ -1059,9 +1071,22 @@ static void on_device_timer() {
     std::thread([]() {
         bool connected = adb_device_connected();
 
-        if (!connected && g_app.isStreaming.load() && !g_app.isBusy.load()) {
-            log_msg("[AutoDetect] Device disconnected, stopping...");
-            disconnect_sync();
+        if (!connected) {
+            // Device physically removed — reset the user-disconnect flag so
+            // auto-connect kicks in when the device is plugged back in.
+            g_app.userDisconnected.store(false);
+
+            if (g_app.isStreaming.load() && !g_app.isBusy.load()) {
+                log_msg("[AutoDetect] Device disconnected, stopping...");
+                disconnect_sync();
+            }
+        } else if (connected && !g_app.isStreaming.load() && !g_app.isBusy.load()
+                   && !g_app.userDisconnected.load()) {
+            // Device connected but not streaming — check if DroidScreen app is running.
+            if (adb_droidscreen_running()) {
+                log_msg("[AutoConnect] DroidScreen detected on device, connecting...");
+                connect_sync();
+            }
         }
     }).detach();
 }
@@ -1087,8 +1112,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case IDM_CONNECT:
             if (g_app.isStreaming.load()) {
+                g_app.userDisconnected.store(true);
                 disconnect_async();
             } else {
+                g_app.userDisconnected.store(false);
                 connect_async();
             }
             break;

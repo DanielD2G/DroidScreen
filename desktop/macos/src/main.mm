@@ -128,7 +128,6 @@ static NSString* const kSettingFPS          = @"DroidScreenFPS";
 static NSString* const kSettingBitrate      = @"DroidScreenBitrate";      // kbps
 static NSString* const kSettingResolution   = @"DroidScreenResolution";   // index
 static NSString* const kSettingScale        = @"DroidScreenScale";        // index
-static NSString* const kSettingAutoConnect  = @"DroidScreenAutoConnect";
 static NSString* const kSettingPort         = @"DroidScreenPort";
 
 // Resolution presets: logical (point) resolution of the virtual display.
@@ -320,6 +319,17 @@ static BOOL adb_device_connected() {
     return NO;
 }
 
+/// Returns YES if the DroidScreen Android app is currently running on the device.
+static BOOL adb_droidscreen_running() {
+    NSString* output = adb_run_output(@[@"shell", @"pidof", @"com.droidscreen.app"]);
+    // pidof returns the PID (a number) if the process is running, empty otherwise.
+    for (NSUInteger i = 0; i < output.length; i++) {
+        unichar c = [output characterAtIndex:i];
+        if (c >= '0' && c <= '9') return YES;
+    }
+    return NO;
+}
+
 // =============================================================================
 #pragma mark - Menu Bar Icon
 // =============================================================================
@@ -391,12 +401,12 @@ static NSImage* CreateStatusBarIcon() {
 @property (nonatomic, strong) NSPopUpButton* resolutionPopup;
 @property (nonatomic, strong) NSPopUpButton* scalePopup;       // unused, kept for compat
 @property (nonatomic, strong) NSButton*      retinaCheckbox;
-@property (nonatomic, strong) NSButton*      autoConnectCheckbox;
 @property (nonatomic, strong) NSTextField*   portField;
 
 // State.
 @property (nonatomic, assign) BOOL isStreaming;
 @property (nonatomic, assign) BOOL isBusy;  // Prevents concurrent connect/disconnect ops.
+@property (nonatomic, assign) BOOL userDisconnected;  // Suppresses auto-connect until device is re-plugged or user clicks Connect.
 
 @end
 
@@ -435,7 +445,6 @@ static NSImage* CreateStatusBarIcon() {
         kSettingBitrate:     @15000,
         kSettingResolution:  @0,
         kSettingScale:       @0,
-        kSettingAutoConnect: @NO,
         kSettingPort:        @38271,
     }];
 
@@ -547,7 +556,7 @@ static NSImage* CreateStatusBarIcon() {
 // -----------------------------------------------------------------------------
 
 - (void)buildSettingsWindow {
-    NSRect frame = NSMakeRect(0, 0, 400, 370);
+    NSRect frame = NSMakeRect(0, 0, 400, 330);
     NSWindowStyleMask style = NSWindowStyleMaskTitled
                             | NSWindowStyleMaskClosable;
 
@@ -623,17 +632,7 @@ static NSImage* CreateStatusBarIcon() {
     [contentView addSubview:self.retinaCheckbox];
     [self addLabel:@"Quality:" toView:contentView atX:leftMargin y:y width:labelWidth];
 
-    // --- Row 5: Auto-connect ---
-    y -= rowHeight + 12;
-    self.autoConnectCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(controlLeft, y, controlWidth, 20)];
-    [self.autoConnectCheckbox setButtonType:NSButtonTypeSwitch];
-    self.autoConnectCheckbox.title = @"Auto-connect when device detected";
-    [self.autoConnectCheckbox setFont:[NSFont systemFontOfSize:13]];
-    self.autoConnectCheckbox.state = [[NSUserDefaults standardUserDefaults] boolForKey:kSettingAutoConnect]
-                                     ? NSControlStateValueOn : NSControlStateValueOff;
-    [contentView addSubview:self.autoConnectCheckbox];
-
-    // --- Row 6: Port ---
+    // --- Row 5: Port ---
     y -= rowHeight + 12;
     [self addLabel:@"Port:" toView:contentView atX:leftMargin y:y width:labelWidth];
     self.portField = [[NSTextField alloc] initWithFrame:NSMakeRect(controlLeft, y, 100, 24)];
@@ -700,9 +699,6 @@ static NSImage* CreateStatusBarIcon() {
     // Retina (HiDPI).
     [defaults setBool:(self.retinaCheckbox.state == NSControlStateValueOn) forKey:kSettingScale];
 
-    // Auto-connect.
-    [defaults setBool:(self.autoConnectCheckbox.state == NSControlStateValueOn) forKey:kSettingAutoConnect];
-
     // Port.
     NSInteger port = self.portField.integerValue;
     if (port < 1 || port > 65535) port = 38271;
@@ -710,13 +706,12 @@ static NSImage* CreateStatusBarIcon() {
 
     [defaults synchronize];
 
-    NSLog(@"[Settings] Saved: fps=%ld bitrate=%ld res=%ld retina=%d port=%ld auto=%d",
+    NSLog(@"[Settings] Saved: fps=%ld bitrate=%ld res=%ld retina=%d port=%ld",
           (long)fps,
           (long)[defaults integerForKey:kSettingBitrate],
           (long)[defaults integerForKey:kSettingResolution],
           (int)[defaults boolForKey:kSettingScale],
-          (long)port,
-          (int)[defaults boolForKey:kSettingAutoConnect]);
+          (long)port);
 
     // If currently streaming, restart the pipeline with new settings.
     if (_isStreaming) {
@@ -791,7 +786,9 @@ struct StreamSettings {
 - (void)toggleConnect:(id)sender {
     NSLog(@"[DEBUG] toggleConnect: isStreaming=%d", _isStreaming);
     if (_isStreaming) {
-        // Disconnect.
+        // User manually disconnected — suppress auto-connect until device is
+        // re-plugged or user clicks Connect again.
+        _userDisconnected = YES;
         [self updateConnectMenuTitle:@"Disconnecting..."];
         self.connectMenuItem.enabled = NO;
         dispatch_async(_streamQueue, ^{
@@ -801,7 +798,8 @@ struct StreamSettings {
             });
         });
     } else {
-        // Connect.
+        // User manually connecting — clear the suppression flag.
+        _userDisconnected = NO;
         [self updateConnectMenuTitle:@"Connecting..."];
         self.connectMenuItem.enabled = NO;
         dispatch_async(_streamQueue, ^{
@@ -1116,22 +1114,31 @@ struct StreamSettings {
     // Run device check off the main thread.
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         BOOL connected = adb_device_connected();
-        BOOL autoConnect = [[NSUserDefaults standardUserDefaults] boolForKey:kSettingAutoConnect];
 
-        if (autoConnect && connected && !self->_isStreaming && !self->_isBusy) {
-            NSLog(@"[AutoConnect] Device detected, auto-connecting...");
-            dispatch_async(self->_streamQueue, ^{
-                if (!self->_isStreaming) {
-                    [self connectSync];
-                }
-            });
-        } else if (!connected && self->_isStreaming) {
-            NSLog(@"[AutoConnect] Device disconnected, stopping...");
-            dispatch_async(self->_streamQueue, ^{
-                if (self->_isStreaming) {
-                    [self disconnectSync];
-                }
-            });
+        if (!connected) {
+            // Device physically removed — reset the user-disconnect flag so
+            // auto-connect kicks in when the device is plugged back in.
+            self->_userDisconnected = NO;
+
+            if (self->_isStreaming) {
+                NSLog(@"[AutoConnect] Device disconnected, stopping...");
+                dispatch_async(self->_streamQueue, ^{
+                    if (self->_isStreaming) {
+                        [self disconnectSync];
+                    }
+                });
+            }
+        } else if (connected && !self->_isStreaming && !self->_isBusy
+                   && !self->_userDisconnected) {
+            // Device connected but not streaming — check if DroidScreen app is running.
+            if (adb_droidscreen_running()) {
+                NSLog(@"[AutoConnect] DroidScreen detected on device, connecting...");
+                dispatch_async(self->_streamQueue, ^{
+                    if (!self->_isStreaming) {
+                        [self connectSync];
+                    }
+                });
+            }
         }
     });
 }
