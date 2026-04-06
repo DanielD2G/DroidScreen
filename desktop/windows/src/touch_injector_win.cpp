@@ -114,8 +114,15 @@ bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
             (static_cast<uint64_t>(y) * (surface_h_ - 1)) / 65535);
     }
 
-    int32_t pixel_x = offset_x_ + static_cast<int32_t>(local_x);
-    int32_t pixel_y = offset_y_ + static_cast<int32_t>(local_y);
+    // InjectSyntheticPointerInput expects coordinates relative to the
+    // top-left of the virtual screen, not the primary monitor origin.
+    int32_t pixel_x = (offset_x_ - vdesk_x_) + static_cast<int32_t>(local_x);
+    int32_t pixel_y = (offset_y_ - vdesk_y_) + static_cast<int32_t>(local_y);
+
+    if (pixel_x < 0) pixel_x = 0;
+    if (pixel_y < 0) pixel_y = 0;
+    if (pixel_x >= vdesk_width_)  pixel_x = vdesk_width_ - 1;
+    if (pixel_y >= vdesk_height_) pixel_y = vdesk_height_ - 1;
 
     // Update per-pointer state.
     auto& ptr = pointers_[ptr_id];
