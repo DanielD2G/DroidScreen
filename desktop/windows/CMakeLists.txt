@@ -24,6 +24,7 @@ add_executable(droidscreen_desktop WIN32
     src/wgc_capturer.cpp
     src/ffmpeg_encoder.cpp
     src/touch_injector_win.cpp
+    src/virtual_display_win.cpp
 )
 
 target_include_directories(droidscreen_desktop
@@ -46,6 +47,8 @@ target_link_libraries(droidscreen_desktop
         shell32       # Shell_NotifyIcon, SHGetFolderPath
         comctl32      # InitCommonControlsEx
         advapi32      # Registry API
+        setupapi      # SetupDi* functions (parsec-vdd)
+        cfgmgr32      # CM_Get_DevNode_Status (parsec-vdd)
 )
 
 target_compile_features(droidscreen_desktop PRIVATE cxx_std_17)

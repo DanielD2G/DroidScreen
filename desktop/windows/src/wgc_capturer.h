@@ -26,6 +26,12 @@ public:
     ~WGCCapturer() override;
 
     bool init(uint32_t display_index = 0) override;
+
+    /// Initialize capture targeting a specific HMONITOR (e.g. a virtual display).
+    /// This bypasses the DXGI output enumeration and creates a capture item
+    /// directly for the given monitor.
+    bool init_with_monitor(HMONITOR monitor);
+
     bool start(std::function<void(const CapturedFrame&)> on_frame) override;
     void stop() override;
 

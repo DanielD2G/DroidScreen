@@ -174,6 +174,31 @@ Section "DroidScreen (required)" SecMain
 SectionEnd
 
 ; ══════════════════════════════════════════════════════════════
+; Parsec Virtual Display Driver — prompt user to install if missing
+; ══════════════════════════════════════════════════════════════
+Section "Parsec Virtual Display Driver" SecParsecVDD
+  ; Check if the Parsec VDD driver is already installed by looking
+  ; for its device in the registry.
+  ClearErrors
+  ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\ParsecVDA" "ImagePath"
+  IfErrors 0 parsec_already_installed
+
+  ; Driver not found — ask user if they want to download it.
+  MessageBox MB_YESNO|MB_ICONQUESTION \
+    "DroidScreen requires the Parsec Virtual Display Driver to create$\n\
+a virtual monitor for streaming.$\n$\n\
+The driver is not currently installed. Would you like to open$\n\
+the download page now?$\n$\n\
+(You can also install it later — the app will prompt you.)" \
+    IDYES parsec_open_download IDNO parsec_already_installed
+
+  parsec_open_download:
+    ExecShell "open" "https://github.com/nomi-san/parsec-vdd/releases"
+
+  parsec_already_installed:
+SectionEnd
+
+; ══════════════════════════════════════════════════════════════
 ; Uninstaller
 ; ══════════════════════════════════════════════════════════════
 Section "Uninstall"

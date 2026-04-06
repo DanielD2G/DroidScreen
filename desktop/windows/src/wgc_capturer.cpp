@@ -267,6 +267,136 @@ bool WGCCapturer::init(uint32_t display_index) {
     return true;
 }
 
+bool WGCCapturer::init_with_monitor(HMONITOR monitor) {
+    if (!monitor) {
+        fprintf(stderr, "[wgc] init_with_monitor: null HMONITOR\n");
+        return false;
+    }
+
+    // Create D3D11 device with BGRA support (required for WGC).
+    UINT creation_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#ifndef NDEBUG
+    creation_flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+
+    D3D_FEATURE_LEVEL feature_levels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+    };
+
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        creation_flags,
+        feature_levels,
+        _countof(feature_levels),
+        D3D11_SDK_VERSION,
+        device_.ReleaseAndGetAddressOf(),
+        nullptr,
+        context_.ReleaseAndGetAddressOf());
+
+    if (FAILED(hr)) {
+        fprintf(stderr, "[wgc] D3D11CreateDevice failed: 0x%08lx\n", hr);
+        return false;
+    }
+
+    // Get monitor dimensions.
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(monitor, &mi)) {
+        fprintf(stderr, "[wgc] GetMonitorInfo failed\n");
+        return false;
+    }
+
+    width_  = static_cast<uint32_t>(mi.rcMonitor.right - mi.rcMonitor.left);
+    height_ = static_cast<uint32_t>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+
+    fprintf(stderr, "[wgc] init_with_monitor: %ls (%ux%u)\n",
+            mi.szDevice, width_, height_);
+
+    // Create a GraphicsCaptureItem for the monitor via interop.
+    auto interop_factory = winrt::get_activation_factory<
+        GraphicsCaptureItem,
+        IGraphicsCaptureItemInterop>();
+
+    GraphicsCaptureItem item{nullptr};
+    hr = interop_factory->CreateForMonitor(
+        monitor,
+        winrt::guid_of<GraphicsCaptureItem>(),
+        winrt::put_abi(item));
+
+    if (FAILED(hr) || !item) {
+        fprintf(stderr, "[wgc] CreateForMonitor failed: 0x%08lx\n", hr);
+        return false;
+    }
+
+    // Create the staging texture for frame copies.
+    D3D11_TEXTURE2D_DESC staging_desc = {};
+    staging_desc.Width            = width_;
+    staging_desc.Height           = height_;
+    staging_desc.MipLevels        = 1;
+    staging_desc.ArraySize        = 1;
+    staging_desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    staging_desc.SampleDesc.Count = 1;
+    staging_desc.Usage            = D3D11_USAGE_DEFAULT;
+    staging_desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+    hr = device_->CreateTexture2D(&staging_desc, nullptr,
+                                   staging_texture_.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "[wgc] CreateTexture2D (staging) failed: 0x%08lx\n", hr);
+        return false;
+    }
+
+    // Create the frame pool (2 frames, BGRA).
+    IDirect3DDevice winrt_device = create_winrt_device(device_.Get());
+    if (!winrt_device) {
+        return false;
+    }
+
+    auto pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+        winrt_device,
+        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        2,
+        {static_cast<int32_t>(width_), static_cast<int32_t>(height_)});
+
+    if (!pool) {
+        fprintf(stderr, "[wgc] CreateFreeThreaded frame pool failed\n");
+        return false;
+    }
+
+    // Create the capture session.
+    auto session = pool.CreateCaptureSession(item);
+    if (!session) {
+        fprintf(stderr, "[wgc] CreateCaptureSession failed\n");
+        return false;
+    }
+
+    // Disable the yellow capture border (Windows 11 / 10 20H1+).
+    try {
+        session.IsBorderRequired(false);
+    } catch (...) {
+        fprintf(stderr, "[wgc] IsBorderRequired not supported on this build\n");
+    }
+
+    // Disable cursor rendering in the capture (optional).
+    try {
+        session.IsCursorCaptureEnabled(true);
+    } catch (...) {
+    }
+
+    // Store WinRT objects.
+    wrt_ = std::make_unique<WinRTState>();
+    wrt_->item    = item;
+    wrt_->pool    = pool;
+    wrt_->session = session;
+
+    fprintf(stderr, "[wgc] initialized for HMONITOR %p (%ux%u)\n",
+            monitor, width_, height_);
+    return true;
+}
+
 bool WGCCapturer::start(std::function<void(const CapturedFrame&)> on_frame) {
     if (!wrt_) {
         fprintf(stderr, "[wgc] not initialized\n");

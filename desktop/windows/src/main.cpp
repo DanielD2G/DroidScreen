@@ -31,6 +31,7 @@
 #include "wgc_capturer.h"
 #include "ffmpeg_encoder.h"
 #include "touch_injector_win.h"
+#include "virtual_display_win.h"
 #include "droidscreen/pipeline.h"
 #include "droidscreen/server.h"
 
@@ -439,6 +440,7 @@ struct AppState {
     std::atomic<bool> wantQuit{false};
 
     // Pipeline components.
+    std::unique_ptr<droidscreen::VirtualDisplayWin> vdisplay;
     std::unique_ptr<droidscreen::WGCCapturer>     capturer;
     std::unique_ptr<droidscreen::FFmpegEncoder>     encoder;
     std::unique_ptr<droidscreen::TCPClient>        client;
@@ -802,13 +804,49 @@ static void connect_sync() {
     }
     log_msg("[Stream] Target device: %ux%u", dev_w, dev_h);
 
-    // 3. Initialize WGC capturer.
+    // 3. Create a virtual display matching the device resolution.
+    update_status(L"Creating virtual display...");
+    g_app.vdisplay = std::make_unique<droidscreen::VirtualDisplayWin>();
+
+    if (!g_app.vdisplay->is_driver_installed()) {
+        log_msg("[Stream] Parsec VDD: %s", g_app.vdisplay->last_error().c_str());
+        // Show a user-friendly message box with download link.
+        MessageBoxA(nullptr,
+            "The Parsec Virtual Display Driver is required but not installed.\n\n"
+            "Please download and install it from:\n"
+            "https://github.com/nomi-san/parsec-vdd/releases\n\n"
+            "After installing, restart DroidScreen and try again.",
+            "DroidScreen - Driver Required",
+            MB_OK | MB_ICONWARNING);
+        update_status(L"Parsec VDD driver not installed");
+        g_app.vdisplay.reset();
+        adb_forward_remove(settings.port);
+        g_app.isBusy.store(false);
+        return;
+    }
+
+    if (!g_app.vdisplay->create(dev_w, dev_h, settings.fps)) {
+        log_msg("[Stream] Virtual display creation failed: %s",
+                g_app.vdisplay->last_error().c_str());
+        update_status(L"Virtual display creation failed");
+        g_app.vdisplay.reset();
+        adb_forward_remove(settings.port);
+        g_app.isBusy.store(false);
+        return;
+    }
+
+    log_msg("[Stream] Virtual display created: %ux%u@%u HMONITOR=%p",
+            dev_w, dev_h, settings.fps, g_app.vdisplay->monitor_handle());
+
+    // 4. Initialize WGC capturer targeting the virtual display's HMONITOR.
     update_status(L"Initializing capture...");
     g_app.capturer = std::make_unique<droidscreen::WGCCapturer>();
-    if (!g_app.capturer->init(settings.display)) {
-        log_msg("[Stream] WGC capturer init failed");
+    if (!g_app.capturer->init_with_monitor(g_app.vdisplay->monitor_handle())) {
+        log_msg("[Stream] WGC capturer init failed for virtual display");
         update_status(L"Screen capture init failed");
         g_app.capturer.reset();
+        g_app.vdisplay->destroy();
+        g_app.vdisplay.reset();
         adb_forward_remove(settings.port);
         g_app.isBusy.store(false);
         return;
@@ -818,7 +856,7 @@ static void connect_sync() {
     uint32_t cap_h = g_app.capturer->height();
     log_msg("[Stream] Capture resolution: %ux%u", cap_w, cap_h);
 
-    // 4. Create encoder.
+    // 5. Create encoder.
     update_status(L"Initializing encoder...");
     log_msg("[Stream] Creating FFmpeg encoder (D3D device=%p, context=%p)",
             g_app.capturer->device(), g_app.capturer->context());
@@ -838,12 +876,13 @@ static void connect_sync() {
         update_status(L"Encoder init failed");
         g_app.encoder.reset();
         g_app.capturer.reset();
+        if (g_app.vdisplay) { g_app.vdisplay->destroy(); g_app.vdisplay.reset(); }
         adb_forward_remove(settings.port);
         g_app.isBusy.store(false);
         return;
     }
 
-    // 5. Create touch injector.
+    // 6. Create touch injector.
     g_app.touch = std::make_unique<droidscreen::WinTouchInjector>();
     if (settings.touch) {
         if (!g_app.touch->init(cap_w, cap_h)) {
@@ -852,7 +891,7 @@ static void connect_sync() {
         }
     }
 
-    // 6. TCP connect.
+    // 7. TCP connect.
     update_status(L"Connecting to device...");
     g_app.client = std::make_unique<droidscreen::TCPClient>();
     if (!g_app.client->connect(settings.port)) {
@@ -864,12 +903,13 @@ static void connect_sync() {
         if (settings.touch) g_app.touch->shutdown();
         g_app.touch.reset();
         g_app.client.reset();
+        if (g_app.vdisplay) { g_app.vdisplay->destroy(); g_app.vdisplay.reset(); }
         adb_forward_remove(settings.port);
         g_app.isBusy.store(false);
         return;
     }
 
-    // 7. Create and start pipeline.
+    // 8. Create and start pipeline.
     g_app.pipeline = std::make_unique<droidscreen::Pipeline>(
         g_app.capturer.get(), g_app.encoder.get(),
         g_app.client.get(), g_app.touch.get());
@@ -886,6 +926,7 @@ static void connect_sync() {
         g_app.capturer.reset();
         if (settings.touch) g_app.touch->shutdown();
         g_app.touch.reset();
+        if (g_app.vdisplay) { g_app.vdisplay->destroy(); g_app.vdisplay.reset(); }
         adb_forward_remove(settings.port);
         g_app.isBusy.store(false);
         return;
@@ -936,6 +977,12 @@ static void disconnect_sync() {
         g_app.client.reset();
     }
     g_app.capturer.reset();
+
+    // Destroy the virtual display (removes it from Windows).
+    if (g_app.vdisplay) {
+        g_app.vdisplay->destroy();
+        g_app.vdisplay.reset();
+    }
 
     adb_forward_remove(settings.port);
 
