@@ -107,13 +107,14 @@ FunctionEnd
 Section "DroidScreen (required)" SecMain
   SectionIn RO
 
-  ; ── Kill running instance before overwriting ────────────────
-  ; Silently kill any running DroidScreen process so files can
-  ; be overwritten during upgrades. /F = force, /T = tree.
+  ; ── Kill running processes before overwriting ────────────────
+  ; Kill DroidScreen and ADB so files can be overwritten on upgrade.
   nsExec::ExecToLog 'taskkill /F /IM droidscreen_desktop.exe /T'
+  nsExec::ExecToLog 'taskkill /F /IM adb.exe /T'
 
   ; ── Main application + FFmpeg DLLs ──────────────────────────
   SetOutPath "$INSTDIR"
+  SetOverwrite on
   File /oname=droidscreen_desktop.exe "${STAGING_DIR}\app\droidscreen_desktop.exe"
   File /oname=icon.ico "${STAGING_DIR}\icon.ico"
   ; FFmpeg shared libraries (bundled, may not all exist in every build)
@@ -124,11 +125,16 @@ Section "DroidScreen (required)" SecMain
   File /nonfatal "${STAGING_DIR}\app\avformat*.dll"
 
   ; ── ADB (bundled platform-tools) ───────────────────────────
-  ; Always overwrite — updates ADB to latest version.
+  ; Overwrite existing ADB files. We killed adb.exe above so the
+  ; files should be unlocked. Use /nonfatal in case they're still
+  ; locked (e.g. another app holds a handle) — DroidScreen can
+  ; also find ADB on the system PATH at runtime.
   SetOutPath "$INSTDIR\adb"
-  File /oname=adb.exe "${STAGING_DIR}\adb\adb.exe"
-  File /oname=AdbWinApi.dll "${STAGING_DIR}\adb\AdbWinApi.dll"
-  File /oname=AdbWinUsbApi.dll "${STAGING_DIR}\adb\AdbWinUsbApi.dll"
+  SetOverwrite try
+  File /nonfatal /oname=adb.exe "${STAGING_DIR}\adb\adb.exe"
+  File /nonfatal /oname=AdbWinApi.dll "${STAGING_DIR}\adb\AdbWinApi.dll"
+  File /nonfatal /oname=AdbWinUsbApi.dll "${STAGING_DIR}\adb\AdbWinUsbApi.dll"
+  SetOverwrite on
 
   ; ── Save install directory in registry ─────────────────────
   WriteRegStr HKCU "Software\DroidScreen" "InstallDir" "$INSTDIR"
