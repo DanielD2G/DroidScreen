@@ -409,12 +409,15 @@ static void setup_logging() {
         std::string logPath = logDir + "\\droidscreen.log";
         g_logFile = fopen(logPath.c_str(), "w");
         if (g_logFile) {
-            // Redirect stderr to the log file so that fprintf(stderr, ...)
+            log_msg("=== DroidScreen Debug Log ===");
+
+            // Also redirect stderr to the same log file so fprintf(stderr,...)
             // from sub-components (NVENC, WGC, pipeline, etc.) is captured.
             // In a /SUBSYSTEM:WINDOWS app, stderr goes nowhere by default.
-            _dup2(_fileno(g_logFile), _fileno(stderr));
-            setvbuf(stderr, nullptr, _IONBF, 0);
-            log_msg("=== DroidScreen Debug Log ===");
+            // Use freopen which is more reliable than _dup2 for GUI apps.
+            std::string stderrPath = logDir + "\\stderr.log";
+            freopen(stderrPath.c_str(), "w", stderr);
+            setvbuf(stderr, nullptr, _IONBF, 0);  // unbuffered
         }
     }
 }
@@ -816,12 +819,22 @@ static void connect_sync() {
 
     // 4. Create encoder.
     update_status(L"Initializing encoder...");
+    log_msg("[Stream] Creating NVENC encoder (D3D device=%p, context=%p)",
+            g_app.capturer->device(), g_app.capturer->context());
     g_app.encoder = std::make_unique<droidscreen::NvencEncoder>();
     g_app.encoder->set_d3d_device(g_app.capturer->device(),
                                    g_app.capturer->context());
 
+    // Flush stderr before init so any NVENC messages are captured.
+    fflush(stderr);
     if (!g_app.encoder->init(cap_w, cap_h, settings.fps, settings.bitrate_kbps)) {
-        log_msg("[Stream] NVENC encoder init failed");
+        fflush(stderr);
+        // Read back any stderr output that NVENC wrote.
+        // Also log a diagnostic summary.
+        log_msg("[Stream] NVENC encoder init failed for %ux%u@%ufps %ukbps",
+                cap_w, cap_h, settings.fps, settings.bitrate_kbps);
+        log_msg("[Stream] Check: 1) NVIDIA GPU present? 2) Latest drivers? "
+                "3) nvEncodeAPI64.dll in PATH or system?");
         update_status(L"NVENC encoder init failed");
         g_app.encoder.reset();
         g_app.capturer.reset();
