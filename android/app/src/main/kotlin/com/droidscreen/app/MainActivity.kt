@@ -169,49 +169,48 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        return handleTouchEvent(surfaceView, event)
+        return handleTouchEvent(window.decorView, event)
     }
 
     override fun onGenericMotionEvent(event: MotionEvent): Boolean {
-        return handleGenericMotionEvent(surfaceView, event) || super.onGenericMotionEvent(event)
+        return handleGenericMotionEvent(window.decorView, event) || super.onGenericMotionEvent(event)
     }
 
     private fun handleTouchEvent(view: View, event: MotionEvent): Boolean {
-        val width = view.width
-        val height = view.height
+        val width = surfaceView.width
+        val height = surfaceView.height
         if (width <= 0 || height <= 0) {
             return false
         }
 
-        val source = event.source
-        val isPointerSource =
-            (source and InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN ||
-            (source and InputDevice.SOURCE_STYLUS) == InputDevice.SOURCE_STYLUS
-        if (!isPointerSource) {
+        if (!isPointerLikeSource(event)) {
             return false
         }
 
         view.requestUnbufferedDispatch(event)
-        return InputRouter.forwardTouch(event, width, height, inputSettings, this)
+        return InputRouter.forwardTouch(view, surfaceView, event, width, height, inputSettings, this)
     }
 
     private fun handleGenericMotionEvent(view: View, event: MotionEvent): Boolean {
-        val width = view.width
-        val height = view.height
+        val width = surfaceView.width
+        val height = surfaceView.height
         if (width <= 0 || height <= 0) {
             return false
         }
 
-        val source = event.source
-        val isPointerSource =
-            (source and InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN ||
-            (source and InputDevice.SOURCE_STYLUS) == InputDevice.SOURCE_STYLUS
-        if (!isPointerSource) {
+        if (!isPointerLikeSource(event)) {
             return false
         }
 
         view.requestUnbufferedDispatch(event)
-        return InputRouter.forwardGenericMotion(event, width, height, inputSettings, this)
+        return InputRouter.forwardGenericMotion(view, surfaceView, event, width, height, inputSettings, this)
+    }
+
+    private fun isPointerLikeSource(event: MotionEvent): Boolean {
+        val source = event.source
+        return (source and InputDevice.SOURCE_CLASS_POINTER) != 0 ||
+            (source and InputDevice.SOURCE_CLASS_POSITION) != 0 ||
+            source == InputDevice.SOURCE_MOUSE_RELATIVE
     }
 
     private fun bindInputSettingsUi() {

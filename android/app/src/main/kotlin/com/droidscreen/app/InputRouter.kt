@@ -2,6 +2,7 @@ package com.droidscreen.app
 
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.View
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.min
@@ -54,6 +55,8 @@ object InputRouter {
     private var activeMousePointerId: Int? = null
 
     fun forwardTouch(
+        inputView: View,
+        surfaceView: View,
         event: MotionEvent,
         surfaceWidth: Int,
         surfaceHeight: Int,
@@ -62,7 +65,15 @@ object InputRouter {
     ): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
             activeMousePointerId = null
-            return routeCancelAll(event, surfaceWidth, surfaceHeight, settings, activity)
+            return routeCancelAll(
+                inputView,
+                surfaceView,
+                event,
+                surfaceWidth,
+                surfaceHeight,
+                settings,
+                activity
+            )
         }
 
         val actionMasked = event.actionMasked
@@ -75,25 +86,75 @@ object InputRouter {
 
         when (actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                handled = routePointer(event, 0, surfaceWidth, surfaceHeight, pointerAction, settings, activity)
+                handled = routePointer(
+                    inputView,
+                    surfaceView,
+                    event,
+                    0,
+                    surfaceWidth,
+                    surfaceHeight,
+                    pointerAction,
+                    settings,
+                    activity
+                )
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                handled = routePointer(event, pointerIndex, surfaceWidth, surfaceHeight, pointerAction, settings, activity)
+                handled = routePointer(
+                    inputView,
+                    surfaceView,
+                    event,
+                    pointerIndex,
+                    surfaceWidth,
+                    surfaceHeight,
+                    pointerAction,
+                    settings,
+                    activity
+                )
             }
 
             MotionEvent.ACTION_MOVE -> {
                 for (i in 0 until event.pointerCount) {
-                    handled = routePointer(event, i, surfaceWidth, surfaceHeight, pointerAction, settings, activity) || handled
+                    handled = routePointer(
+                        inputView,
+                        surfaceView,
+                        event,
+                        i,
+                        surfaceWidth,
+                        surfaceHeight,
+                        pointerAction,
+                        settings,
+                        activity
+                    ) || handled
                 }
             }
 
             MotionEvent.ACTION_UP -> {
-                handled = routePointer(event, 0, surfaceWidth, surfaceHeight, pointerAction, settings, activity)
+                handled = routePointer(
+                    inputView,
+                    surfaceView,
+                    event,
+                    0,
+                    surfaceWidth,
+                    surfaceHeight,
+                    pointerAction,
+                    settings,
+                    activity
+                )
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                handled = routePointer(event, pointerIndex, surfaceWidth, surfaceHeight, pointerAction, settings, activity)
+                handled = routePointer(
+                    inputView,
+                    surfaceView,
+                    event,
+                    pointerIndex,
+                    surfaceWidth,
+                    surfaceHeight,
+                    pointerAction,
+                    settings,
+                    activity
+                )
             }
         }
 
@@ -101,6 +162,8 @@ object InputRouter {
     }
 
     fun forwardGenericMotion(
+        inputView: View,
+        surfaceView: View,
         event: MotionEvent,
         surfaceWidth: Int,
         surfaceHeight: Int,
@@ -117,10 +180,22 @@ object InputRouter {
             else -> return false
         }
 
-        return routePointer(event, pointerIndex, surfaceWidth, surfaceHeight, action, settings, activity)
+        return routePointer(
+            inputView,
+            surfaceView,
+            event,
+            pointerIndex,
+            surfaceWidth,
+            surfaceHeight,
+            action,
+            settings,
+            activity
+        )
     }
 
     private fun routePointer(
+        inputView: View,
+        surfaceView: View,
         event: MotionEvent,
         pointerIndex: Int,
         surfaceWidth: Int,
@@ -137,21 +212,23 @@ object InputRouter {
         }
         return when (target) {
             InputTarget.TOUCH -> {
-                sendTouch(event, pointerIndex, surfaceWidth, surfaceHeight, activity)
+                sendTouch(inputView, surfaceView, event, pointerIndex, surfaceWidth, surfaceHeight, activity)
                 true
             }
 
             InputTarget.PEN -> {
-                sendPen(event, pointerIndex, surfaceWidth, surfaceHeight, action, source, activity)
+                sendPen(inputView, surfaceView, event, pointerIndex, surfaceWidth, surfaceHeight, action, source, activity)
                 true
             }
 
-            InputTarget.MOUSE -> sendMouse(event, pointerIndex, surfaceWidth, surfaceHeight, action, source, activity)
+            InputTarget.MOUSE -> sendMouse(inputView, surfaceView, event, pointerIndex, surfaceWidth, surfaceHeight, action, source, activity)
             InputTarget.IGNORE -> false
         }
     }
 
     private fun routeCancelAll(
+        inputView: View,
+        surfaceView: View,
         event: MotionEvent,
         surfaceWidth: Int,
         surfaceHeight: Int,
@@ -253,6 +330,8 @@ object InputRouter {
         }
 
     private fun sendTouch(
+        inputView: View,
+        surfaceView: View,
         event: MotionEvent,
         pointerIndex: Int,
         surfaceWidth: Int,
@@ -265,8 +344,14 @@ object InputRouter {
         }
 
         val pointerId = event.getPointerId(pointerIndex)
-        val xFrac = normalizePosition(event.getX(pointerIndex), surfaceWidth)
-        val yFrac = normalizePosition(event.getY(pointerIndex), surfaceHeight)
+        val (xFrac, yFrac) = getSurfaceRelativeNormalizedXY(
+            inputView,
+            surfaceView,
+            event,
+            pointerIndex,
+            surfaceWidth,
+            surfaceHeight
+        )
         val pressureOrDistance = getPressureOrDistance(event, pointerIndex)
         val normalizedContactArea = getNormalizedContactArea(event, pointerIndex, surfaceWidth, surfaceHeight)
         val orientation = getRotationDegrees(event, pointerIndex)
@@ -284,6 +369,8 @@ object InputRouter {
     }
 
     private fun sendPen(
+        inputView: View,
+        surfaceView: View,
         event: MotionEvent,
         pointerIndex: Int,
         surfaceWidth: Int,
@@ -293,8 +380,14 @@ object InputRouter {
         activity: MainActivity
     ) {
         val pointerId = event.getPointerId(pointerIndex)
-        val xFrac = normalizePosition(event.getX(pointerIndex), surfaceWidth)
-        val yFrac = normalizePosition(event.getY(pointerIndex), surfaceHeight)
+        val (xFrac, yFrac) = getSurfaceRelativeNormalizedXY(
+            inputView,
+            surfaceView,
+            event,
+            pointerIndex,
+            surfaceWidth,
+            surfaceHeight
+        )
         val pressureOrDistance = getPressureOrDistance(event, pointerIndex)
         val tilt = normalizeTilt(event, pointerIndex)
         val rotation = getRotationDegrees(event, pointerIndex)
@@ -316,6 +409,8 @@ object InputRouter {
     }
 
     private fun sendMouse(
+        inputView: View,
+        surfaceView: View,
         event: MotionEvent,
         pointerIndex: Int,
         surfaceWidth: Int,
@@ -352,8 +447,14 @@ object InputRouter {
             }
         }
 
-        val xFrac = normalizePosition(event.getX(pointerIndex), surfaceWidth)
-        val yFrac = normalizePosition(event.getY(pointerIndex), surfaceHeight)
+        val (xFrac, yFrac) = getSurfaceRelativeNormalizedXY(
+            inputView,
+            surfaceView,
+            event,
+            pointerIndex,
+            surfaceWidth,
+            surfaceHeight
+        )
         val buttons = desiredMouseButtons(event, action, source)
 
         activity.nativeSendMouse(action, buttons, xFrac, yFrac)
@@ -401,6 +502,33 @@ object InputRouter {
             return 0
         }
         return ((value / dimension) * FRAC_MAX).roundToInt().coerceIn(0, FRAC_MAX)
+    }
+
+    private fun getSurfaceRelativeNormalizedXY(
+        inputView: View,
+        surfaceView: View,
+        event: MotionEvent,
+        pointerIndex: Int,
+        surfaceWidth: Int,
+        surfaceHeight: Int
+    ): Pair<Int, Int> {
+        var x = event.getX(pointerIndex)
+        var y = event.getY(pointerIndex)
+
+        if (inputView !== surfaceView) {
+            val inputLocation = IntArray(2)
+            val surfaceLocation = IntArray(2)
+            inputView.getLocationInWindow(inputLocation)
+            surfaceView.getLocationInWindow(surfaceLocation)
+
+            x += (inputLocation[0] - surfaceLocation[0]).toFloat()
+            y += (inputLocation[1] - surfaceLocation[1]).toFloat()
+        }
+
+        x = x.coerceIn(0f, surfaceWidth.toFloat())
+        y = y.coerceIn(0f, surfaceHeight.toFloat())
+
+        return normalizePosition(x, surfaceWidth) to normalizePosition(y, surfaceHeight)
     }
 
     private fun normalizeContact(value: Float, dimension: Int): Int {
