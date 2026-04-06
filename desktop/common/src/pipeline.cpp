@@ -425,8 +425,10 @@ void Pipeline::recv_loop() {
                     ds_touch_event_t ev;
                     ds_touch_deserialize(payload.data(), &ev);
                     touch_->inject(ev.action, ev.pointer_id,
+                                   ev.tool_type, ev.buttons,
                                    ev.x_frac, ev.y_frac, ev.pressure,
-                                   ev.touch_major, ev.touch_minor, ev.orientation);
+                                   ev.touch_major, ev.touch_minor,
+                                   ev.orientation, ev.distance, ev.tilt);
                 }
                 break;
             }

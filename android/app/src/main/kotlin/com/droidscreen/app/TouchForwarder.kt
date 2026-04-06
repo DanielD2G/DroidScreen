@@ -19,7 +19,14 @@ object TouchForwarder {
     private const val DS_TOUCH_HOVER = 4
     private const val DS_TOUCH_HOVER_LEAVE = 5
     private const val DS_TOUCH_BUTTON_ONLY = 6
+    private const val DS_TOUCH_TOOL_UNKNOWN = 0
+    private const val DS_TOUCH_TOOL_FINGER = 1
+    private const val DS_TOUCH_TOOL_STYLUS = 2
+    private const val DS_TOUCH_TOOL_ERASER = 3
+    private const val DS_TOUCH_TOOL_MOUSE = 4
     private const val ORIENTATION_UNKNOWN = 0xFFFF
+    private const val DISTANCE_UNKNOWN = 0xFFFF
+    private const val TILT_UNKNOWN = 0xFFFF
 
     fun forwardTouch(event: MotionEvent, surfaceWidth: Int, surfaceHeight: Int, activity: MainActivity) {
         val actionMasked = event.actionMasked
@@ -101,13 +108,17 @@ object TouchForwarder {
         val touchMajor = event.getTouchMajor(pointerIndex)
         val touchMinor = event.getTouchMinor(pointerIndex)
         val orientationRad = event.getOrientation(pointerIndex)
+        val toolType = mapToolType(event.getToolType(pointerIndex))
+        val buttons = event.buttonState
+        val distance = normalizeDistance(event, pointerIndex)
+        val tilt = normalizeTilt(event, pointerIndex)
 
         val xFrac = (x / surfaceWidth * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
         val yFrac = (y / surfaceHeight * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
         val pressureFrac = (pressure * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
         val touchMajorFrac = (touchMajor / surfaceWidth * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
         val touchMinorFrac = (touchMinor / surfaceHeight * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
-        val orientationDeg = if (touchMajor > 0f && touchMinor > 0f) {
+        val orientationDeg = if (orientationRad.isFinite()) {
             ((Math.toDegrees(orientationRad.toDouble()) + 360.0) % 360.0).roundToInt().coerceIn(0, 359)
         } else {
             ORIENTATION_UNKNOWN
@@ -116,12 +127,55 @@ object TouchForwarder {
         activity.nativeSendTouch(
             action,
             pointerId,
+            toolType,
+            buttons,
             xFrac,
             yFrac,
             pressureFrac,
             touchMajorFrac,
             touchMinorFrac,
-            orientationDeg
+            orientationDeg,
+            distance,
+            tilt
         )
     }
+
+    private fun mapToolType(toolType: Int): Int =
+        when (toolType) {
+            MotionEvent.TOOL_TYPE_FINGER -> DS_TOUCH_TOOL_FINGER
+            MotionEvent.TOOL_TYPE_STYLUS -> DS_TOUCH_TOOL_STYLUS
+            MotionEvent.TOOL_TYPE_ERASER -> DS_TOUCH_TOOL_ERASER
+            MotionEvent.TOOL_TYPE_MOUSE -> DS_TOUCH_TOOL_MOUSE
+            else -> DS_TOUCH_TOOL_UNKNOWN
+        }
+
+    private fun normalizeDistance(event: MotionEvent, pointerIndex: Int): Int {
+        if (!supportsAxis(event, MotionEvent.AXIS_DISTANCE)) {
+            return DISTANCE_UNKNOWN
+        }
+        return normalizeUnitAxis(event.getAxisValue(MotionEvent.AXIS_DISTANCE, pointerIndex))
+    }
+
+    private fun normalizeTilt(event: MotionEvent, pointerIndex: Int): Int {
+        if (!supportsAxis(event, MotionEvent.AXIS_TILT)) {
+            return TILT_UNKNOWN
+        }
+        val tiltRad = event.getAxisValue(MotionEvent.AXIS_TILT, pointerIndex)
+        if (!tiltRad.isFinite()) {
+            return TILT_UNKNOWN
+        }
+        return Math.toDegrees(tiltRad.toDouble()).roundToInt().coerceIn(0, 90)
+    }
+
+    private fun normalizeUnitAxis(value: Float): Int {
+        if (!value.isFinite()) {
+            return DISTANCE_UNKNOWN
+        }
+        return (value.coerceIn(0f, 1f) * FRAC_MAX).roundToInt().coerceIn(0, FRAC_MAX)
+    }
+
+    private fun supportsAxis(event: MotionEvent, axis: Int): Boolean =
+        event.device?.motionRanges?.any { range ->
+            range.axis == axis
+        } == true
 }

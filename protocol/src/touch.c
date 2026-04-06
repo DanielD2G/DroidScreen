@@ -40,14 +40,19 @@ size_t ds_touch_serialize(uint8_t *buf, const ds_touch_event_t *event)
 {
     buf[0] = event->action;
     buf[1] = event->pointer_id;
-    write_le16(buf + 2, event->x_frac);
-    write_le16(buf + 4, event->y_frac);
-    write_le16(buf + 6, event->pressure);
-    write_le16(buf + 8, event->touch_major);
-    write_le16(buf + 10, event->touch_minor);
-    write_le16(buf + 12, event->orientation);
-    write_le32(buf + 14, event->timestamp_ms);
-    memset(buf + 18, 0, 2);
+    buf[2] = event->tool_type;
+    buf[3] = 0;
+    write_le16(buf + 4, event->x_frac);
+    write_le16(buf + 6, event->y_frac);
+    write_le16(buf + 8, event->pressure);
+    write_le16(buf + 10, event->touch_major);
+    write_le16(buf + 12, event->touch_minor);
+    write_le16(buf + 14, event->orientation);
+    write_le16(buf + 16, event->distance);
+    write_le16(buf + 18, event->tilt);
+    write_le32(buf + 20, event->buttons);
+    write_le32(buf + 24, event->timestamp_ms);
+    memset(buf + 28, 0, 4);
     return DS_TOUCH_EVENT_SIZE;
 }
 
@@ -55,14 +60,19 @@ size_t ds_touch_deserialize(const uint8_t *buf, ds_touch_event_t *event)
 {
     event->action       = buf[0];
     event->pointer_id   = buf[1];
-    event->x_frac       = read_le16(buf + 2);
-    event->y_frac       = read_le16(buf + 4);
-    event->pressure     = read_le16(buf + 6);
-    event->touch_major  = read_le16(buf + 8);
-    event->touch_minor  = read_le16(buf + 10);
-    event->orientation  = read_le16(buf + 12);
-    event->timestamp_ms = read_le32(buf + 14);
-    memcpy(event->reserved, buf + 18, 2);
+    event->tool_type    = buf[2];
+    event->reserved0    = buf[3];
+    event->x_frac       = read_le16(buf + 4);
+    event->y_frac       = read_le16(buf + 6);
+    event->pressure     = read_le16(buf + 8);
+    event->touch_major  = read_le16(buf + 10);
+    event->touch_minor  = read_le16(buf + 12);
+    event->orientation  = read_le16(buf + 14);
+    event->distance     = read_le16(buf + 16);
+    event->tilt         = read_le16(buf + 18);
+    event->buttons      = read_le32(buf + 20);
+    event->timestamp_ms = read_le32(buf + 24);
+    memcpy(event->reserved, buf + 28, 4);
     return DS_TOUCH_EVENT_SIZE;
 }
 

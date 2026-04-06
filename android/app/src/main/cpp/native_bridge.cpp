@@ -599,15 +599,18 @@ Java_com_droidscreen_app_MainActivity_nativeStop(
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendTouch(
         JNIEnv* /*env*/, jobject /*thiz*/,
-        jint action, jint pointerId, jint xFrac, jint yFrac, jint pressure,
-        jint touchMajor, jint touchMinor, jint orientation) {
+        jint action, jint pointerId, jint toolType, jint buttons,
+        jint xFrac, jint yFrac, jint pressure,
+        jint touchMajor, jint touchMinor, jint orientation,
+        jint distance, jint tilt) {
 
     if (g_client_fd < 0) {
         return;
     }
 
-    touch_sender_send(g_client_fd, action, pointerId, xFrac, yFrac, pressure,
-                      touchMajor, touchMinor, orientation);
+    touch_sender_send(g_client_fd, action, pointerId, toolType, buttons,
+                      xFrac, yFrac, pressure, touchMajor, touchMinor,
+                      orientation, distance, tilt);
 }
 
 } /* extern "C" */

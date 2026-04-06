@@ -18,8 +18,10 @@ extern "C" {
  * Returns 0 on success, -1 on error.
  */
 int touch_sender_send(int fd, int action, int pointer_id,
+                      int tool_type, int buttons,
                       int x_frac, int y_frac, int pressure,
-                      int touch_major, int touch_minor, int orientation);
+                      int touch_major, int touch_minor, int orientation,
+                      int distance, int tilt);
 
 #ifdef __cplusplus
 }

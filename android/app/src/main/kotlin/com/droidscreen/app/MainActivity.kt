@@ -198,11 +198,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     external fun nativeSendTouch(
         action: Int,
         pointerId: Int,
+        toolType: Int,
+        buttons: Int,
         xFrac: Int,
         yFrac: Int,
         pressure: Int,
         touchMajor: Int,
         touchMinor: Int,
-        orientation: Int
+        orientation: Int,
+        distance: Int,
+        tilt: Int
     )
 }
