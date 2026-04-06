@@ -30,8 +30,13 @@ public:
     /// @param x Fractional X coordinate (0..65535).
     /// @param y Fractional Y coordinate (0..65535).
     /// @param pressure Touch pressure (0..65535).
+    /// @param touch_major Major axis of the touch contact ellipse (0..65535).
+    /// @param touch_minor Minor axis of the touch contact ellipse (0..65535).
+    /// @param orientation Touch orientation in degrees, or 0xFFFF if unknown.
     virtual bool inject(uint8_t action, uint8_t ptr_id,
-                        uint16_t x, uint16_t y, uint16_t pressure) = 0;
+                        uint16_t x, uint16_t y, uint16_t pressure,
+                        uint16_t touch_major, uint16_t touch_minor,
+                        uint16_t orientation) = 0;
 
     /// Shut down the injector and release resources.
     virtual void shutdown() = 0;
@@ -41,7 +46,8 @@ public:
 class NullTouchInjector : public TouchInjector {
 public:
     bool init(uint32_t, uint32_t, int32_t, int32_t) override { return true; }
-    bool inject(uint8_t, uint8_t, uint16_t, uint16_t, uint16_t) override { return true; }
+    bool inject(uint8_t, uint8_t, uint16_t, uint16_t, uint16_t,
+                uint16_t, uint16_t, uint16_t) override { return true; }
     void shutdown() override {}
 };
 

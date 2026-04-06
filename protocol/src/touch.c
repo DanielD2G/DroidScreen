@@ -43,8 +43,11 @@ size_t ds_touch_serialize(uint8_t *buf, const ds_touch_event_t *event)
     write_le16(buf + 2, event->x_frac);
     write_le16(buf + 4, event->y_frac);
     write_le16(buf + 6, event->pressure);
-    write_le32(buf + 8, event->timestamp_ms);
-    memset(buf + 12, 0, 4);
+    write_le16(buf + 8, event->touch_major);
+    write_le16(buf + 10, event->touch_minor);
+    write_le16(buf + 12, event->orientation);
+    write_le32(buf + 14, event->timestamp_ms);
+    memset(buf + 18, 0, 2);
     return DS_TOUCH_EVENT_SIZE;
 }
 
@@ -55,8 +58,11 @@ size_t ds_touch_deserialize(const uint8_t *buf, ds_touch_event_t *event)
     event->x_frac       = read_le16(buf + 2);
     event->y_frac       = read_le16(buf + 4);
     event->pressure     = read_le16(buf + 6);
-    event->timestamp_ms = read_le32(buf + 8);
-    memcpy(event->reserved, buf + 12, 4);
+    event->touch_major  = read_le16(buf + 8);
+    event->touch_minor  = read_le16(buf + 10);
+    event->orientation  = read_le16(buf + 12);
+    event->timestamp_ms = read_le32(buf + 14);
+    memcpy(event->reserved, buf + 18, 2);
     return DS_TOUCH_EVENT_SIZE;
 }
 

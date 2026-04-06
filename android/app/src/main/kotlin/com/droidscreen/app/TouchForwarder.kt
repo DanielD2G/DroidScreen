@@ -1,6 +1,7 @@
 package com.droidscreen.app
 
 import android.view.MotionEvent
+import kotlin.math.roundToInt
 
 /**
  * Converts MotionEvent touch data to fractional coordinates and forwards
@@ -15,6 +16,7 @@ object TouchForwarder {
     private const val DS_TOUCH_MOVE = 1
     private const val DS_TOUCH_UP = 2
     private const val DS_TOUCH_CANCEL = 3
+    private const val ORIENTATION_UNKNOWN = 0xFFFF
 
     fun forward(event: MotionEvent, surfaceWidth: Int, surfaceHeight: Int, activity: MainActivity) {
         val actionMasked = event.actionMasked
@@ -63,11 +65,30 @@ object TouchForwarder {
         val x = event.getX(pointerIndex)
         val y = event.getY(pointerIndex)
         val pressure = event.getPressure(pointerIndex)
+        val touchMajor = event.getTouchMajor(pointerIndex)
+        val touchMinor = event.getTouchMinor(pointerIndex)
+        val orientationRad = event.getOrientation(pointerIndex)
 
         val xFrac = (x / surfaceWidth * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
         val yFrac = (y / surfaceHeight * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
         val pressureFrac = (pressure * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
+        val touchMajorFrac = (touchMajor / surfaceWidth * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
+        val touchMinorFrac = (touchMinor / surfaceHeight * FRAC_MAX).toInt().coerceIn(0, FRAC_MAX)
+        val orientationDeg = if (touchMajor > 0f && touchMinor > 0f) {
+            ((Math.toDegrees(orientationRad.toDouble()) + 360.0) % 360.0).roundToInt().coerceIn(0, 359)
+        } else {
+            ORIENTATION_UNKNOWN
+        }
 
-        activity.nativeSendTouch(action, pointerId, xFrac, yFrac, pressureFrac)
+        activity.nativeSendTouch(
+            action,
+            pointerId,
+            xFrac,
+            yFrac,
+            pressureFrac,
+            touchMajorFrac,
+            touchMinorFrac,
+            orientationDeg
+        )
     }
 }

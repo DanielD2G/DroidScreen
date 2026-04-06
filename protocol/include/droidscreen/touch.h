@@ -23,14 +23,18 @@ typedef enum {
     DS_TOUCH_CANCEL = 3
 } ds_touch_action_t;
 
-#define DS_TOUCH_EVENT_SIZE  16
+#define DS_TOUCH_EVENT_SIZE  20
+#define DS_TOUCH_ORIENTATION_UNKNOWN  0xFFFFu
 
 /*
- * Touch event (16 bytes)
+ * Touch event (20 bytes)
  *
  * Coordinates are stored as fractional values (0..65535) representing
  * the position as a fraction of the display dimensions.
  * 0 = left/top edge, 65535 = right/bottom edge.
+ *
+ * touch_major / touch_minor are normalized contact ellipse dimensions.
+ * orientation is degrees (0..359) or DS_TOUCH_ORIENTATION_UNKNOWN.
  */
 #pragma pack(push, 1)
 typedef struct {
@@ -39,8 +43,11 @@ typedef struct {
     uint16_t x_frac;
     uint16_t y_frac;
     uint16_t pressure;
+    uint16_t touch_major;
+    uint16_t touch_minor;
+    uint16_t orientation;
     uint32_t timestamp_ms;
-    uint8_t  reserved[4];
+    uint8_t  reserved[2];
 } ds_touch_event_t;
 #pragma pack(pop)
 

@@ -168,6 +168,13 @@ static void* recv_thread_func(void* /*arg*/) {
 
         ds_handshake_req_t req;
         ds_handshake_req_deserialize(hs_buf, &req);
+        if (req.protocol_version != DS_PROTOCOL_VERSION) {
+            LOGE("recv_thread: protocol version mismatch android=%u desktop=%u",
+                 DS_PROTOCOL_VERSION, req.protocol_version);
+            tcp_close(g_client_fd);
+            g_client_fd = -1;
+            continue;
+        }
         LOGI("recv_thread: handshake req: %ux%u @ %u fps, codec=%u",
              req.width, req.height, req.fps, req.codec);
 
@@ -592,13 +599,15 @@ Java_com_droidscreen_app_MainActivity_nativeStop(
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendTouch(
         JNIEnv* /*env*/, jobject /*thiz*/,
-        jint action, jint pointerId, jint xFrac, jint yFrac, jint pressure) {
+        jint action, jint pointerId, jint xFrac, jint yFrac, jint pressure,
+        jint touchMajor, jint touchMinor, jint orientation) {
 
     if (g_client_fd < 0) {
         return;
     }
 
-    touch_sender_send(g_client_fd, action, pointerId, xFrac, yFrac, pressure);
+    touch_sender_send(g_client_fd, action, pointerId, xFrac, yFrac, pressure,
+                      touchMajor, touchMinor, orientation);
 }
 
 } /* extern "C" */

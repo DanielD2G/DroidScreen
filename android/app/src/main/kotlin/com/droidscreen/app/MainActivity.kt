@@ -156,5 +156,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private external fun nativeInit(surface: Surface, port: Int)
     private external fun nativeStop()
-    external fun nativeSendTouch(action: Int, pointerId: Int, xFrac: Int, yFrac: Int, pressure: Int)
+    external fun nativeSendTouch(
+        action: Int,
+        pointerId: Int,
+        xFrac: Int,
+        yFrac: Int,
+        pressure: Int,
+        touchMajor: Int,
+        touchMinor: Int,
+        orientation: Int
+    )
 }

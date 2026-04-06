@@ -106,6 +106,12 @@ bool Pipeline::handshake(uint32_t width, uint32_t height,
     ds_handshake_resp_t resp;
     ds_handshake_resp_deserialize(resp_buf, &resp);
 
+    if (resp.protocol_version != DS_PROTOCOL_VERSION) {
+        fprintf(stderr, "[pipeline] protocol version mismatch: desktop=%u android=%u\n",
+                DS_PROTOCOL_VERSION, resp.protocol_version);
+        return false;
+    }
+
     fprintf(stderr, "[pipeline] handshake complete: peer accepted %ux%u@%u, "
             "codec=%u, max_bitrate=%u kbps, touch=%u\n",
             resp.accepted_width, resp.accepted_height, resp.accepted_fps,
@@ -415,11 +421,12 @@ void Pipeline::recv_loop() {
             }
 
             case DS_MSG_TOUCH_EVENT: {
-                if (hdr.length >= DS_TOUCH_EVENT_SIZE) {
+                if (hdr.length == DS_TOUCH_EVENT_SIZE) {
                     ds_touch_event_t ev;
                     ds_touch_deserialize(payload.data(), &ev);
                     touch_->inject(ev.action, ev.pointer_id,
-                                   ev.x_frac, ev.y_frac, ev.pressure);
+                                   ev.x_frac, ev.y_frac, ev.pressure,
+                                   ev.touch_major, ev.touch_minor, ev.orientation);
                 }
                 break;
             }
