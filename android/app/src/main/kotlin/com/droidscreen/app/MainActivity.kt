@@ -128,7 +128,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return handleGenericMotionEvent(surfaceView, event) || super.onGenericMotionEvent(event)
     }
 
-    private fun handleTouchEvent(view: SurfaceView, event: MotionEvent): Boolean {
+    private fun handleTouchEvent(view: View, event: MotionEvent): Boolean {
         val width = view.width
         val height = view.height
         if (width <= 0 || height <= 0) {
@@ -140,7 +140,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return true
     }
 
-    private fun handleGenericMotionEvent(view: SurfaceView, event: MotionEvent): Boolean {
+    private fun handleGenericMotionEvent(view: View, event: MotionEvent): Boolean {
         val width = view.width
         val height = view.height
         if (width <= 0 || height <= 0) {
