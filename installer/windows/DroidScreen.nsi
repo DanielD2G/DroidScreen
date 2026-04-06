@@ -112,10 +112,16 @@ Section "DroidScreen (required)" SecMain
   ; be overwritten during upgrades. /F = force, /T = tree.
   nsExec::ExecToLog 'taskkill /F /IM droidscreen_desktop.exe /T'
 
-  ; ── Main application ───────────────────────────────────────
+  ; ── Main application + FFmpeg DLLs ──────────────────────────
   SetOutPath "$INSTDIR"
   File /oname=droidscreen_desktop.exe "${STAGING_DIR}\app\droidscreen_desktop.exe"
   File /oname=icon.ico "${STAGING_DIR}\icon.ico"
+  ; FFmpeg shared libraries (bundled, may not all exist in every build)
+  File /nonfatal "${STAGING_DIR}\app\avcodec*.dll"
+  File /nonfatal "${STAGING_DIR}\app\avutil*.dll"
+  File /nonfatal "${STAGING_DIR}\app\swscale*.dll"
+  File /nonfatal "${STAGING_DIR}\app\swresample*.dll"
+  File /nonfatal "${STAGING_DIR}\app\avformat*.dll"
 
   ; ── ADB (bundled platform-tools) ───────────────────────────
   ; Always overwrite — updates ADB to latest version.
@@ -177,6 +183,11 @@ Section "Uninstall"
   ; ── Remove application files ───────────────────────────────
   Delete "$INSTDIR\droidscreen_desktop.exe"
   Delete "$INSTDIR\icon.ico"
+  Delete "$INSTDIR\avcodec*.dll"
+  Delete "$INSTDIR\avutil*.dll"
+  Delete "$INSTDIR\swscale*.dll"
+  Delete "$INSTDIR\swresample*.dll"
+  Delete "$INSTDIR\avformat*.dll"
   Delete "$INSTDIR\adb\adb.exe"
   Delete "$INSTDIR\adb\AdbWinApi.dll"
   Delete "$INSTDIR\adb\AdbWinUsbApi.dll"

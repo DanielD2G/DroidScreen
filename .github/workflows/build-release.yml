@@ -183,10 +183,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install FFmpeg via vcpkg
+      - name: Install FFmpeg (prebuilt)
         shell: pwsh
         run: |
-          & C:\vcpkg\vcpkg install ffmpeg[core,avcodec,swscale,x264]:x64-windows
+          # Download prebuilt FFmpeg shared+dev from BtbN (GPL, includes x264/nvenc/qsv)
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
+          Write-Host "Downloading FFmpeg from BtbN..."
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extract
+
+          # Find the extracted directory (name varies with version)
+          $ffDir = Get-ChildItem ffmpeg-extract | Select-Object -First 1
+          Write-Host "FFmpeg dir: $($ffDir.FullName)"
+
+          # Set env vars for CMake to find the headers and libs
+          $ffPath = $ffDir.FullName
+          echo "FFMPEG_DIR=$ffPath" >> $env:GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$ffPath" >> $env:GITHUB_ENV
 
       - name: Configure & build (x64 Release)
         shell: pwsh
@@ -194,8 +207,8 @@ jobs:
           cmake -B build -S . `
             -G "Visual Studio 17 2022" `
             -A x64 `
-            -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
-            -DCMAKE_SYSTEM_VERSION=10.0
+            -DCMAKE_SYSTEM_VERSION=10.0 `
+            -DFFMPEG_ROOT="$env:FFMPEG_DIR"
           cmake --build build --config Release --parallel
 
       - name: Download ADB platform-tools
@@ -227,6 +240,17 @@ jobs:
             exit 1
           }
           Copy-Item $exe "staging\app\"
+
+          # Copy FFmpeg DLLs (needed at runtime for shared builds)
+          $ffBin = "$env:FFMPEG_DIR\bin"
+          if (Test-Path $ffBin) {
+            Copy-Item "$ffBin\avcodec*.dll"  "staging\app\" -ErrorAction SilentlyContinue
+            Copy-Item "$ffBin\avutil*.dll"   "staging\app\" -ErrorAction SilentlyContinue
+            Copy-Item "$ffBin\swscale*.dll"  "staging\app\" -ErrorAction SilentlyContinue
+            Copy-Item "$ffBin\swresample*.dll" "staging\app\" -ErrorAction SilentlyContinue
+            Copy-Item "$ffBin\avformat*.dll" "staging\app\" -ErrorAction SilentlyContinue
+            Write-Host "FFmpeg DLLs staged from $ffBin"
+          }
 
           # Copy icon
           Copy-Item "installer\windows\icon.ico" "staging\"
