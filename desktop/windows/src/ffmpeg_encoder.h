@@ -23,9 +23,10 @@
 #include "droidscreen/encoder.h"
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
-#include <cstdint>
+#include <vector>
 
 #include <d3d11.h>
 #include <wrl/client.h>
@@ -65,7 +66,7 @@ private:
                      uint32_t fps, uint32_t bitrate_kbps);
 
     /// Create the D3D11 staging texture for GPU->CPU readback.
-    bool create_staging_texture(uint32_t width, uint32_t height);
+    bool create_staging_texture(uint32_t width, uint32_t height, DXGI_FORMAT format);
 
     /// Emit SPS/PPS as a config packet via the user callback.
     void emit_config(const uint8_t* data, size_t size, int64_t timestamp_us,
@@ -97,8 +98,10 @@ private:
     uint32_t height_  = 0;
     uint32_t fps_     = 0;
     uint32_t bitrate_kbps_ = 0;
+    DXGI_FORMAT source_format_ = DXGI_FORMAT_UNKNOWN;
 
     std::string encoder_name_;
+    std::vector<uint8_t> bgra_scratch_;
 
     std::atomic<bool> keyframe_pending_{false};
     bool config_sent_ = false;

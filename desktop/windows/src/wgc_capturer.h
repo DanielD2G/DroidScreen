@@ -52,6 +52,7 @@ public:
 private:
     /// Called by the FramePool.FrameArrived event.
     void on_frame_arrived();
+    bool ensure_staging_texture(uint32_t width, uint32_t height, DXGI_FORMAT format);
 
     uint32_t width_  = 0;
     uint32_t height_ = 0;
@@ -67,6 +68,7 @@ private:
     // Staging texture for copying frames (the capture texture must be
     // released as quickly as possible to avoid frame pool starvation).
     Microsoft::WRL::ComPtr<ID3D11Texture2D>      staging_texture_;
+    DXGI_FORMAT                                  staging_format_ = DXGI_FORMAT_UNKNOWN;
 
     // WinRT capture objects — stored via pimpl to keep WinRT headers
     // out of this header. Defined in the .cpp.

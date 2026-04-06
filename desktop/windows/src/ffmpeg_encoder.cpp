@@ -16,10 +16,91 @@
 
 #include "ffmpeg_encoder.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
 namespace droidscreen {
+
+namespace {
+
+static float half_to_float(uint16_t bits) {
+    const uint32_t sign = static_cast<uint32_t>(bits & 0x8000u) << 16;
+    uint32_t exp = (bits >> 10) & 0x1Fu;
+    uint32_t mant = bits & 0x03FFu;
+
+    uint32_t out = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            out = sign;
+        } else {
+            int adjusted_exp = -14;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                --adjusted_exp;
+            }
+            mant &= 0x03FFu;
+            out = sign
+                | (static_cast<uint32_t>(adjusted_exp + 127) << 23)
+                | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        out = sign | 0x7F800000u | (mant << 13);
+    } else {
+        out = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+
+    float value = 0.0f;
+    std::memcpy(&value, &out, sizeof(value));
+    return value;
+}
+
+static float linear_to_srgb(float linear) {
+    linear = std::max(0.0f, linear);
+    if (linear <= 0.0031308f) {
+        return linear * 12.92f;
+    }
+    return 1.055f * std::pow(linear, 1.0f / 2.4f) - 0.055f;
+}
+
+static uint8_t float_to_u8(float value) {
+    value = std::clamp(value, 0.0f, 1.0f);
+    return static_cast<uint8_t>(value * 255.0f + 0.5f);
+}
+
+static void convert_fp16_rgba_to_bgra8(
+        const uint8_t* src, uint32_t src_pitch,
+        uint8_t* dst, uint32_t width, uint32_t height) {
+    const uint32_t dst_pitch = width * 4;
+
+    for (uint32_t y = 0; y < height; ++y) {
+        const auto* src_row = reinterpret_cast<const uint16_t*>(src + y * src_pitch);
+        uint8_t* dst_row = dst + static_cast<size_t>(y) * dst_pitch;
+
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint16_t* px = src_row + static_cast<size_t>(x) * 4;
+
+            // WGC HDR capture commonly uses scRGB FP16. Tone-map the linear
+            // values down to SDR, then convert to sRGB for FFmpeg.
+            float r = std::max(0.0f, half_to_float(px[0]));
+            float g = std::max(0.0f, half_to_float(px[1]));
+            float b = std::max(0.0f, half_to_float(px[2]));
+
+            r = linear_to_srgb(r / (1.0f + r));
+            g = linear_to_srgb(g / (1.0f + g));
+            b = linear_to_srgb(b / (1.0f + b));
+
+            uint8_t* out = dst_row + static_cast<size_t>(x) * 4;
+            out[0] = float_to_u8(b);
+            out[1] = float_to_u8(g);
+            out[2] = float_to_u8(r);
+            out[3] = 255;
+        }
+    }
+}
+
+} // namespace
 
 FFmpegEncoder::FFmpegEncoder() = default;
 
@@ -39,13 +120,14 @@ void FFmpegEncoder::set_d3d_device(ID3D11Device* device,
 // Staging texture creation
 // ---------------------------------------------------------------------------
 
-bool FFmpegEncoder::create_staging_texture(uint32_t width, uint32_t height) {
+bool FFmpegEncoder::create_staging_texture(
+        uint32_t width, uint32_t height, DXGI_FORMAT format) {
     D3D11_TEXTURE2D_DESC desc = {};
     desc.Width            = width;
     desc.Height           = height;
     desc.MipLevels        = 1;
     desc.ArraySize        = 1;
-    desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Format           = format;
     desc.SampleDesc.Count = 1;
     desc.Usage            = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
@@ -54,10 +136,13 @@ bool FFmpegEncoder::create_staging_texture(uint32_t width, uint32_t height) {
     HRESULT hr = device_->CreateTexture2D(&desc, nullptr,
                                            staging_texture_.ReleaseAndGetAddressOf());
     if (FAILED(hr)) {
-        fprintf(stderr, "[ffmpeg] CreateTexture2D (staging) failed: 0x%08lx\n", hr);
+        fprintf(stderr,
+                "[ffmpeg] CreateTexture2D (staging %ux%u fmt=%u) failed: 0x%08lx\n",
+                width, height, format, hr);
         return false;
     }
 
+    source_format_ = format;
     return true;
 }
 
@@ -157,14 +242,11 @@ bool FFmpegEncoder::init(uint32_t width, uint32_t height,
     height_       = height;
     fps_          = fps;
     bitrate_kbps_ = bitrate_kbps;
+    source_format_ = DXGI_FORMAT_UNKNOWN;
+    bgra_scratch_.clear();
 
     if (!device_ || !context_) {
         fprintf(stderr, "[ffmpeg] D3D11 device/context not set\n");
-        return false;
-    }
-
-    // Create staging texture for GPU -> CPU readback.
-    if (!create_staging_texture(width, height)) {
         return false;
     }
 
@@ -263,13 +345,12 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
 
     std::lock_guard<std::mutex> lock(encode_mutex_);
 
-    // The native_frame is an ID3D11Texture2D* in BGRA format.
-    auto* bgra_texture = static_cast<ID3D11Texture2D*>(native_frame);
-    if (!bgra_texture) return false;
+    auto* source_texture = static_cast<ID3D11Texture2D*>(native_frame);
+    if (!source_texture) return false;
 
     // Verify source texture dimensions and format.
     D3D11_TEXTURE2D_DESC src_desc = {};
-    bgra_texture->GetDesc(&src_desc);
+    source_texture->GetDesc(&src_desc);
 
     // Log diagnostics on the first frame.
     if (frame_index_ == 0) {
@@ -291,14 +372,22 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
         return false;
     }
 
-    if (src_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
-        static bool format_warned = false;
-        if (!format_warned) {
-            fprintf(stderr, "[ffmpeg] WARNING: source texture format %u != "
-                    "expected B8G8R8A8_UNORM (87) — colors may be wrong\n",
-                    src_desc.Format);
-            format_warned = true;
+    if (src_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        src_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        fprintf(stderr, "[ffmpeg] unsupported source texture format %u\n",
+                src_desc.Format);
+        return false;
+    }
+
+    if (!staging_texture_ || source_format_ != src_desc.Format) {
+        if (!create_staging_texture(width_, height_, src_desc.Format)) {
+            return false;
         }
+        fprintf(stderr, "[ffmpeg] source texture format set to %u%s\n",
+                src_desc.Format,
+                (src_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+                    ? " (HDR/scRGB -> SDR path)"
+                    : "");
     }
 
     // Lock the D3D11 context mutex to prevent races with the WGC
@@ -311,7 +400,7 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
     }
 
     // Step 1: Copy the GPU texture to the staging texture.
-    context_->CopyResource(staging_texture_.Get(), bgra_texture);
+    context_->CopyResource(staging_texture_.Get(), source_texture);
 
     // Step 2: Map the staging texture for CPU read.
     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -323,18 +412,34 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
 
     // Log stride info on first frame.
     if (frame_index_ == 0) {
+        const uint32_t min_pitch =
+            (source_format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) ? width_ * 8 : width_ * 4;
         fprintf(stderr, "[ffmpeg] first frame: mapped RowPitch=%u "
                 "(expected min %u), NV12 linesize[0]=%d linesize[1]=%d\n",
-                mapped.RowPitch, width_ * 4,
+                mapped.RowPitch, min_pitch,
                 nv12_frame_->linesize[0], nv12_frame_->linesize[1]);
     }
 
-    // Step 3: Convert BGRA -> NV12 via sws_scale.
-    const uint8_t* src_data[1] = { static_cast<const uint8_t*>(mapped.pData) };
-    int src_linesize[1] = { static_cast<int>(mapped.RowPitch) };
-
     // Make the frame writable (in case it is referenced by the encoder).
     av_frame_make_writable(nv12_frame_);
+
+    // Step 3: Convert the source frame to BGRA if needed, then BGRA -> NV12.
+    const uint8_t* bgra_data = static_cast<const uint8_t*>(mapped.pData);
+    int bgra_linesize = static_cast<int>(mapped.RowPitch);
+    if (source_format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        bgra_scratch_.resize(static_cast<size_t>(width_) * height_ * 4);
+        convert_fp16_rgba_to_bgra8(
+            static_cast<const uint8_t*>(mapped.pData),
+            mapped.RowPitch,
+            bgra_scratch_.data(),
+            width_,
+            height_);
+        bgra_data = bgra_scratch_.data();
+        bgra_linesize = static_cast<int>(width_ * 4);
+    }
+
+    const uint8_t* src_data[1] = { bgra_data };
+    int src_linesize[1] = { bgra_linesize };
 
     sws_scale(sws_ctx_,
               src_data, src_linesize,
@@ -553,6 +658,8 @@ void FFmpegEncoder::shutdown() {
     device_.Reset();
 
     encoder_name_.clear();
+    source_format_ = DXGI_FORMAT_UNKNOWN;
+    bgra_scratch_.clear();
     config_sent_ = false;
     frame_index_ = 0;
 

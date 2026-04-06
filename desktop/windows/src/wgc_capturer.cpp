@@ -104,6 +104,42 @@ WGCCapturer::~WGCCapturer() {
     stop();
 }
 
+bool WGCCapturer::ensure_staging_texture(
+        uint32_t width, uint32_t height, DXGI_FORMAT format) {
+    if (staging_texture_ && format == staging_format_) {
+        D3D11_TEXTURE2D_DESC current_desc = {};
+        staging_texture_->GetDesc(&current_desc);
+        if (current_desc.Width == width && current_desc.Height == height) {
+            return true;
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC staging_desc = {};
+    staging_desc.Width            = width;
+    staging_desc.Height           = height;
+    staging_desc.MipLevels        = 1;
+    staging_desc.ArraySize        = 1;
+    staging_desc.Format           = format;
+    staging_desc.SampleDesc.Count = 1;
+    staging_desc.Usage            = D3D11_USAGE_DEFAULT;
+    staging_desc.BindFlags        = 0;
+
+    HRESULT hr = device_->CreateTexture2D(
+        &staging_desc, nullptr, staging_texture_.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr,
+                "[wgc] CreateTexture2D (staging %ux%u fmt=%u) failed: 0x%08lx\n",
+                width, height, format, hr);
+        staging_format_ = DXGI_FORMAT_UNKNOWN;
+        return false;
+    }
+
+    staging_format_ = format;
+    fprintf(stderr, "[wgc] staging texture ready: %ux%u fmt=%u\n",
+            width, height, format);
+    return true;
+}
+
 bool WGCCapturer::init(uint32_t display_index) {
     // Create D3D11 device with BGRA support (required for WGC).
     UINT creation_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -196,24 +232,6 @@ bool WGCCapturer::init(uint32_t display_index) {
 
     if (FAILED(hr) || !item) {
         fprintf(stderr, "[wgc] CreateForMonitor failed: 0x%08lx\n", hr);
-        return false;
-    }
-
-    // Create the staging texture for frame copies.
-    D3D11_TEXTURE2D_DESC staging_desc = {};
-    staging_desc.Width            = width_;
-    staging_desc.Height           = height_;
-    staging_desc.MipLevels        = 1;
-    staging_desc.ArraySize        = 1;
-    staging_desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-    staging_desc.SampleDesc.Count = 1;
-    staging_desc.Usage            = D3D11_USAGE_DEFAULT;
-    staging_desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-
-    hr = device_->CreateTexture2D(&staging_desc, nullptr,
-                                   staging_texture_.ReleaseAndGetAddressOf());
-    if (FAILED(hr)) {
-        fprintf(stderr, "[wgc] CreateTexture2D (staging) failed: 0x%08lx\n", hr);
         return false;
     }
 
@@ -328,24 +346,6 @@ bool WGCCapturer::init_with_monitor(HMONITOR monitor) {
 
     if (FAILED(hr) || !item) {
         fprintf(stderr, "[wgc] CreateForMonitor failed: 0x%08lx\n", hr);
-        return false;
-    }
-
-    // Create the staging texture for frame copies.
-    D3D11_TEXTURE2D_DESC staging_desc = {};
-    staging_desc.Width            = width_;
-    staging_desc.Height           = height_;
-    staging_desc.MipLevels        = 1;
-    staging_desc.ArraySize        = 1;
-    staging_desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-    staging_desc.SampleDesc.Count = 1;
-    staging_desc.Usage            = D3D11_USAGE_DEFAULT;
-    staging_desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-
-    hr = device_->CreateTexture2D(&staging_desc, nullptr,
-                                   staging_texture_.ReleaseAndGetAddressOf());
-    if (FAILED(hr)) {
-        fprintf(stderr, "[wgc] CreateTexture2D (staging) failed: 0x%08lx\n", hr);
         return false;
     }
 
@@ -470,6 +470,13 @@ void WGCCapturer::on_frame_arrived() {
     src_box.bottom = (frame_h < height_) ? frame_h : height_;
     src_box.back   = 1;
 
+    D3D11_TEXTURE2D_DESC src_desc = {};
+    source_texture->GetDesc(&src_desc);
+    if (!ensure_staging_texture(src_box.right, src_box.bottom, src_desc.Format)) {
+        frame.Close();
+        return;
+    }
+
     // Lock the D3D11 context mutex — the immediate context is NOT
     // thread-safe and the encode thread also uses it for CopyResource/Map.
     {
@@ -516,6 +523,7 @@ void WGCCapturer::stop() {
 
     // Release the staging texture.
     staging_texture_.Reset();
+    staging_format_ = DXGI_FORMAT_UNKNOWN;
 
     fprintf(stderr, "[wgc] capture stopped\n");
 }
