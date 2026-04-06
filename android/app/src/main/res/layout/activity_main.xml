@@ -9,4 +9,49 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <!-- Status overlay — shown when not streaming, hidden during video -->
+    <LinearLayout
+        android:id="@+id/status_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:background="#CC000000"
+        android:paddingStart="48dp"
+        android:paddingEnd="48dp"
+        android:paddingTop="32dp"
+        android:paddingBottom="32dp">
+
+        <!-- App icon / title -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="DroidScreen"
+            android:textColor="#FFFFFF"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="16dp" />
+
+        <!-- Main status text -->
+        <TextView
+            android:id="@+id/status_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Initializing..."
+            android:textColor="#BBBBBB"
+            android:textSize="18sp"
+            android:layout_marginBottom="8dp" />
+
+        <!-- Detail text (port, etc.) -->
+        <TextView
+            android:id="@+id/status_detail"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#888888"
+            android:textSize="14sp" />
+
+    </LinearLayout>
+
 </FrameLayout>

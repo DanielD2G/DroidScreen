@@ -184,12 +184,18 @@ bool Pipeline::start(uint32_t width, uint32_t height,
 }
 
 void Pipeline::stop() {
-    if (!running_.exchange(false)) return;
+    bool was_running = running_.exchange(false);
 
-    fprintf(stderr, "[pipeline] stopping...\n");
+    // Always join threads if they are joinable, even if running_ was
+    // already false (e.g., set by recv_loop on connection loss).
+    // Without this, the std::thread destructors would call std::terminate.
 
-    // Stop capture first (no more frames enqueued).
-    capturer_->stop();
+    if (was_running) {
+        fprintf(stderr, "[pipeline] stopping...\n");
+
+        // Stop capture first (no more frames enqueued).
+        capturer_->stop();
+    }
 
     // Wake the encode thread so it can exit.
     {
@@ -211,6 +217,11 @@ void Pipeline::stop() {
     if (send_thread_.joinable()) send_thread_.join();
     if (recv_thread_.joinable()) recv_thread_.join();
     if (ping_thread_.joinable()) ping_thread_.join();
+
+    if (!was_running) {
+        // Already stopped — threads joined, nothing more to do.
+        return;
+    }
 
     // Drain any remaining frames in capture_queue_ (release CVPixelBuffers).
 #ifdef __APPLE__

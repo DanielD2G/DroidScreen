@@ -32,7 +32,12 @@ public:
     bool init(uint32_t display_index = 0) override;
 
     /// Initialize capture for a specific CGDirectDisplayID (e.g., virtual display).
-    bool init_with_display_id(uint32_t cg_display_id);
+    /// @param cg_display_id  The CGDirectDisplayID to capture.
+    /// @param capture_width  Output pixel width (0 = use display's native).
+    /// @param capture_height Output pixel height (0 = use display's native).
+    bool init_with_display_id(uint32_t cg_display_id,
+                              uint32_t capture_width = 0,
+                              uint32_t capture_height = 0);
     bool start(std::function<void(const CapturedFrame&)> on_frame) override;
     void stop() override;
 

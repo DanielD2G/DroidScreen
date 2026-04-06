@@ -3,11 +3,19 @@ cmake_minimum_required(VERSION 3.14)
 # Enable Objective-C++ for .mm files.
 enable_language(OBJCXX)
 
-add_executable(droidscreen_desktop
+add_executable(droidscreen_desktop MACOSX_BUNDLE
     src/main.mm
     src/sck_capturer.mm
     src/vt_encoder.mm
     src/virtual_display.mm
+)
+
+# Info.plist for menu-bar-only app (LSUIElement = true).
+set_target_properties(droidscreen_desktop PROPERTIES
+    MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist"
+    MACOSX_BUNDLE_BUNDLE_NAME "DroidScreen"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.droidscreen.desktop"
 )
 
 target_include_directories(droidscreen_desktop
@@ -25,6 +33,7 @@ target_compile_features(droidscreen_desktop PRIVATE cxx_std_17)
 
 # macOS frameworks.
 target_link_libraries(droidscreen_desktop PRIVATE
+    "-framework AppKit"
     "-framework ScreenCaptureKit"
     "-framework VideoToolbox"
     "-framework CoreMedia"

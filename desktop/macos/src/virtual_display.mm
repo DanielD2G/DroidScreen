@@ -5,7 +5,12 @@
  * Objective-C interfaces manually since they are not in public headers.
  * This works on macOS 10.14+ but may break in future releases.
  *
- * Pattern based on: github.com/enfp-dev-studio/node-mac-virtual-display
+ * HiDPI/Retina support:
+ *   - maxPixelsWide/High = framebuffer size (2× logical for Retina)
+ *   - CGVirtualDisplayMode width/height = logical (point) resolution
+ *   - settings.hiDPI = 1 tells macOS to use 2× pixel density
+ *
+ * Pattern based on: github.com/nicnacnic/node-mac-virtual-display
  */
 
 #import "virtual_display.h"
@@ -38,6 +43,7 @@
 
 @interface CGVirtualDisplaySettings : NSObject
 @property (nonatomic, copy) NSArray *modes;
+@property (nonatomic) unsigned int hiDPI;
 - (instancetype)init;
 @end
 
@@ -59,7 +65,8 @@ VirtualDisplay::~VirtualDisplay() {
     destroy();
 }
 
-bool VirtualDisplay::create(uint32_t width, uint32_t height, uint32_t fps) {
+bool VirtualDisplay::create(uint32_t width, uint32_t height,
+                            uint32_t fps, bool hidpi) {
     if (active_) {
         fprintf(stderr, "[vdisplay] already active, destroying first\n");
         destroy();
@@ -80,19 +87,40 @@ bool VirtualDisplay::create(uint32_t width, uint32_t height, uint32_t fps) {
     // Remember the primary display before we create the virtual one.
     CGDirectDisplayID primaryDisplay = CGMainDisplayID();
 
+    // ---- Compute pixel and physical dimensions ----
+    //
+    // Logical resolution = what macOS shows in "looks like" (points).
+    // Framebuffer = actual backing pixels.
+    //
+    // For HiDPI (Retina): framebuffer = 2× logical, macOS renders at 2× density.
+    // For LoDPI (1x):     framebuffer = logical.
+    //
+    uint32_t framebuffer_w = hidpi ? width * 2 : width;
+    uint32_t framebuffer_h = hidpi ? height * 2 : height;
+
+    // Physical size in mm.
+    // Use a PPI that makes sense for the display type:
+    // - HiDPI: 220 PPI (typical Retina density, like MacBook Pro)
+    // - LoDPI: 110 PPI (typical external monitor density)
+    // sizeInMillimeters is computed from the FRAMEBUFFER pixels and PPI.
+    double ppi = hidpi ? 220.0 : 110.0;
+    CGSize physicalSize = CGSizeMake(
+        (double)framebuffer_w / ppi * 25.4,
+        (double)framebuffer_h / ppi * 25.4);
+
+    fprintf(stderr, "[vdisplay] creating: logical=%ux%u, framebuffer=%ux%u, "
+            "hidpi=%s, ppi=%.0f, physical=%.0fx%.0fmm\n",
+            width, height, framebuffer_w, framebuffer_h,
+            hidpi ? "YES" : "NO", ppi,
+            physicalSize.width, physicalSize.height);
+
     // 1. Create descriptor.
     CGVirtualDisplayDescriptor *desc =
         [[descClass alloc] init];
     desc.name = @"DroidScreen";
-    desc.maxPixelsWide = width;
-    desc.maxPixelsHigh = height;
-
-    // Physical size in mm (assume ~130 PPI for a tablet-like display).
-    double ppi = 130.0;
-    desc.sizeInMillimeters = CGSizeMake(
-        (double)width / ppi * 25.4,
-        (double)height / ppi * 25.4);
-
+    desc.maxPixelsWide = framebuffer_w;
+    desc.maxPixelsHigh = framebuffer_h;
+    desc.sizeInMillimeters = physicalSize;
     desc.serialNum = 0xD50D;  // "DroidScreen" hash
     desc.productID = 0xD5C0;
     desc.vendorID  = 0xDCDC;
@@ -107,14 +135,53 @@ bool VirtualDisplay::create(uint32_t width, uint32_t height, uint32_t fps) {
     }
 
     // 3. Configure display modes.
-    CGVirtualDisplayMode *mode =
-        [[modeClass alloc] initWithWidth:width
-                                  height:height
-                             refreshRate:(double)fps];
+    //
+    // CGVirtualDisplayMode width/height = LOGICAL (point) resolution.
+    // macOS maps this to the framebuffer based on the hiDPI setting.
+    //
+    // When HiDPI is enabled, we add multiple modes at different logical
+    // resolutions so macOS offers scaled options in System Settings:
+    //   - "More Space"  = larger logical res (e.g. 2560×1600 @ 2x)
+    //   - "Default"     = native logical res
+    //   - "Larger Text" = smaller logical res (e.g. 1280×800 @ 2x)
+    //
+    NSMutableArray *modes = [NSMutableArray array];
+
+    // Primary mode at the requested logical resolution.
+    [modes addObject:[[modeClass alloc] initWithWidth:width
+                                               height:height
+                                          refreshRate:(double)fps]];
+
+    if (hidpi) {
+        // Common 16:10 scaled resolutions for HiDPI.
+        // Each one becomes a "Retina" option backed by 2× pixels.
+        struct { uint32_t w; uint32_t h; } scaled[] = {
+            {2560, 1600},
+            {1920, 1200},
+            {1680, 1050},
+            {1440,  900},
+            {1280,  800},
+            {1024,  640},
+        };
+        for (auto& s : scaled) {
+            // Skip if it matches the primary mode (already added).
+            if (s.w == width && s.h == height) continue;
+            // Only add if the 2× backing fits within maxPixels.
+            if (s.w * 2 <= framebuffer_w && s.h * 2 <= framebuffer_h) {
+                [modes addObject:[[modeClass alloc] initWithWidth:s.w
+                                                           height:s.h
+                                                      refreshRate:(double)fps]];
+            }
+        }
+    }
 
     CGVirtualDisplaySettings *settings =
         [[settClass alloc] init];
-    settings.modes = @[mode];
+    settings.modes = modes;
+    settings.hiDPI = hidpi ? 1 : 0;
+
+    fprintf(stderr, "[vdisplay] registering %lu modes (hiDPI=%s)\n",
+            (unsigned long)modes.count, hidpi ? "YES" : "NO");
 
     BOOL applied = [display applySettings:settings];
     if (!applied) {
@@ -124,8 +191,10 @@ bool VirtualDisplay::create(uint32_t width, uint32_t height, uint32_t fps) {
 
     CGDirectDisplayID vdID = display.displayID;
 
-    fprintf(stderr, "[vdisplay] created virtual display: ID=%u, %ux%u@%uHz\n",
-            vdID, width, height, fps);
+    fprintf(stderr, "[vdisplay] created virtual display: ID=%u, "
+            "logical=%ux%u@%uHz, framebuffer=%ux%u, hiDPI=%s\n",
+            vdID, width, height, fps, framebuffer_w, framebuffer_h,
+            hidpi ? "YES" : "NO");
 
     // 4. POST-PROCESSING: Prevent the virtual display from hijacking
     //    the primary display or enabling unwanted mirroring.
@@ -155,6 +224,7 @@ bool VirtualDisplay::create(uint32_t width, uint32_t height, uint32_t fps) {
     display_id_ = vdID;
     width_      = width;
     height_     = height;
+    hidpi_      = hidpi;
     active_     = true;
 
     return true;
@@ -182,6 +252,7 @@ void VirtualDisplay::destroy() {
 
     display_id_ = 0;
     active_ = false;
+    hidpi_ = false;
 
     fprintf(stderr, "[vdisplay] destroyed\n");
 }

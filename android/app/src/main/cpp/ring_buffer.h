@@ -147,6 +147,16 @@ static inline size_t ring_buffer_read_message(ring_buffer *rb,
     return (size_t)msg_len;
 }
 
+/**
+ * Reset the ring buffer, discarding all data.
+ * Only safe when no concurrent reads/writes are happening
+ * (e.g., between client sessions when producer has stopped).
+ */
+static inline void ring_buffer_reset(ring_buffer *rb) {
+    RB_ATOMIC_STORE(&rb->write_pos, (size_t)0, RB_MO_RELEASE);
+    RB_ATOMIC_STORE(&rb->read_pos, (size_t)0, RB_MO_RELEASE);
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -17,12 +17,16 @@ public:
     VirtualDisplay();
     ~VirtualDisplay();
 
-    /// Create a virtual display with the given resolution.
-    /// @param width  Pixel width.
-    /// @param height Pixel height.
-    /// @param fps    Refresh rate in Hz.
+    /// Create a virtual display with the given logical resolution.
+    /// @param width   Logical (point) width — how much content fits.
+    /// @param height  Logical (point) height.
+    /// @param fps     Refresh rate in Hz.
+    /// @param hidpi   If true, creates a Retina (2x) display: framebuffer is
+    ///                2× the logical resolution, macOS renders at 2x density.
+    ///                Text and UI look much sharper.
     /// @return true on success.
-    bool create(uint32_t width, uint32_t height, uint32_t fps = 60);
+    bool create(uint32_t width, uint32_t height, uint32_t fps = 60,
+                bool hidpi = false);
 
     /// Destroy the virtual display.
     void destroy();
@@ -33,8 +37,12 @@ public:
     /// Whether the display is currently active.
     bool is_active() const { return active_; }
 
+    /// Logical (point) resolution.
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
+
+    /// Whether HiDPI (Retina) is enabled.
+    bool is_hidpi() const { return hidpi_; }
 
 private:
     void* display_ = nullptr;   // CGVirtualDisplay*
@@ -43,6 +51,7 @@ private:
     uint32_t display_id_ = 0;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+    bool hidpi_ = false;
     bool active_ = false;
 };
 

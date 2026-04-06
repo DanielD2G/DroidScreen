@@ -153,6 +153,12 @@ int decoder_drain(DecoderContext *ctx) {
     int rendered = 0;
     AMediaCodecBufferInfo info;
 
+    /* Moonlight strategy: drain ALL available output buffers.
+     * Keep only the LATEST one for rendering — drop older frames
+     * without rendering them (release with render=false).
+     * This ensures we always display the newest decoded frame. */
+    ssize_t last_idx = -1;
+
     for (;;) {
         ssize_t idx = AMediaCodec_dequeueOutputBuffer(ctx->codec, &info, OUTPUT_TIMEOUT_US);
 
@@ -171,18 +177,24 @@ int decoder_drain(DecoderContext *ctx) {
         }
 
         if (idx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
-            /* Deprecated but may still be sent */
             continue;
         }
 
         if (idx < 0) {
-            LOGW("decoder_drain: unexpected dequeue result: %zd", idx);
             break;
         }
 
-        /* Render immediately — lower latency than scheduled vsync for live streams */
-        AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)idx, true);
-        rendered++;
+        /* If we already have a pending frame, drop it (render=false) */
+        if (last_idx >= 0) {
+            AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, false);
+        }
+        last_idx = idx;
+    }
+
+    /* Render only the newest frame */
+    if (last_idx >= 0) {
+        AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, true);
+        rendered = 1;
     }
 
     return rendered;

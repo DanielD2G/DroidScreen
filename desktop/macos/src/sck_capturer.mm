@@ -108,7 +108,9 @@ SCKCapturer::~SCKCapturer() {
     stop();
 }
 
-bool SCKCapturer::init_with_display_id(uint32_t cg_display_id) {
+bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
+                                       uint32_t capture_width,
+                                       uint32_t capture_height) {
     __block bool success = false;
     __block SCDisplay* chosen_display = nil;
 
@@ -142,11 +144,25 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id) {
             dispatch_semaphore_signal(sem);
         }];
 
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC);
+    if (dispatch_semaphore_wait(sem, timeout) != 0) {
+        fprintf(stderr, "[sck] getShareableContent timed out (10s) — permission denied?\n");
+        return false;
+    }
     if (!success) return false;
 
-    width_  = (uint32_t)chosen_display.width;
-    height_ = (uint32_t)chosen_display.height;
+    // SCDisplay.width/height returns LOGICAL (point) resolution.
+    uint32_t display_logical_w = (uint32_t)chosen_display.width;
+    uint32_t display_logical_h = (uint32_t)chosen_display.height;
+
+    fprintf(stderr, "[sck] display ID %u: logical=%ux%u\n",
+            cg_display_id, display_logical_w, display_logical_h);
+
+    // Use explicit capture dimensions if provided, otherwise use the display's
+    // logical resolution. For HiDPI displays, capturing at the logical resolution
+    // makes SCK downsample from the 2x framebuffer — producing sharp output.
+    width_  = (capture_width > 0)  ? capture_width  : display_logical_w;
+    height_ = (capture_height > 0) ? capture_height : display_logical_h;
 
     SCContentFilter* filter =
         [[SCContentFilter alloc] initWithDisplay:chosen_display
@@ -179,7 +195,7 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id) {
         return false;
     }
 
-    fprintf(stderr, "[sck] initialized for display ID %u (%ux%u)\n",
+    fprintf(stderr, "[sck] initialized for display ID %u (capture=%ux%u)\n",
             cg_display_id, width_, height_);
     return true;
 }
@@ -221,7 +237,11 @@ bool SCKCapturer::init(uint32_t display_index) {
             dispatch_semaphore_signal(sem);
         }];
 
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC);
+    if (dispatch_semaphore_wait(sem, timeout) != 0) {
+        fprintf(stderr, "[sck] getShareableContent timed out (10s) — permission denied?\n");
+        return false;
+    }
 
     if (!success) return false;
 
@@ -285,7 +305,11 @@ bool SCKCapturer::start(std::function<void(const CapturedFrame&)> on_frame) {
         dispatch_semaphore_signal(sem);
     }];
 
-    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC);
+    if (dispatch_semaphore_wait(sem, timeout) != 0) {
+        fprintf(stderr, "[sck] startCapture timed out (10s)\n");
+        return false;
+    }
 
     if (ok) {
         fprintf(stderr, "[sck] capture started\n");

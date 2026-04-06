@@ -190,22 +190,17 @@ bool VTEncoder::encode(void* native_frame, int64_t timestamp_us,
             &kCFTypeDictionaryValueCallBacks);
     }
 
-    // Retain and pass pixel_buf as sourceFrameRefcon so the output_callback
-    // can release it after VT is done with the hardware encode.  The caller
-    // may release its own reference immediately after encode() returns;
-    // this retain ensures the buffer survives until the async callback.
-    CVPixelBufferRetain(pixel_buf);
-
+    // Do NOT retain pixel_buf for sourceFrameRefcon — retaining it prevents
+    // ScreenCaptureKit from recycling the buffer (queueDepth exhaustion).
+    // VT internally retains what it needs for the hardware encode.
     OSStatus status = VTCompressionSessionEncodeFrame(
         session_, pixel_buf, pts, kCMTimeInvalid,
-        frame_props, static_cast<void*>(pixel_buf), nullptr);
+        frame_props, nullptr, nullptr);
 
     if (frame_props) CFRelease(frame_props);
 
     if (status != noErr) {
         fprintf(stderr, "[vt] EncodeFrame failed: %d\n", (int)status);
-        // Release the retain we took above -- the callback won't fire.
-        CVPixelBufferRelease(pixel_buf);
         return false;
     }
 
@@ -217,20 +212,14 @@ bool VTEncoder::encode(void* native_frame, int64_t timestamp_us,
 }
 
 void VTEncoder::output_callback(void* refcon,
-                                void* source_frame_refcon,
+                                void* /*source_frame_refcon*/,
                                 OSStatus status,
                                 VTEncodeInfoFlags /*info_flags*/,
                                 CMSampleBufferRef sample_buf) {
-    // Always release the pixel buffer we retained before EncodeFrame,
-    // even on error (VT is done with it regardless).
-    CVPixelBufferRef refcon_buf =
-        static_cast<CVPixelBufferRef>(source_frame_refcon);
-
     if (status != noErr || !sample_buf) {
         if (status != noErr) {
             fprintf(stderr, "[vt] output callback error: %d\n", (int)status);
         }
-        if (refcon_buf) CVPixelBufferRelease(refcon_buf);
         return;
     }
 
@@ -250,7 +239,6 @@ void VTEncoder::output_callback(void* refcon,
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buf);
     int64_t timestamp_us = (int64_t)(CMTimeGetSeconds(pts) * 1e6);
 
-    // On keyframe or first frame, emit VPS/SPS/PPS config.
     if (is_keyframe || !self->config_sent_) {
         CMFormatDescriptionRef fmt =
             CMSampleBufferGetFormatDescription(sample_buf);
@@ -260,9 +248,6 @@ void VTEncoder::output_callback(void* refcon,
     }
 
     self->emit_frame(sample_buf, is_keyframe);
-
-    // Release the pixel buffer -- VT is done with it.
-    if (refcon_buf) CVPixelBufferRelease(refcon_buf);
 }
 
 void VTEncoder::emit_config(CMFormatDescriptionRef fmt,

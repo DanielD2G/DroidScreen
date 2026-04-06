@@ -11,11 +11,19 @@ import android.view.Surface
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.TextView
 
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
     companion object {
         private const val TAG = "DroidScreen"
+
+        // Status constants — must match native_bridge.cpp
+        const val STATUS_WAITING = 0
+        const val STATUS_CONNECTED = 1
+        const val STATUS_DISCONNECTED = 2
+        const val STATUS_ERROR = 3
 
         init {
             System.loadLibrary("droidscreen_native")
@@ -23,6 +31,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private lateinit var surfaceView: SurfaceView
+    private lateinit var statusOverlay: LinearLayout
+    private lateinit var statusText: TextView
+    private lateinit var statusDetail: TextView
+    private var nativeStarted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,7 +43,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         surfaceView = findViewById(R.id.surface_view)
+        statusOverlay = findViewById(R.id.status_overlay)
+        statusText = findViewById(R.id.status_text)
+        statusDetail = findViewById(R.id.status_detail)
+
         surfaceView.holder.addCallback(this)
+
+        // Show initial waiting state
+        updateStatusUI(STATUS_WAITING)
 
         setImmersiveMode()
     }
@@ -39,6 +58,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun onResume() {
         super.onResume()
         setImmersiveMode()
+    }
+
+    override fun onDestroy() {
+        if (nativeStarted) {
+            nativeStop()
+            nativeStarted = false
+        }
+        super.onDestroy()
     }
 
     private fun setImmersiveMode() {
@@ -64,15 +91,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
+        if (nativeStarted) {
+            // Surface was recreated (e.g., app went to background and came back).
+            // Must restart native layer with the new Surface — old one is dead.
+            android.util.Log.i(TAG, "Surface recreated, restarting native layer")
+            nativeStop()
+            nativeStarted = false
+        }
         nativeInit(holder.surface, USBConnectionManager.PORT)
+        nativeStarted = true
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        // No action needed; native layer handles surface directly
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        nativeStop()
+        // Don't stop native here — surfaceCreated will handle restart.
+        // This avoids a race condition during rotation where surfaceDestroyed
+        // is called immediately followed by surfaceCreated.
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -84,7 +120,40 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         return true
     }
 
-    // Native methods
+    /**
+     * Called from native code (JNI) when connection status changes.
+     * This is called from a native thread — must post to UI thread.
+     */
+    @Suppress("unused") // Called from JNI
+    fun onNativeStatusChanged(status: Int) {
+        runOnUiThread {
+            updateStatusUI(status)
+        }
+    }
+
+    private fun updateStatusUI(status: Int) {
+        when (status) {
+            STATUS_WAITING -> {
+                statusOverlay.visibility = View.VISIBLE
+                statusText.text = "Waiting for connection..."
+                statusDetail.text = "Port: ${USBConnectionManager.PORT}"
+            }
+            STATUS_CONNECTED -> {
+                statusOverlay.visibility = View.GONE
+            }
+            STATUS_DISCONNECTED -> {
+                statusOverlay.visibility = View.VISIBLE
+                statusText.text = "Disconnected"
+                statusDetail.text = "Reconnecting..."
+            }
+            STATUS_ERROR -> {
+                statusOverlay.visibility = View.VISIBLE
+                statusText.text = "Error"
+                statusDetail.text = "Please restart the app"
+            }
+        }
+    }
+
     private external fun nativeInit(surface: Surface, port: Int)
     private external fun nativeStop()
     external fun nativeSendTouch(action: Int, pointerId: Int, xFrac: Int, yFrac: Int, pressure: Int)
