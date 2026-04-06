@@ -177,19 +177,35 @@ SectionEnd
 ; Parsec Virtual Display Driver — prompt user to install if missing
 ; ══════════════════════════════════════════════════════════════
 Section "Parsec Virtual Display Driver" SecParsecVDD
-  ; Check if the Parsec VDD driver is already installed by looking
-  ; for its device in the registry.
+  ; Check if the Parsec VDD driver is installed.
+  ; Try multiple detection methods since the service/registry name varies
+  ; across driver versions.
+
+  ; Method 1: Check for the UMDF driver service.
   ClearErrors
   ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\ParsecVDA" "ImagePath"
   IfErrors 0 parsec_already_installed
 
-  ; Driver not found — ask user if they want to download it.
+  ; Method 2: Check for the WDF driver service (some versions use this name).
+  ClearErrors
+  ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\ParsecVdd" "ImagePath"
+  IfErrors 0 parsec_already_installed
+
+  ; Method 3: Look for the device class enum entry (most reliable).
+  ClearErrors
+  EnumRegKey $0 HKLM "SYSTEM\CurrentControlSet\Enum\Root\Parsec" 0
+  IfErrors 0 parsec_already_installed
+
+  ; Method 4: Check if the driver DLL exists in DriverStore.
+  IfFileExists "$WINDIR\System32\drivers\UMDF\ParsecVDA.dll" parsec_already_installed
+
+  ; None found — ask user if they want to download it.
   MessageBox MB_YESNO|MB_ICONQUESTION \
-    "DroidScreen requires the Parsec Virtual Display Driver to create$\n\
+    "DroidScreen uses the Parsec Virtual Display Driver to create$\n\
 a virtual monitor for streaming.$\n$\n\
-The driver is not currently installed. Would you like to open$\n\
+It does not appear to be installed. Would you like to open$\n\
 the download page now?$\n$\n\
-(You can also install it later — the app will prompt you.)" \
+(You can also install it later from Settings.)" \
     IDYES parsec_open_download IDNO parsec_already_installed
 
   parsec_open_download:
