@@ -10,12 +10,18 @@ add_executable(droidscreen_desktop MACOSX_BUNDLE
     src/virtual_display.mm
 )
 
+# Bundle the app icon.
+set(MACOSX_ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.icns")
+set_source_files_properties(${MACOSX_ICON} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+target_sources(droidscreen_desktop PRIVATE ${MACOSX_ICON})
+
 # Info.plist for menu-bar-only app (LSUIElement = true).
 set_target_properties(droidscreen_desktop PROPERTIES
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist"
     MACOSX_BUNDLE_BUNDLE_NAME "DroidScreen"
     MACOSX_BUNDLE_GUI_IDENTIFIER "com.droidscreen.desktop"
+    MACOSX_BUNDLE_ICON_FILE "icon"
 )
 
 target_include_directories(droidscreen_desktop

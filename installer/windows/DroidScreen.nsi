@@ -2,11 +2,14 @@
 ; DroidScreen NSIS Installer Script
 ;
 ; Builds an installer for DroidScreen Windows x64.
+; Supports clean install and overwrite/upgrade installs.
+;
 ; Expected staging layout (set via /DSTAGING_DIR=...):
 ;   staging/app/droidscreen_desktop.exe
 ;   staging/adb/adb.exe
 ;   staging/adb/AdbWinApi.dll
 ;   staging/adb/AdbWinUsbApi.dll
+;   staging/icon.ico
 ; ─────────────────────────────────────────────────────────────
 
 ; ── Compiler flags ───────────────────────────────────────────
@@ -28,12 +31,15 @@
 !endif
 
 ; ── General settings ─────────────────────────────────────────
-Name "DroidScreen Setup"
+Name "DroidScreen ${VERSION}"
 OutFile "${OUTFILE}"
 InstallDir "$PROGRAMFILES64\DroidScreen"
 InstallDirRegKey HKCU "Software\DroidScreen" "InstallDir"
 RequestExecutionLevel admin
 Unicode True
+
+; Allow overwriting files without prompting (handles upgrades).
+SetOverwrite on
 
 ; ── Version information embedded in the .exe ─────────────────
 VIProductVersion "${VERSION}.0"
@@ -48,8 +54,10 @@ Var AutoStart
 
 ; ── Modern UI configuration ──────────────────────────────────
 !define MUI_ABORTWARNING
-!define MUI_ICON "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
-!define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
+
+; Use the DroidScreen icon for installer and uninstaller.
+!define MUI_ICON "${STAGING_DIR}\icon.ico"
+!define MUI_UNICON "${STAGING_DIR}\icon.ico"
 
 ; Finish page: offer to run DroidScreen
 !define MUI_FINISHPAGE_RUN "$INSTDIR\droidscreen_desktop.exe"
@@ -99,15 +107,22 @@ FunctionEnd
 Section "DroidScreen (required)" SecMain
   SectionIn RO
 
+  ; ── Kill running instance before overwriting ────────────────
+  ; Silently kill any running DroidScreen process so files can
+  ; be overwritten during upgrades. /F = force, /T = tree.
+  nsExec::ExecToLog 'taskkill /F /IM droidscreen_desktop.exe /T'
+
   ; ── Main application ───────────────────────────────────────
   SetOutPath "$INSTDIR"
-  File "${STAGING_DIR}\app\droidscreen_desktop.exe"
+  File /oname=droidscreen_desktop.exe "${STAGING_DIR}\app\droidscreen_desktop.exe"
+  File /oname=icon.ico "${STAGING_DIR}\icon.ico"
 
   ; ── ADB (bundled platform-tools) ───────────────────────────
+  ; Always overwrite — updates ADB to latest version.
   SetOutPath "$INSTDIR\adb"
-  File "${STAGING_DIR}\adb\adb.exe"
-  File "${STAGING_DIR}\adb\AdbWinApi.dll"
-  File "${STAGING_DIR}\adb\AdbWinUsbApi.dll"
+  File /oname=adb.exe "${STAGING_DIR}\adb\adb.exe"
+  File /oname=AdbWinApi.dll "${STAGING_DIR}\adb\AdbWinApi.dll"
+  File /oname=AdbWinUsbApi.dll "${STAGING_DIR}\adb\AdbWinUsbApi.dll"
 
   ; ── Save install directory in registry ─────────────────────
   WriteRegStr HKCU "Software\DroidScreen" "InstallDir" "$INSTDIR"
@@ -115,17 +130,21 @@ Section "DroidScreen (required)" SecMain
 
   ; ── Start Menu shortcuts ───────────────────────────────────
   CreateDirectory "$SMPROGRAMS\DroidScreen"
-  CreateShortcut "$SMPROGRAMS\DroidScreen\DroidScreen.lnk" "$INSTDIR\droidscreen_desktop.exe"
-  CreateShortcut "$SMPROGRAMS\DroidScreen\Uninstall DroidScreen.lnk" "$INSTDIR\Uninstall.exe"
+  CreateShortcut "$SMPROGRAMS\DroidScreen\DroidScreen.lnk" \
+    "$INSTDIR\droidscreen_desktop.exe" "" "$INSTDIR\icon.ico"
+  CreateShortcut "$SMPROGRAMS\DroidScreen\Uninstall DroidScreen.lnk" \
+    "$INSTDIR\Uninstall.exe"
 
   ; ── Desktop shortcut (optional) ────────────────────────────
   ${If} $DesktopShortcut == ${BST_CHECKED}
-    CreateShortcut "$DESKTOP\DroidScreen.lnk" "$INSTDIR\droidscreen_desktop.exe"
+    CreateShortcut "$DESKTOP\DroidScreen.lnk" \
+      "$INSTDIR\droidscreen_desktop.exe" "" "$INSTDIR\icon.ico"
   ${EndIf}
 
   ; ── Auto-start (optional) ─────────────────────────────────
   ${If} $AutoStart == ${BST_CHECKED}
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "DroidScreen" '"$INSTDIR\droidscreen_desktop.exe"'
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" \
+      "DroidScreen" '"$INSTDIR\droidscreen_desktop.exe"'
   ${EndIf}
 
   ; ── Uninstaller ────────────────────────────────────────────
@@ -136,6 +155,8 @@ Section "DroidScreen (required)" SecMain
     "DisplayName" "DroidScreen"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DroidScreen" \
     "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DroidScreen" \
+    "DisplayIcon" '"$INSTDIR\icon.ico"'
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DroidScreen" \
     "DisplayVersion" "${VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DroidScreen" \
@@ -150,8 +171,12 @@ SectionEnd
 ; Uninstaller
 ; ══════════════════════════════════════════════════════════════
 Section "Uninstall"
+  ; ── Kill running instance ──────────────────────────────────
+  nsExec::ExecToLog 'taskkill /F /IM droidscreen_desktop.exe /T'
+
   ; ── Remove application files ───────────────────────────────
   Delete "$INSTDIR\droidscreen_desktop.exe"
+  Delete "$INSTDIR\icon.ico"
   Delete "$INSTDIR\adb\adb.exe"
   Delete "$INSTDIR\adb\AdbWinApi.dll"
   Delete "$INSTDIR\adb\AdbWinUsbApi.dll"
@@ -169,4 +194,7 @@ Section "Uninstall"
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "DroidScreen"
   DeleteRegKey HKCU "Software\DroidScreen"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DroidScreen"
+
+  ; ── Remove log directory ───────────────────────────────────
+  RMDir /r "$LOCALAPPDATA\DroidScreen"
 SectionEnd

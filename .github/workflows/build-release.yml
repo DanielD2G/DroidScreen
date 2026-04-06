@@ -222,6 +222,9 @@ jobs:
           }
           Copy-Item $exe "staging\app\"
 
+          # Copy icon
+          Copy-Item "installer\windows\icon.ico" "staging\"
+
           # Copy ADB files (zip extracts to adb-extract\platform-tools\)
           $adbDir = "adb-extract\platform-tools"
           Copy-Item "$adbDir\adb.exe"          "staging\adb\"
