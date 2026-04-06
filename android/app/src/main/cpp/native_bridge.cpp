@@ -38,11 +38,15 @@ extern "C" {
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-/* Ring buffer capacity: 4 MB */
-#define RING_BUFFER_CAPACITY (4 * 1024 * 1024)
+/* Ring buffer capacity: 16 MB.
+ * 4K keyframes and brief decode stalls can easily overflow 4 MB. */
+#define RING_BUFFER_CAPACITY (16 * 1024 * 1024)
 
-/* Max single frame payload size: 2 MB */
-#define MAX_FRAME_SIZE (2 * 1024 * 1024)
+/* Max single frame payload size: 4 MB */
+#define MAX_FRAME_SIZE (4 * 1024 * 1024)
+
+/* Internal ring-buffer message size: [flags:u8][nal payload] */
+#define MAX_VIDEO_MSG_SIZE (MAX_FRAME_SIZE + 1)
 
 /* Status constants — must match MainActivity.kt companion object */
 #define STATUS_WAITING      0
@@ -60,6 +64,7 @@ static ring_buffer*      g_ring_buf  = nullptr;
 static pthread_t         g_recv_thread;
 static pthread_t         g_decode_thread;
 static DecoderContext*   g_decoder   = nullptr;
+static std::atomic<uint32_t> g_stream_frame_interval_us{16667};
 
 /* ---- JNI callback state ---- */
 static JavaVM*           g_jvm      = nullptr;
@@ -113,6 +118,7 @@ static void* recv_thread_func(void* /*arg*/) {
 
     /* Use a static thread-local buffer to avoid per-connection malloc. */
     static uint8_t payload_buf[MAX_FRAME_SIZE];
+    static uint8_t video_msg_buf[MAX_VIDEO_MSG_SIZE];
     uint8_t hdr_buf[DS_HEADER_SIZE];
     ds_header_t hdr;
 
@@ -164,6 +170,9 @@ static void* recv_thread_func(void* /*arg*/) {
         ds_handshake_req_deserialize(hs_buf, &req);
         LOGI("recv_thread: handshake req: %ux%u @ %u fps, codec=%u",
              req.width, req.height, req.fps, req.codec);
+
+        uint32_t fps = req.fps > 0 ? req.fps : 60;
+        g_stream_frame_interval_us.store(1000000u / fps, std::memory_order_release);
 
         /* Configure decoder with the negotiated resolution */
         if (g_decoder) {
@@ -228,8 +237,15 @@ static void* recv_thread_func(void* /*arg*/) {
 
             switch (hdr.type) {
                 case DS_MSG_VIDEO_FRAME: {
-                    /* Write NAL data to ring buffer for decode thread */
-                    if (ring_buffer_write_message(g_ring_buf, payload_buf, hdr.length) != 0) {
+                    /* Preserve protocol flags; Android must not infer config/keyframe
+                     * from the first NAL because Windows keyframes may start with SPS. */
+                    video_msg_buf[0] = hdr.flags;
+                    if (hdr.length > 0) {
+                        memcpy(video_msg_buf + 1, payload_buf, hdr.length);
+                    }
+
+                    if (ring_buffer_write_message(
+                            g_ring_buf, video_msg_buf, hdr.length + 1) != 0) {
                         LOGW("recv_thread: ring buffer full, dropping frame");
                     }
                     break;
@@ -333,7 +349,7 @@ static void* decode_thread_func(void* /*arg*/) {
 
     LOGI("decode_thread: started, waiting for decoder configuration...");
 
-    auto* nal_buf = static_cast<uint8_t*>(malloc(MAX_FRAME_SIZE));
+    auto* nal_buf = static_cast<uint8_t*>(malloc(MAX_VIDEO_MSG_SIZE));
     if (!nal_buf) {
         LOGE("decode_thread: failed to allocate NAL buffer");
         return nullptr;
@@ -364,41 +380,43 @@ static void* decode_thread_func(void* /*arg*/) {
         if (r > 0) frames_rendered += r;
 
         /* Try to read a NAL unit from the ring buffer */
-        size_t nal_len = ring_buffer_read_message(g_ring_buf, nal_buf, MAX_FRAME_SIZE);
-        if (nal_len == 0) {
+        size_t msg_len = ring_buffer_read_message(g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
+        if (msg_len == 0) {
             usleep(100); /* 100us — 5x faster polling than before */
             continue;
         }
 
-        /* Identify NAL type. Patch SPS for low-latency (Moonlight trick).
-         * SPS=7, PPS=8 → BUFFER_FLAG_CODEC_CONFIG. IDR=5 → keyframe. */
-        uint32_t flags = 0;
-        uint8_t first_nal_type = 0;
-
-        if (nal_len >= 5 && nal_buf[0] == 0 && nal_buf[1] == 0 &&
-            nal_buf[2] == 0 && nal_buf[3] == 1) {
-            first_nal_type = nal_buf[4] & 0x1F;
-        } else if (nal_len > 0) {
-            first_nal_type = nal_buf[0] & 0x1F;
+        if (msg_len < 1) {
+            continue;
         }
 
-        if (first_nal_type == 7 || first_nal_type == 8) {
+        uint8_t video_flags = nal_buf[0];
+        uint8_t* video_data = nal_buf + 1;
+        size_t nal_len = msg_len - 1;
+        if (nal_len == 0) {
+            continue;
+        }
+
+        /* Use the transport flags, not first-NAL heuristics.
+         * Windows keyframes may begin with SPS/PPS + IDR in one packet. */
+        uint32_t flags = 0;
+        int is_config = 0;
+        ds_frame_parse_flags(video_flags, nullptr, &is_config);
+
+        if (is_config) {
             flags = 2; /* BUFFER_FLAG_CODEC_CONFIG */
 
             /* Patch SPS constraint flags to signal no reordering needed. */
-            if (first_nal_type == 7) {
-                sps_patch_constraints(nal_buf, nal_len);
-            }
+            sps_patch_constraints(video_data, nal_len);
         }
 
-        /* Feed to decoder (non-blocking — timeout 0) */
-        int ret = decoder_feed(g_decoder, nal_buf, nal_len, pts_us, flags);
+        int ret = decoder_feed(g_decoder, video_data, nal_len, pts_us, flags);
         if (ret == 0) {
             frames_fed++;
         } else {
             feed_errors++;
         }
-        pts_us += 16667; /* ~60fps timestamp increment */
+        pts_us += g_stream_frame_interval_us.load(std::memory_order_acquire);
 
         /* Immediately drain again after feeding */
         r = decoder_drain(g_decoder);

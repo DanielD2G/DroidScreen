@@ -22,10 +22,10 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-/* Input buffer dequeue timeout: 0 = non-blocking.
- * If no buffer is available the caller retries on the next iteration,
- * avoiding any stall on the decode thread. */
-#define INPUT_TIMEOUT_US  0
+/* Input buffer dequeue timeout.
+ * A small wait dramatically reduces dropped NALs under load without
+ * adding noticeable end-to-end latency. */
+#define INPUT_TIMEOUT_US  5000
 /* Output buffer dequeue timeout (0 = non-blocking poll) */
 #define OUTPUT_TIMEOUT_US 0
 

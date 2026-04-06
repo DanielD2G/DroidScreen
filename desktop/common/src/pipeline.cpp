@@ -306,12 +306,17 @@ void Pipeline::encode_loop() {
                 sp.flags = flags;
                 sp.encode_done_us = t_enc_end;
 
-                // Push to send queue. If the queue is full, drop the
-                // oldest packet to avoid unbounded growth.
+                // Push to send queue. Never drop encoded packets: losing H.264
+                // access units causes visible corruption until the next keyframe.
+                // Backpressure here is preferable; raw-frame dropping already
+                // happens upstream in capture_queue_.
                 {
-                    std::lock_guard<std::mutex> lock(send_mutex_);
-                    while (send_queue_.size() >= kMaxSendQueueSize) {
-                        send_queue_.pop_front();
+                    std::unique_lock<std::mutex> lock(send_mutex_);
+                    send_cv_.wait(lock, [this] {
+                        return send_queue_.size() < kMaxSendQueueSize || !running_.load();
+                    });
+                    if (!running_.load()) {
+                        return;
                     }
                     send_queue_.push_back(std::move(sp));
                     send_cv_.notify_one();
@@ -353,6 +358,7 @@ void Pipeline::send_loop() {
 
             pkt = std::move(send_queue_.front());
             send_queue_.pop_front();
+            send_cv_.notify_one();
         }
 
         int64_t t_send_start = now_us();
