@@ -3,6 +3,8 @@ package com.droidscreen.app
 import android.app.Activity
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -23,6 +25,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     companion object {
         private const val TAG = "DroidScreen"
+        private const val CONTROLS_AUTO_HIDE_DELAY_MS = 3_000L
 
         // Status constants — must match native_bridge.cpp
         const val STATUS_WAITING = 0
@@ -39,13 +42,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var statusOverlay: LinearLayout
     private lateinit var statusText: TextView
     private lateinit var statusDetail: TextView
+    private lateinit var inputSettingsScrim: View
+    private lateinit var controlsContainer: LinearLayout
     private lateinit var inputToggleButton: Button
     private lateinit var inputPanel: LinearLayout
     private lateinit var fingerModeSpinner: Spinner
     private lateinit var stylusModeSpinner: Spinner
     private lateinit var unknownModeSpinner: Spinner
     private var nativeStarted = false
+    private var controlsVisible = true
     private lateinit var inputSettings: InputSettings
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val hideControlsRunnable = Runnable {
+        if (statusOverlay.visibility == View.GONE && controlsVisible) {
+            setControlsVisible(false)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,6 +69,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         statusOverlay = findViewById(R.id.status_overlay)
         statusText = findViewById(R.id.status_text)
         statusDetail = findViewById(R.id.status_detail)
+        inputSettingsScrim = findViewById(R.id.input_settings_scrim)
+        controlsContainer = findViewById(R.id.controls_container)
         inputToggleButton = findViewById(R.id.input_settings_toggle)
         inputPanel = findViewById(R.id.input_settings_panel)
         fingerModeSpinner = findViewById(R.id.finger_mode_spinner)
@@ -89,11 +103,26 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
+        uiHandler.removeCallbacks(hideControlsRunnable)
         if (nativeStarted) {
             nativeStop()
             nativeStarted = false
         }
         super.onDestroy()
+    }
+
+    override fun onBackPressed() {
+        if (inputPanel.visibility == View.VISIBLE) {
+            closeInputPanel()
+            return
+        }
+
+        if (statusOverlay.visibility == View.GONE && !controlsVisible) {
+            setControlsVisible(true)
+            return
+        }
+
+        super.onBackPressed()
     }
 
     private fun setImmersiveMode() {
@@ -186,10 +215,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun bindInputSettingsUi() {
+        val touchRescheduler = View.OnTouchListener { _, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                scheduleControlsAutoHide()
+            }
+            false
+        }
+
+        controlsContainer.setOnTouchListener(touchRescheduler)
+        inputSettingsScrim.setOnClickListener {
+            closeInputPanel()
+            scheduleControlsAutoHide()
+        }
+        inputSettingsScrim.setOnTouchListener(touchRescheduler)
+
         inputToggleButton.setOnClickListener {
-            val showing = inputPanel.visibility == View.VISIBLE
-            inputPanel.visibility = if (showing) View.GONE else View.VISIBLE
-            inputToggleButton.text = if (showing) "Input" else "Close"
+            toggleInputPanel()
+            scheduleControlsAutoHide()
         }
 
         bindSpinner(
@@ -201,6 +243,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 fingerInputMode = FingerInputMode.values()[index]
             )
             persistInputSettings()
+            scheduleControlsAutoHide()
         }
 
         bindSpinner(
@@ -212,6 +255,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 stylusInputMode = StylusInputMode.values()[index]
             )
             persistInputSettings()
+            scheduleControlsAutoHide()
         }
 
         bindSpinner(
@@ -223,6 +267,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 unknownPointerFallback = UnknownPointerFallback.values()[index]
             )
             persistInputSettings()
+            scheduleControlsAutoHide()
         }
     }
 
@@ -249,6 +294,42 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         InputSettingsStore.save(this, inputSettings)
     }
 
+    private fun toggleInputPanel() {
+        val showing = inputPanel.visibility == View.VISIBLE
+        if (showing) {
+            closeInputPanel()
+        } else {
+            inputPanel.visibility = View.VISIBLE
+            inputSettingsScrim.visibility = View.VISIBLE
+            inputToggleButton.text = "Close"
+        }
+    }
+
+    private fun closeInputPanel() {
+        inputPanel.visibility = View.GONE
+        inputSettingsScrim.visibility = View.GONE
+        inputToggleButton.text = "Input"
+        scheduleControlsAutoHide()
+    }
+
+    private fun setControlsVisible(visible: Boolean) {
+        controlsVisible = visible
+        controlsContainer.visibility = if (visible) View.VISIBLE else View.GONE
+        if (!visible) {
+            uiHandler.removeCallbacks(hideControlsRunnable)
+            closeInputPanel()
+        } else {
+            scheduleControlsAutoHide()
+        }
+    }
+
+    private fun scheduleControlsAutoHide() {
+        uiHandler.removeCallbacks(hideControlsRunnable)
+        if (statusOverlay.visibility == View.GONE && controlsVisible) {
+            uiHandler.postDelayed(hideControlsRunnable, CONTROLS_AUTO_HIDE_DELAY_MS)
+        }
+    }
+
     /**
      * Called from native code (JNI) when connection status changes.
      * This is called from a native thread — must post to UI thread.
@@ -263,19 +344,26 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun updateStatusUI(status: Int) {
         when (status) {
             STATUS_WAITING -> {
+                setControlsVisible(true)
+                uiHandler.removeCallbacks(hideControlsRunnable)
                 statusOverlay.visibility = View.VISIBLE
                 statusText.text = "Waiting for connection..."
                 statusDetail.text = "Port: ${USBConnectionManager.PORT}"
             }
             STATUS_CONNECTED -> {
+                setControlsVisible(false)
                 statusOverlay.visibility = View.GONE
             }
             STATUS_DISCONNECTED -> {
+                setControlsVisible(true)
+                uiHandler.removeCallbacks(hideControlsRunnable)
                 statusOverlay.visibility = View.VISIBLE
                 statusText.text = "Disconnected"
                 statusDetail.text = "Reconnecting..."
             }
             STATUS_ERROR -> {
+                setControlsVisible(true)
+                uiHandler.removeCallbacks(hideControlsRunnable)
                 statusOverlay.visibility = View.VISIBLE
                 statusText.text = "Error"
                 statusDetail.text = "Please restart the app"

@@ -9,28 +9,26 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <View
+        android:id="@+id/input_settings_scrim"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
     <LinearLayout
+        android:id="@+id/controls_container"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|end"
+        android:layout_gravity="bottom|center_horizontal"
         android:layout_margin="12dp"
         android:orientation="vertical"
-        android:gravity="end">
-
-        <Button
-            android:id="@+id/input_settings_toggle"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Input"
-            android:textAllCaps="false"
-            android:paddingStart="16dp"
-            android:paddingEnd="16dp" />
+        android:gravity="center_horizontal">
 
         <LinearLayout
             android:id="@+id/input_settings_panel"
             android:layout_width="220dp"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginBottom="8dp"
             android:orientation="vertical"
             android:background="#DD111111"
             android:padding="12dp"
@@ -78,6 +76,15 @@
                 android:layout_marginTop="6dp" />
 
         </LinearLayout>
+
+        <Button
+            android:id="@+id/input_settings_toggle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Input"
+            android:textAllCaps="false"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp" />
     </LinearLayout>
 
     <!-- Status overlay — shown when not streaming, hidden during video -->
