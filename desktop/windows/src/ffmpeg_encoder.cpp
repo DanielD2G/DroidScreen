@@ -411,51 +411,90 @@ void FFmpegEncoder::emit_config(
         const uint8_t* data, size_t size, int64_t timestamp_us,
         const std::function<void(const EncodedPacket&)>& callback) {
     /*
-     * FFmpeg with Annex B output prepends SPS and PPS NAL units to
-     * keyframes. We scan for the first non-SPS/PPS NAL unit to
-     * determine where the config data ends.
+     * Extract SPS and PPS NAL units from the first keyframe.
      *
-     * NAL unit types (nal_unit_type is the lower 5 bits of the first byte
-     * after the start code):
-     *   7 = SPS
-     *   8 = PPS
-     *   5 = IDR slice
+     * Different encoders produce different NAL orderings:
+     *   h264_nvenc:  [AUD(9)] [SPS(7)] [PPS(8)] [SEI(6)] [IDR(5)]
+     *   libx264:     [SPS(7)] [PPS(8)] [IDR(5)]
+     *   h264_qsv:   [AUD(9)] [SPS(7)] [PPS(8)] [IDR(5)]
+     *   h264_amf:    [SPS(7)] [PPS(8)] [SEI(6)] [IDR(5)]
+     *
+     * We extract from the first SPS start code up to the first VCL NAL
+     * (types 1-5 = coded slice data). This cleanly skips any AUD or SEI
+     * before the SPS, and includes SPS + PPS (+ any non-VCL NALs between
+     * them, which is rare but harmless).
+     *
+     * NAL unit types (nal_unit_type = byte after start code & 0x1F):
+     *   1-5 = VCL (coded slice / IDR slice)
+     *   6   = SEI
+     *   7   = SPS
+     *   8   = PPS
+     *   9   = AUD (Access Unit Delimiter)
      */
-    size_t config_end = 0;
-    size_t i = 0;
-    while (i + 4 < size) {
-        bool found_4 = (data[i] == 0 && data[i+1] == 0 &&
-                        data[i+2] == 0 && data[i+3] == 1);
-        bool found_3 = (!found_4 && data[i] == 0 &&
-                        data[i+1] == 0 && data[i+2] == 1);
+    size_t first_sps_pos = SIZE_MAX;  // byte offset of SPS start code
+    size_t first_vcl_pos = SIZE_MAX;  // byte offset of first VCL start code
+    bool   found_sps = false;
+    bool   found_pps = false;
 
-        if (found_4 || found_3) {
-            size_t nal_start = found_4 ? i + 4 : i + 3;
-            if (nal_start < size) {
-                uint8_t nal_type = data[nal_start] & 0x1F;
-                if (nal_type == 7 || nal_type == 8) {
-                    // SPS or PPS -- config data continues past this NAL.
-                    i = nal_start;
-                    continue;
-                } else {
-                    // Non-config NAL found; config data ends here.
-                    config_end = i;
-                    break;
-                }
+    size_t i = 0;
+    while (i + 3 < size) {
+        bool is_4byte = (i + 4 <= size &&
+                         data[i] == 0 && data[i+1] == 0 &&
+                         data[i+2] == 0 && data[i+3] == 1);
+        bool is_3byte = (!is_4byte &&
+                         data[i] == 0 && data[i+1] == 0 &&
+                         data[i+2] == 1);
+
+        if (is_4byte || is_3byte) {
+            size_t sc_len   = is_4byte ? 4 : 3;
+            size_t nal_hdr  = i + sc_len;
+            if (nal_hdr >= size) break;
+
+            uint8_t nal_type = data[nal_hdr] & 0x1F;
+
+            if (nal_type == 7 && first_sps_pos == SIZE_MAX) {
+                first_sps_pos = i;  // config starts here
+                found_sps = true;
             }
+            if (nal_type == 8) {
+                found_pps = true;
+            }
+
+            // VCL NALs (coded slice types 1-5) mark the end of config.
+            if (nal_type >= 1 && nal_type <= 5) {
+                first_vcl_pos = i;
+                break;
+            }
+
+            // Skip past the start code to continue scanning.
+            i = nal_hdr + 1;
+            continue;
         }
         i++;
     }
 
-    if (config_end > 0 && callback) {
+    if (first_sps_pos != SIZE_MAX && first_vcl_pos > first_sps_pos &&
+        found_sps && found_pps && callback) {
+        size_t config_size = first_vcl_pos - first_sps_pos;
+
+        fprintf(stderr, "[ffmpeg] config packet: %zu bytes "
+                "(SPS@%zu, VCL@%zu)\n",
+                config_size, first_sps_pos, first_vcl_pos);
+
         EncodedPacket pkt;
-        pkt.data         = data;
-        pkt.size         = config_end;
+        pkt.data         = data + first_sps_pos;
+        pkt.size         = config_size;
         pkt.is_keyframe  = false;
         pkt.is_config    = true;
         pkt.timestamp_us = timestamp_us;
         callback(pkt);
         config_sent_ = true;
+    } else {
+        fprintf(stderr, "[ffmpeg] WARNING: could not extract config from "
+                "keyframe (sps=%d pps=%d sps_pos=%zu vcl_pos=%zu "
+                "size=%zu)\n",
+                found_sps, found_pps,
+                first_sps_pos, first_vcl_pos, size);
     }
 }
 
