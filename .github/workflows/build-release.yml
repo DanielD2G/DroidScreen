@@ -196,7 +196,10 @@ jobs:
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "platform-tools.zip"
-          Expand-Archive -Path "platform-tools.zip" -DestinationPath "."
+          Expand-Archive -Path "platform-tools.zip" -DestinationPath "adb-extract"
+          # The zip contains a platform-tools/ subdirectory
+          Write-Host "ADB extracted contents:"
+          Get-ChildItem -Recurse adb-extract | Select-Object FullName
 
       - name: Install NSIS
         shell: pwsh
@@ -205,19 +208,36 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           # Stage files
-          New-Item -ItemType Directory -Force -Path "staging/app"
-          New-Item -ItemType Directory -Force -Path "staging/adb"
-          Copy-Item "build\desktop\windows\Release\droidscreen_desktop.exe" "staging\app\"
-          Copy-Item "platform-tools\adb.exe" "staging\adb\"
-          Copy-Item "platform-tools\AdbWinApi.dll" "staging\adb\"
-          Copy-Item "platform-tools\AdbWinUsbApi.dll" "staging\adb\"
+          New-Item -ItemType Directory -Force -Path "staging\app" | Out-Null
+          New-Item -ItemType Directory -Force -Path "staging\adb" | Out-Null
+
+          # Copy the built exe
+          $exe = "build\desktop\windows\Release\droidscreen_desktop.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "EXE not found at $exe"
+            exit 1
+          }
+          Copy-Item $exe "staging\app\"
+
+          # Copy ADB files (zip extracts to adb-extract\platform-tools\)
+          $adbDir = "adb-extract\platform-tools"
+          Copy-Item "$adbDir\adb.exe"          "staging\adb\"
+          Copy-Item "$adbDir\AdbWinApi.dll"    "staging\adb\"
+          Copy-Item "$adbDir\AdbWinUsbApi.dll" "staging\adb\"
+
+          Write-Host "Staged files:"
+          Get-ChildItem -Recurse staging
 
           # Build installer
-          & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=$env:VERSION /DSTAGING_DIR=staging installer\windows\DroidScreen.nsi
+          $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          & $nsis /DVERSION=$env:VERSION /DSTAGING_DIR=staging "installer\windows\DroidScreen.nsi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Copy to dist
-          New-Item -ItemType Directory -Force -Path dist
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "installer\windows\DroidScreen-Setup.exe" "dist\DroidScreen-Windows-x64-v$env:VERSION-Setup.exe"
 
       - uses: actions/upload-artifact@v4
