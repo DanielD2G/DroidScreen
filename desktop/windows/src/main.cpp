@@ -483,7 +483,7 @@ static void setup_tray_icon(HWND hwnd) {
     nid.uCallbackMessage = WM_TRAYICON;
 
     // Use a system application icon.
-    nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512)); // IDI_APPLICATION
     wcscpy_s(nid.szTip, L"DroidScreen");
 
     Shell_NotifyIconW(NIM_ADD, &nid);
@@ -561,7 +561,7 @@ static void register_settings_class(HINSTANCE hInst) {
     wc.hInstance      = hInst;
     wc.hbrBackground  = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName  = kSettingsClass;
-    wc.hCursor        = LoadCursor(nullptr, IDC_ARROW);
+    wc.hCursor        = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW = 32512
     RegisterClassExW(&wc);
 }
 
