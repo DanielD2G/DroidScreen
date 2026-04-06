@@ -22,6 +22,9 @@ target_link_libraries(droidscreen_desktop
         d3dcompiler
         ws2_32
         windowsapp    # WinRT / C++/WinRT support
+        shell32       # Shell_NotifyIcon, SHGetFolderPath
+        comctl32      # InitCommonControlsEx
+        advapi32      # Registry API
 )
 
 target_compile_features(droidscreen_desktop PRIVATE cxx_std_17)
@@ -38,10 +41,9 @@ set_target_properties(droidscreen_desktop PROPERTIES
     VS_GLOBAL_CppWinRTEnabled "true"
 )
 
-# Subsystem: use the console entry point (/SUBSYSTEM:CONSOLE) even though
-# we declared WIN32 above (WIN32 is needed for windowsapp linkage on some
-# CMake generators). Override with linker flags.
+# Subsystem: Windows GUI application (no console window).
+# WIN32 in add_executable sets /SUBSYSTEM:WINDOWS and uses WinMain entry point.
 if(MSVC)
-    target_link_options(droidscreen_desktop PRIVATE /SUBSYSTEM:CONSOLE)
+    target_link_options(droidscreen_desktop PRIVATE /SUBSYSTEM:WINDOWS)
     target_compile_options(droidscreen_desktop PRIVATE /await)
 endif()

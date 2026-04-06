@@ -1,0 +1,9 @@
+; DroidScreenDriver.def
+;
+; Module definition file for the DroidScreen IddCx UMDF v2 driver.
+; Exports the standard WDF driver entry point.
+
+LIBRARY "DroidScreenDriver"
+
+EXPORTS
+    DriverEntry
