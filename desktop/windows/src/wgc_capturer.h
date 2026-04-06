@@ -11,19 +11,12 @@
 #include "droidscreen/capturer.h"
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
-
-// Forward-declare WinRT types to avoid pulling in the full WinRT headers
-// in every translation unit. The .cpp includes the real headers.
-namespace winrt::Windows::Graphics::Capture {
-    struct Direct3D11CaptureFramePool;
-    struct GraphicsCaptureSession;
-    struct GraphicsCaptureItem;
-}
 
 namespace droidscreen {
 
@@ -64,12 +57,10 @@ private:
     // released as quickly as possible to avoid frame pool starvation).
     Microsoft::WRL::ComPtr<ID3D11Texture2D>      staging_texture_;
 
-    // WinRT capture objects — stored as void* here to keep the header
-    // free of WinRT includes. The .cpp casts them properly.
-    void* frame_pool_     = nullptr;  // Direct3D11CaptureFramePool
-    void* capture_session_ = nullptr; // GraphicsCaptureSession
-    void* capture_item_    = nullptr; // GraphicsCaptureItem
-    void* frame_arrived_token_ = nullptr; // event token storage
+    // WinRT capture objects — stored via pimpl to keep WinRT headers
+    // out of this header. Defined in the .cpp.
+    struct WinRTState;
+    std::unique_ptr<WinRTState> wrt_;
 
     std::mutex frame_mutex_;
 };

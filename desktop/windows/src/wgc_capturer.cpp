@@ -41,6 +41,19 @@ using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
 namespace droidscreen {
 
 // ---------------------------------------------------------------------------
+// Pimpl: WinRT state stored here so the header stays free of WinRT includes.
+// WinRT projection types delete operator new, but they're fine as struct
+// members — the struct itself is heap-allocated via std::make_unique.
+// ---------------------------------------------------------------------------
+
+struct WGCCapturer::WinRTState {
+    GraphicsCaptureItem           item{nullptr};
+    Direct3D11CaptureFramePool    pool{nullptr};
+    GraphicsCaptureSession        session{nullptr};
+    winrt::event_token            frame_arrived_token{};
+};
+
+// ---------------------------------------------------------------------------
 // Helpers: D3D11 <-> WinRT IDirect3DDevice interop
 // ---------------------------------------------------------------------------
 
@@ -186,12 +199,6 @@ bool WGCCapturer::init(uint32_t display_index) {
         return false;
     }
 
-    // Store the capture item (type-erased to keep the header clean).
-    // WinRT types have deleted operator new, so we use placement new
-    // into manually allocated storage.
-    capture_item_ = ::operator new(sizeof(GraphicsCaptureItem));
-    new (capture_item_) GraphicsCaptureItem(item);
-
     // Create the staging texture for frame copies.
     D3D11_TEXTURE2D_DESC staging_desc = {};
     staging_desc.Width            = width_;
@@ -227,9 +234,6 @@ bool WGCCapturer::init(uint32_t display_index) {
         return false;
     }
 
-    frame_pool_ = ::operator new(sizeof(Direct3D11CaptureFramePool));
-    new (frame_pool_) Direct3D11CaptureFramePool(pool);
-
     // Create the capture session.
     auto session = pool.CreateCaptureSession(item);
     if (!session) {
@@ -252,8 +256,11 @@ bool WGCCapturer::init(uint32_t display_index) {
         // Not available on older builds.
     }
 
-    capture_session_ = ::operator new(sizeof(GraphicsCaptureSession));
-    new (capture_session_) GraphicsCaptureSession(session);
+    // Store WinRT objects in the pimpl struct (no operator new issues).
+    wrt_ = std::make_unique<WinRTState>();
+    wrt_->item    = item;
+    wrt_->pool    = pool;
+    wrt_->session = session;
 
     fprintf(stderr, "[wgc] initialized for display %u (%ux%u)\n",
             display_index, width_, height_);
@@ -261,7 +268,7 @@ bool WGCCapturer::init(uint32_t display_index) {
 }
 
 bool WGCCapturer::start(std::function<void(const CapturedFrame&)> on_frame) {
-    if (!frame_pool_ || !capture_session_) {
+    if (!wrt_) {
         fprintf(stderr, "[wgc] not initialized\n");
         return false;
     }
@@ -269,21 +276,15 @@ bool WGCCapturer::start(std::function<void(const CapturedFrame&)> on_frame) {
     on_frame_ = std::move(on_frame);
     running_.store(true);
 
-    auto* pool = static_cast<Direct3D11CaptureFramePool*>(frame_pool_);
-
     // Subscribe to the FrameArrived event.
-    auto token = pool->FrameArrived(
-        [this](Direct3D11CaptureFramePool const& sender,
+    wrt_->frame_arrived_token = wrt_->pool.FrameArrived(
+        [this](Direct3D11CaptureFramePool const& /*sender*/,
                winrt::Windows::Foundation::IInspectable const&) {
             on_frame_arrived();
         });
 
-    // Store the token for later revocation.
-    frame_arrived_token_ = new winrt::event_token(token);
-
     // Start the capture session.
-    auto* session = static_cast<GraphicsCaptureSession*>(capture_session_);
-    session->StartCapture();
+    wrt_->session.StartCapture();
 
     fprintf(stderr, "[wgc] capture started\n");
     return true;
@@ -294,8 +295,7 @@ void WGCCapturer::on_frame_arrived() {
 
     std::lock_guard<std::mutex> lock(frame_mutex_);
 
-    auto* pool = static_cast<Direct3D11CaptureFramePool*>(frame_pool_);
-    auto frame = pool->TryGetNextFrame();
+    auto frame = wrt_->pool.TryGetNextFrame();
     if (!frame) return;
 
     // Get the surface and extract the D3D11 texture.
@@ -355,39 +355,16 @@ void WGCCapturer::on_frame_arrived() {
 void WGCCapturer::stop() {
     if (!running_.exchange(false)) return;
 
-    // Revoke the FrameArrived event handler.
-    if (frame_pool_ && frame_arrived_token_) {
-        auto* pool = static_cast<Direct3D11CaptureFramePool*>(frame_pool_);
-        auto* token = static_cast<winrt::event_token*>(frame_arrived_token_);
-        pool->FrameArrived(*token);
-        delete token;
-        frame_arrived_token_ = nullptr;
-    }
+    if (wrt_) {
+        // Revoke the FrameArrived event handler.
+        wrt_->pool.FrameArrived(wrt_->frame_arrived_token);
 
-    // Close the capture session.
-    if (capture_session_) {
-        auto* session = static_cast<GraphicsCaptureSession*>(capture_session_);
-        session->Close();
-        session->~GraphicsCaptureSession();
-        ::operator delete(capture_session_);
-        capture_session_ = nullptr;
-    }
+        // Close the session and pool.
+        wrt_->session.Close();
+        wrt_->pool.Close();
 
-    // Close the frame pool.
-    if (frame_pool_) {
-        auto* pool = static_cast<Direct3D11CaptureFramePool*>(frame_pool_);
-        pool->Close();
-        pool->~Direct3D11CaptureFramePool();
-        ::operator delete(frame_pool_);
-        frame_pool_ = nullptr;
-    }
-
-    // Clean up the capture item.
-    if (capture_item_) {
-        auto* item = static_cast<GraphicsCaptureItem*>(capture_item_);
-        item->~GraphicsCaptureItem();
-        ::operator delete(capture_item_);
-        capture_item_ = nullptr;
+        // Release all WinRT objects.
+        wrt_.reset();
     }
 
     // Release the staging texture.
