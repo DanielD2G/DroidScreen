@@ -86,7 +86,31 @@ bool VirtualDisplayWin::create(uint32_t width, uint32_t height, uint32_t fps) {
         return false; // last_error_ already set
     }
 
-    // 2. Open device handle.
+    // 2. Write the desired resolution to the Parsec VDD registry.
+    //    The driver reads custom modes from HKLM\SOFTWARE\Parsec\vdd\{0-4}
+    //    at display plug time. Writing BEFORE VddAddDisplay guarantees
+    //    the mode is available even if it's not a default preset.
+    {
+        HKEY key = nullptr;
+        LONG rc = RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+                                   "SOFTWARE\\Parsec\\vdd\\0",
+                                   0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr);
+        if (rc == ERROR_SUCCESS) {
+            DWORD w = width, h = height, hz = fps;
+            RegSetValueExA(key, "width",  0, REG_DWORD, (BYTE*)&w,  sizeof(DWORD));
+            RegSetValueExA(key, "height", 0, REG_DWORD, (BYTE*)&h,  sizeof(DWORD));
+            RegSetValueExA(key, "hz",     0, REG_DWORD, (BYTE*)&hz, sizeof(DWORD));
+            RegCloseKey(key);
+            fprintf(stderr, "[vdd] Wrote custom mode %ux%u@%u to registry\n",
+                    width, height, fps);
+        } else {
+            // Non-fatal: mode may already be a default preset.
+            fprintf(stderr, "[vdd] Could not write registry (rc=%ld, "
+                    "may need admin) — relying on default presets\n", rc);
+        }
+    }
+
+    // 3. Open device handle.
     device_handle_ = parsec_vdd::OpenDeviceHandle(&parsec_vdd::VDD_ADAPTER_GUID);
     if (device_handle_ == nullptr || device_handle_ == INVALID_HANDLE_VALUE) {
         last_error_ = "Failed to open Parsec VDD device handle.";
@@ -96,7 +120,7 @@ bool VirtualDisplayWin::create(uint32_t width, uint32_t height, uint32_t fps) {
 
     fprintf(stderr, "[vdd] Device handle opened: %p\n", device_handle_);
 
-    // 3. Add a virtual display.
+    // 4. Add a virtual display.
     display_index_ = parsec_vdd::VddAddDisplay(device_handle_);
     if (display_index_ < 0) {
         last_error_ = "VddAddDisplay failed (returned "
@@ -108,17 +132,71 @@ bool VirtualDisplayWin::create(uint32_t width, uint32_t height, uint32_t fps) {
 
     fprintf(stderr, "[vdd] Virtual display added, index=%d\n", display_index_);
 
-    // 4. Start the keep-alive ping thread.
+    // 5. Start the keep-alive ping thread.
     ping_running_.store(true);
     ping_thread_ = std::thread(&VirtualDisplayWin::ping_loop, this);
 
-    // 5. Wait for Windows to register the new display.
-    //    The driver notifies the OS asynchronously; it typically takes
-    //    1-2 seconds for the display to appear in the enumeration.
-    fprintf(stderr, "[vdd] Waiting for display to appear...\n");
-    std::this_thread::sleep_for(2000ms);
+    // 6. Poll until the display is registered and the requested mode
+    //    appears in the enumeration. The driver populates modes
+    //    asynchronously after VddAddDisplay.
+    fprintf(stderr, "[vdd] Waiting for display modes to populate...\n");
+    {
+        std::wstring parsec_dev;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        bool mode_found = false;
 
-    // 6. Configure the display resolution and refresh rate.
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+            // Find the Parsec device name.
+            DISPLAY_DEVICEW dd = {};
+            dd.cb = sizeof(dd);
+            parsec_dev.clear();
+            for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); i++) {
+                if (!(dd.StateFlags & DISPLAY_DEVICE_ACTIVE)) continue;
+                std::wstring devStr(dd.DeviceString);
+                if (devStr.find(L"Parsec") != std::wstring::npos) {
+                    parsec_dev = dd.DeviceName;
+                    break;
+                }
+                // Check child device.
+                DISPLAY_DEVICEW child = {};
+                child.cb = sizeof(child);
+                if (EnumDisplayDevicesW(dd.DeviceName, 0, &child, 0)) {
+                    std::wstring childStr(child.DeviceString);
+                    if (childStr.find(L"Parsec") != std::wstring::npos) {
+                        parsec_dev = dd.DeviceName;
+                        break;
+                    }
+                }
+            }
+
+            if (parsec_dev.empty()) continue;
+
+            // Check if the requested mode is in the enumeration.
+            DEVMODEW enumDm = {};
+            enumDm.dmSize = sizeof(enumDm);
+            for (DWORD m = 0; EnumDisplaySettingsW(parsec_dev.c_str(), m, &enumDm); m++) {
+                if (enumDm.dmPelsWidth == width && enumDm.dmPelsHeight == height) {
+                    mode_found = true;
+                    break;
+                }
+            }
+
+            if (mode_found) {
+                fprintf(stderr, "[vdd] Mode %ux%u found in display enumeration\n",
+                        width, height);
+                break;
+            }
+        }
+
+        if (!mode_found) {
+            fprintf(stderr, "[vdd] Warning: mode %ux%u not found after polling "
+                    "(will try ChangeDisplaySettings anyway)\n", width, height);
+        }
+    }
+
+    // 7. Configure the display resolution and refresh rate.
     if (!configure_display(width, height, fps)) {
         // Non-fatal: the display exists but resolution may be default.
         fprintf(stderr, "[vdd] Warning: could not set resolution %ux%u@%u\n",
@@ -126,7 +204,7 @@ bool VirtualDisplayWin::create(uint32_t width, uint32_t height, uint32_t fps) {
     }
 
     // Give Windows a moment after the mode change.
-    std::this_thread::sleep_for(500ms);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // 7. Find the HMONITOR.
     monitor_ = find_parsec_monitor();
@@ -240,15 +318,36 @@ bool VirtualDisplayWin::configure_display(uint32_t width, uint32_t height,
 
         fprintf(stderr, "[vdd] Found Parsec display device: %ls\n", dd.DeviceName);
 
-        // Get current display settings.
-        DEVMODEW dm = {};
-        dm.dmSize = sizeof(dm);
-        if (!EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) {
-            // Try registry settings.
-            EnumDisplaySettingsW(dd.DeviceName, ENUM_REGISTRY_SETTINGS, &dm);
+        // Enumerate all available modes for this display.
+        fprintf(stderr, "[vdd] Available modes:\n");
+        DEVMODEW enumDm = {};
+        enumDm.dmSize = sizeof(enumDm);
+        uint32_t best_w = 0, best_h = 0, best_hz = 0;
+        uint64_t best_diff = UINT64_MAX;
+
+        for (DWORD m = 0; EnumDisplaySettingsW(dd.DeviceName, m, &enumDm); m++) {
+            // Only log unique resolutions (skip duplicate refresh rates).
+            if (m < 30 || (enumDm.dmPelsWidth == width && enumDm.dmPelsHeight == height)) {
+                fprintf(stderr, "[vdd]   %lux%lu@%lu\n",
+                        enumDm.dmPelsWidth, enumDm.dmPelsHeight,
+                        enumDm.dmDisplayFrequency);
+            }
+
+            // Find the closest matching mode.
+            uint64_t diff = (uint64_t)abs((int)enumDm.dmPelsWidth - (int)width) * 1000
+                          + (uint64_t)abs((int)enumDm.dmPelsHeight - (int)height) * 1000
+                          + (uint64_t)abs((int)enumDm.dmDisplayFrequency - (int)fps);
+            if (diff < best_diff) {
+                best_diff = diff;
+                best_w = enumDm.dmPelsWidth;
+                best_h = enumDm.dmPelsHeight;
+                best_hz = enumDm.dmDisplayFrequency;
+            }
         }
 
-        // Set the desired resolution and refresh rate.
+        // Try the exact requested resolution first.
+        DEVMODEW dm = {};
+        dm.dmSize = sizeof(dm);
         dm.dmPelsWidth = width;
         dm.dmPelsHeight = height;
         dm.dmDisplayFrequency = fps;
@@ -259,9 +358,24 @@ bool VirtualDisplayWin::configure_display(uint32_t width, uint32_t height,
             CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
 
         if (result != DISP_CHANGE_SUCCESSFUL) {
-            fprintf(stderr, "[vdd] ChangeDisplaySettingsEx failed: %ld\n", result);
-            // Try without specifying refresh rate.
+            fprintf(stderr, "[vdd] Exact resolution %ux%u@%u not supported "
+                    "(error %ld)\n", width, height, fps, result);
+
+            // Try without refresh rate.
             dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+            result = ChangeDisplaySettingsExW(
+                dd.DeviceName, &dm, nullptr,
+                CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+        }
+
+        if (result != DISP_CHANGE_SUCCESSFUL && best_w > 0) {
+            // Fall back to the closest available mode.
+            fprintf(stderr, "[vdd] Falling back to closest mode: %ux%u@%u\n",
+                    best_w, best_h, best_hz);
+            dm.dmPelsWidth = best_w;
+            dm.dmPelsHeight = best_h;
+            dm.dmDisplayFrequency = best_hz;
+            dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
             result = ChangeDisplaySettingsExW(
                 dd.DeviceName, &dm, nullptr,
                 CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
@@ -270,11 +384,11 @@ bool VirtualDisplayWin::configure_display(uint32_t width, uint32_t height,
         if (result == DISP_CHANGE_SUCCESSFUL) {
             // Apply the change globally.
             ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-            fprintf(stderr, "[vdd] Display resolution set to %ux%u@%u\n",
-                    width, height, fps);
+            fprintf(stderr, "[vdd] Display resolution set to %lux%lu@%lu\n",
+                    dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency);
             return true;
         } else {
-            fprintf(stderr, "[vdd] ChangeDisplaySettingsEx final attempt "
+            fprintf(stderr, "[vdd] ChangeDisplaySettingsEx all attempts "
                     "failed: %ld\n", result);
             return false;
         }
