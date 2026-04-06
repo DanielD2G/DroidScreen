@@ -28,9 +28,11 @@ FFmpegEncoder::~FFmpegEncoder() {
 }
 
 void FFmpegEncoder::set_d3d_device(ID3D11Device* device,
-                                    ID3D11DeviceContext* context) {
-    device_  = device;
-    context_ = context;
+                                    ID3D11DeviceContext* context,
+                                    std::mutex* d3d_mutex) {
+    device_    = device;
+    context_   = context;
+    d3d_mutex_ = d3d_mutex;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +131,28 @@ bool FFmpegEncoder::try_encoder(const char* encoder_name,
 
 bool FFmpegEncoder::init(uint32_t width, uint32_t height,
                           uint32_t fps, uint32_t bitrate_kbps) {
+    // Clean up any existing resources from a previous init() call.
+    // This prevents resource leaks when Pipeline::start() re-inits
+    // an already-initialized encoder.
+    if (codec_ctx_) {
+        fprintf(stderr, "[ffmpeg] re-init: closing previous encoder session\n");
+        avcodec_free_context(&codec_ctx_);
+        codec_ctx_ = nullptr;
+    }
+    if (sws_ctx_) {
+        sws_freeContext(sws_ctx_);
+        sws_ctx_ = nullptr;
+    }
+    if (nv12_frame_) {
+        av_frame_free(&nv12_frame_);
+        nv12_frame_ = nullptr;
+    }
+    if (pkt_) {
+        av_packet_free(&pkt_);
+        pkt_ = nullptr;
+    }
+    // staging_texture_ is replaced below via ComPtr assignment.
+
     width_        = width;
     height_       = height;
     fps_          = fps;
@@ -243,9 +267,18 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
     auto* bgra_texture = static_cast<ID3D11Texture2D*>(native_frame);
     if (!bgra_texture) return false;
 
-    // Verify source texture dimensions match encoder expectations.
+    // Verify source texture dimensions and format.
     D3D11_TEXTURE2D_DESC src_desc = {};
     bgra_texture->GetDesc(&src_desc);
+
+    // Log diagnostics on the first frame.
+    if (frame_index_ == 0) {
+        fprintf(stderr, "[ffmpeg] first frame: src texture %ux%u fmt=%u, "
+                "encoder %ux%u\n",
+                src_desc.Width, src_desc.Height, src_desc.Format,
+                width_, height_);
+    }
+
     if (src_desc.Width != width_ || src_desc.Height != height_) {
         // Log once then skip — resolution mismatch causes corruption.
         static bool warned = false;
@@ -258,6 +291,25 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
         return false;
     }
 
+    if (src_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        static bool format_warned = false;
+        if (!format_warned) {
+            fprintf(stderr, "[ffmpeg] WARNING: source texture format %u != "
+                    "expected B8G8R8A8_UNORM (87) — colors may be wrong\n",
+                    src_desc.Format);
+            format_warned = true;
+        }
+    }
+
+    // Lock the D3D11 context mutex to prevent races with the WGC
+    // capturer's callback thread (both share the same immediate context).
+    // Scope covers CopyResource + Map + sws_scale + Unmap since the
+    // mapped pointer is only valid while the map is held.
+    std::unique_lock<std::mutex> d3d_lock;
+    if (d3d_mutex_) {
+        d3d_lock = std::unique_lock<std::mutex>(*d3d_mutex_);
+    }
+
     // Step 1: Copy the GPU texture to the staging texture.
     context_->CopyResource(staging_texture_.Get(), bgra_texture);
 
@@ -267,6 +319,14 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
     if (FAILED(hr)) {
         fprintf(stderr, "[ffmpeg] Map staging texture failed: 0x%08lx\n", hr);
         return false;
+    }
+
+    // Log stride info on first frame.
+    if (frame_index_ == 0) {
+        fprintf(stderr, "[ffmpeg] first frame: mapped RowPitch=%u "
+                "(expected min %u), NV12 linesize[0]=%d linesize[1]=%d\n",
+                mapped.RowPitch, width_ * 4,
+                nv12_frame_->linesize[0], nv12_frame_->linesize[1]);
     }
 
     // Step 3: Convert BGRA -> NV12 via sws_scale.
@@ -283,6 +343,11 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
 
     // Step 4: Unmap the staging texture.
     context_->Unmap(staging_texture_.Get(), 0);
+
+    // Release D3D context lock — the rest is CPU-only work.
+    if (d3d_lock.owns_lock()) {
+        d3d_lock.unlock();
+    }
 
     // Step 5: Set frame properties.
     nv12_frame_->pts = frame_index_++;

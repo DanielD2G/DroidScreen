@@ -44,6 +44,11 @@ public:
     /// Returns the immediate device context.
     ID3D11DeviceContext* context() const { return context_.Get(); }
 
+    /// Returns the D3D11 context mutex. The encoder should lock this
+    /// around all D3D11 immediate context calls to prevent races with
+    /// the WGC FrameArrived callback (which runs on a threadpool thread).
+    std::mutex& d3d_mutex() { return d3d_mutex_; }
+
 private:
     /// Called by the FramePool.FrameArrived event.
     void on_frame_arrived();
@@ -69,6 +74,11 @@ private:
     std::unique_ptr<WinRTState> wrt_;
 
     std::mutex frame_mutex_;
+
+    // Mutex protecting D3D11 immediate context access. Shared with
+    // the encoder to prevent concurrent context calls from the WGC
+    // callback thread and the encode thread.
+    std::mutex d3d_mutex_;
 };
 
 } // namespace droidscreen

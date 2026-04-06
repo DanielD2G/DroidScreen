@@ -45,7 +45,11 @@ public:
     ~FFmpegEncoder() override;
 
     /// Set the D3D11 device to use (must be called before init).
-    void set_d3d_device(ID3D11Device* device, ID3D11DeviceContext* context);
+    /// If d3d_mutex is non-null, the encoder will lock it around all
+    /// D3D11 context calls (CopyResource, Map, Unmap) to prevent races
+    /// with the WGC capturer's callback thread.
+    void set_d3d_device(ID3D11Device* device, ID3D11DeviceContext* context,
+                        std::mutex* d3d_mutex = nullptr);
 
     bool init(uint32_t width, uint32_t height,
               uint32_t fps, uint32_t bitrate_kbps) override;
@@ -70,6 +74,9 @@ private:
     // D3D11 device (shared from capturer).
     Microsoft::WRL::ComPtr<ID3D11Device>       device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
+
+    // Optional shared mutex for D3D11 context thread safety.
+    std::mutex* d3d_mutex_ = nullptr;
 
     // Staging texture for GPU -> CPU copy.
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_texture_;

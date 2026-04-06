@@ -862,7 +862,8 @@ static void connect_sync() {
             g_app.capturer->device(), g_app.capturer->context());
     g_app.encoder = std::make_unique<droidscreen::FFmpegEncoder>();
     g_app.encoder->set_d3d_device(g_app.capturer->device(),
-                                   g_app.capturer->context());
+                                   g_app.capturer->context(),
+                                   &g_app.capturer->d3d_mutex());
 
     // Flush stderr before init so any encoder messages are captured.
     fflush(stderr);

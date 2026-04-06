@@ -442,6 +442,18 @@ void WGCCapturer::on_frame_arrived() {
     uint32_t frame_w = static_cast<uint32_t>(content_size.Width);
     uint32_t frame_h = static_cast<uint32_t>(content_size.Height);
 
+    // Log diagnostics on the very first frame.
+    static bool first_frame_logged = false;
+    if (!first_frame_logged) {
+        D3D11_TEXTURE2D_DESC src_desc = {};
+        source_texture->GetDesc(&src_desc);
+        fprintf(stderr, "[wgc] first frame: texture %ux%u fmt=%u, "
+                "content %ux%u, expected %ux%u\n",
+                src_desc.Width, src_desc.Height, src_desc.Format,
+                frame_w, frame_h, width_, height_);
+        first_frame_logged = true;
+    }
+
     // Compute a timestamp in microseconds from the system timestamp.
     auto sys_relative = frame.SystemRelativeTime();
     int64_t timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -458,11 +470,16 @@ void WGCCapturer::on_frame_arrived() {
     src_box.bottom = (frame_h < height_) ? frame_h : height_;
     src_box.back   = 1;
 
-    context_->CopySubresourceRegion(
-        staging_texture_.Get(), 0,   // dst subresource, x, y, z
-        0, 0, 0,
-        source_texture.Get(), 0,     // src subresource
-        &src_box);
+    // Lock the D3D11 context mutex — the immediate context is NOT
+    // thread-safe and the encode thread also uses it for CopyResource/Map.
+    {
+        std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
+        context_->CopySubresourceRegion(
+            staging_texture_.Get(), 0,   // dst subresource, x, y, z
+            0, 0, 0,
+            source_texture.Get(), 0,     // src subresource
+            &src_box);
+    }
 
     // Release the WGC frame immediately.
     frame.Close();
