@@ -187,7 +187,10 @@ bool WGCCapturer::init(uint32_t display_index) {
     }
 
     // Store the capture item (type-erased to keep the header clean).
-    capture_item_ = new GraphicsCaptureItem(item);
+    // WinRT types have deleted operator new, so we use placement new
+    // into manually allocated storage.
+    capture_item_ = ::operator new(sizeof(GraphicsCaptureItem));
+    new (capture_item_) GraphicsCaptureItem(item);
 
     // Create the staging texture for frame copies.
     D3D11_TEXTURE2D_DESC staging_desc = {};
@@ -224,7 +227,8 @@ bool WGCCapturer::init(uint32_t display_index) {
         return false;
     }
 
-    frame_pool_ = new Direct3D11CaptureFramePool(pool);
+    frame_pool_ = ::operator new(sizeof(Direct3D11CaptureFramePool));
+    new (frame_pool_) Direct3D11CaptureFramePool(pool);
 
     // Create the capture session.
     auto session = pool.CreateCaptureSession(item);
@@ -248,7 +252,8 @@ bool WGCCapturer::init(uint32_t display_index) {
         // Not available on older builds.
     }
 
-    capture_session_ = new GraphicsCaptureSession(session);
+    capture_session_ = ::operator new(sizeof(GraphicsCaptureSession));
+    new (capture_session_) GraphicsCaptureSession(session);
 
     fprintf(stderr, "[wgc] initialized for display %u (%ux%u)\n",
             display_index, width_, height_);
@@ -363,7 +368,8 @@ void WGCCapturer::stop() {
     if (capture_session_) {
         auto* session = static_cast<GraphicsCaptureSession*>(capture_session_);
         session->Close();
-        delete session;
+        session->~GraphicsCaptureSession();
+        ::operator delete(capture_session_);
         capture_session_ = nullptr;
     }
 
@@ -371,14 +377,16 @@ void WGCCapturer::stop() {
     if (frame_pool_) {
         auto* pool = static_cast<Direct3D11CaptureFramePool*>(frame_pool_);
         pool->Close();
-        delete pool;
+        pool->~Direct3D11CaptureFramePool();
+        ::operator delete(frame_pool_);
         frame_pool_ = nullptr;
     }
 
     // Clean up the capture item.
     if (capture_item_) {
         auto* item = static_cast<GraphicsCaptureItem*>(capture_item_);
-        delete item;
+        item->~GraphicsCaptureItem();
+        ::operator delete(capture_item_);
         capture_item_ = nullptr;
     }
 
