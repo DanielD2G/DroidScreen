@@ -65,7 +65,9 @@ int decoder_configure(DecoderContext *ctx, int width, int height) {
     AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_PRIORITY, 0);
+
+    /* Priority 0 = real-time (API 28+). Use string literal for compat. */
+    AMediaFormat_setInt32(format, "priority", 0);
 
     /* Request low latency decoding (API 30+, ignored on older) */
     AMediaFormat_setInt32(format, "low-latency", 1);

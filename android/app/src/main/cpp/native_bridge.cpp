@@ -237,32 +237,67 @@ static void* decode_thread_func(void* /*arg*/) {
     }
 
     int64_t pts_us = 0;
+    uint32_t frames_fed = 0;
+    uint32_t frames_rendered = 0;
+    uint32_t feed_errors = 0;
+    struct timespec ts_start, ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
     while (g_running.load(std::memory_order_acquire)) {
         /* Try to read a NAL unit from the ring buffer */
         size_t nal_len = ring_buffer_read_message(g_ring_buf, nal_buf, MAX_FRAME_SIZE);
         if (nal_len == 0) {
-            /* No data available, yield briefly */
+            /* No data available — still drain decoder output */
+            int r = decoder_drain(g_decoder);
+            if (r > 0) frames_rendered += r;
             usleep(500);
             continue;
         }
 
-        /* Determine flags — check NAL unit type for SPS/PPS */
+        /* Check for Annex B start codes and find NAL type */
         uint32_t flags = 0;
-        if (nal_len > 0) {
-            uint8_t nal_type = nal_buf[0] & 0x1F;
+        const uint8_t *nal_ptr = nal_buf;
+        size_t nal_remain = nal_len;
+
+        /* Skip leading start code if present */
+        if (nal_remain >= 4 && nal_ptr[0] == 0 && nal_ptr[1] == 0 &&
+            nal_ptr[2] == 0 && nal_ptr[3] == 1) {
+            uint8_t nal_type = nal_ptr[4] & 0x1F;
             if (nal_type == 7 || nal_type == 8) {
-                /* SPS or PPS — codec config data */
                 flags = 2; /* BUFFER_FLAG_CODEC_CONFIG */
+            }
+        } else if (nal_remain > 0) {
+            uint8_t nal_type = nal_ptr[0] & 0x1F;
+            if (nal_type == 7 || nal_type == 8) {
+                flags = 2;
             }
         }
 
         /* Feed to decoder */
-        decoder_feed(g_decoder, nal_buf, nal_len, pts_us, flags);
+        int ret = decoder_feed(g_decoder, nal_buf, nal_len, pts_us, flags);
+        if (ret == 0) {
+            frames_fed++;
+        } else {
+            feed_errors++;
+        }
         pts_us += 16667; /* ~60fps timestamp increment */
 
         /* Drain rendered output buffers */
-        decoder_drain(g_decoder);
+        int r = decoder_drain(g_decoder);
+        if (r > 0) frames_rendered += r;
+
+        /* Log stats every ~2 seconds */
+        if ((frames_fed % 120) == 0 && frames_fed > 0) {
+            clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            double elapsed = (ts_now.tv_sec - ts_start.tv_sec)
+                           + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
+            size_t ring_used = ring_buffer_available_read(g_ring_buf);
+            LOGI("decode: fed=%u rendered=%u err=%u | "
+                 "%.1f fed/s %.1f render/s | ring=%zu bytes",
+                 frames_fed, frames_rendered, feed_errors,
+                 frames_fed / elapsed, frames_rendered / elapsed,
+                 ring_used);
+        }
     }
 
     free(nal_buf);

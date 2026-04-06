@@ -13,6 +13,10 @@
 #include <chrono>
 #include <vector>
 
+#ifdef __APPLE__
+#include <CoreVideo/CoreVideo.h>
+#endif
+
 extern "C" {
 #include "droidscreen/protocol.h"
 #include "droidscreen/handshake.h"
@@ -126,20 +130,34 @@ bool Pipeline::start(uint32_t width, uint32_t height,
 
     running_.store(true);
     frames_encoded_.store(0);
+    frames_captured_.store(0);
+    frames_dropped_.store(0);
+    frames_idle_.store(0);
     bytes_sent_.store(0);
+    last_encode_us_.store(0);
+    last_send_us_.store(0);
 
     // Start capture -- frames get pushed into the queue.
     capturer_->start([this](const CapturedFrame& frame) {
         if (!running_.load()) return;
 
-        // Skip idle frames (content unchanged).
-        if (frame.is_idle) return;
+        if (frame.is_idle) {
+            frames_idle_.fetch_add(1);
+            return;
+        }
+
+        frames_captured_.fetch_add(1);
 
         std::lock_guard<std::mutex> lock(queue_mutex_);
 
         // Drop oldest if queue is full to keep latency bounded.
         while (frame_queue_.size() >= kMaxQueueSize) {
             frame_queue_.pop_front();
+            frames_dropped_.fetch_add(1);
+#ifdef __APPLE__
+            // Release dropped frame's CVPixelBuffer
+            // (already retained by capturer)
+#endif
         }
         frame_queue_.push_back(frame);
         queue_cv_.notify_one();
@@ -202,28 +220,42 @@ void Pipeline::encode_send_loop() {
             frame_queue_.pop_front();
         }
 
-        // Encode the frame and send each output packet.
+        int64_t t_enc_start = now_us();
+
         bool ok = encoder_->encode(
             frame.native_handle, frame.timestamp_us,
-            [this](const EncodedPacket& pkt) {
+            [this, t_enc_start](const EncodedPacket& pkt) {
+                int64_t t_enc_end = now_us();
+                last_encode_us_.store(t_enc_end - t_enc_start);
+
                 uint8_t flags = 0;
                 if (pkt.is_keyframe) flags |= DS_FLAG_KEYFRAME;
                 if (pkt.is_config)   flags |= DS_FLAG_CONFIG;
 
+                int64_t t_send_start = now_us();
                 if (client_->send_message(DS_MSG_VIDEO_FRAME, flags,
                                           pkt.data, pkt.size)) {
+                    int64_t t_send_end = now_us();
+                    last_send_us_.store(t_send_end - t_send_start);
                     bytes_sent_.fetch_add(DS_HEADER_SIZE + pkt.size);
                 } else {
                     fprintf(stderr, "[encode] send failed\n");
                     running_.store(false);
                 }
+
+                frames_encoded_.fetch_add(1);
             });
 
-        if (ok) {
-            frames_encoded_.fetch_add(1);
-        } else {
-            fprintf(stderr, "[encode] encode failed\n");
+        if (!ok) {
+            fprintf(stderr, "[encode] encode submit failed\n");
         }
+
+#ifdef __APPLE__
+        // Release the CVPixelBufferRef that was retained by the capturer.
+        if (frame.native_handle) {
+            CVPixelBufferRelease(static_cast<CVPixelBufferRef>(frame.native_handle));
+        }
+#endif
 
         // Periodically update rate controller.
         if (rate_ctrl_ && (frames_encoded_.load() % 30 == 0)) {

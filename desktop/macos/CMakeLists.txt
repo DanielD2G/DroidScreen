@@ -7,6 +7,7 @@ add_executable(droidscreen_desktop
     src/main.mm
     src/sck_capturer.mm
     src/vt_encoder.mm
+    src/virtual_display.mm
 )
 
 target_include_directories(droidscreen_desktop
@@ -37,6 +38,7 @@ set_source_files_properties(
     src/main.mm
     src/sck_capturer.mm
     src/vt_encoder.mm
+    src/virtual_display.mm
     PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
 )

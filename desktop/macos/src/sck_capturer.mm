@@ -74,6 +74,10 @@
         timestamp_us = (int64_t)(CMTimeGetSeconds(pts) * 1e6);
     }
 
+    // Retain the pixel buffer so it survives beyond this callback.
+    // The pipeline must release it after encoding.
+    CVPixelBufferRetain(pixelBuf);
+
     droidscreen::CapturedFrame frame;
     frame.native_handle = pixelBuf;
     frame.width  = (uint32_t)CVPixelBufferGetWidth(pixelBuf);
@@ -102,6 +106,82 @@ SCKCapturer::SCKCapturer() = default;
 
 SCKCapturer::~SCKCapturer() {
     stop();
+}
+
+bool SCKCapturer::init_with_display_id(uint32_t cg_display_id) {
+    __block bool success = false;
+    __block SCDisplay* chosen_display = nil;
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    [SCShareableContent getShareableContentWithCompletionHandler:
+        ^(SCShareableContent * _Nullable content, NSError * _Nullable error) {
+            if (error || !content) {
+                fprintf(stderr, "[sck] getShareableContent failed: %s\n",
+                        error ? [[error localizedDescription] UTF8String]
+                              : "nil content");
+                dispatch_semaphore_signal(sem);
+                return;
+            }
+
+            for (SCDisplay *d in content.displays) {
+                if (d.displayID == cg_display_id) {
+                    chosen_display = d;
+                    break;
+                }
+            }
+
+            if (!chosen_display) {
+                fprintf(stderr, "[sck] display ID %u not found in SCK\n",
+                        cg_display_id);
+                dispatch_semaphore_signal(sem);
+                return;
+            }
+
+            success = true;
+            dispatch_semaphore_signal(sem);
+        }];
+
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (!success) return false;
+
+    width_  = (uint32_t)chosen_display.width;
+    height_ = (uint32_t)chosen_display.height;
+
+    SCContentFilter* filter =
+        [[SCContentFilter alloc] initWithDisplay:chosen_display
+                                excludingWindows:@[]];
+
+    SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
+    config.width  = width_;
+    config.height = height_;
+    config.minimumFrameInterval = CMTimeMake(1, 60);
+    config.queueDepth = 3;
+    config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    config.showsCursor = YES;
+
+    stream_ = [[SCStream alloc] initWithFilter:filter
+                                 configuration:config
+                                      delegate:nil];
+
+    delegate_ = [[SCKCapturerDelegate alloc] init];
+    delegate_.owner = this;
+
+    NSError* addErr = nil;
+    [stream_ addStreamOutput:delegate_
+                        type:SCStreamOutputTypeScreen
+              sampleHandlerQueue:dispatch_get_global_queue(
+                  QOS_CLASS_USER_INTERACTIVE, 0)
+                       error:&addErr];
+    if (addErr) {
+        fprintf(stderr, "[sck] addStreamOutput failed: %s\n",
+                [[addErr localizedDescription] UTF8String]);
+        return false;
+    }
+
+    fprintf(stderr, "[sck] initialized for display ID %u (%ux%u)\n",
+            cg_display_id, width_, height_);
+    return true;
 }
 
 bool SCKCapturer::init(uint32_t display_index) {
@@ -159,7 +239,7 @@ bool SCKCapturer::init(uint32_t display_index) {
     config.height = cap_h;
     config.minimumFrameInterval = CMTimeMake(1, 60);  // 60 fps
     config.queueDepth = 3;
-    config.pixelFormat = kCVPixelFormatType_32BGRA;
+    config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.showsCursor = YES;
 
     // Create the stream.

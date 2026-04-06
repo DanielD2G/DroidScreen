@@ -48,11 +48,13 @@ public:
     /// Number of frames encoded so far.
     uint64_t frames_encoded() const { return frames_encoded_.load(); }
 
-    /// Number of bytes sent so far.
+    uint64_t frames_captured() const { return frames_captured_.load(); }
+    uint64_t frames_dropped() const { return frames_dropped_.load(); }
+    uint64_t frames_idle() const { return frames_idle_.load(); }
     uint64_t bytes_sent() const { return bytes_sent_.load(); }
-
-    /// Last measured RTT in microseconds.
     int64_t last_rtt_us() const { return last_rtt_us_.load(); }
+    int64_t last_encode_us() const { return last_encode_us_.load(); }
+    int64_t last_send_us() const { return last_send_us_.load(); }
 
 private:
     // Perform the protocol handshake with the Android device.
@@ -91,8 +93,13 @@ private:
 
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> frames_encoded_{0};
+    std::atomic<uint64_t> frames_captured_{0};
+    std::atomic<uint64_t> frames_dropped_{0};
+    std::atomic<uint64_t> frames_idle_{0};
     std::atomic<uint64_t> bytes_sent_{0};
     std::atomic<int64_t>  last_rtt_us_{0};
+    std::atomic<int64_t>  last_encode_us_{0};
+    std::atomic<int64_t>  last_send_us_{0};
 
     // Timestamp of last ping sent, for RTT calculation.
     std::atomic<int64_t> ping_sent_us_{0};
