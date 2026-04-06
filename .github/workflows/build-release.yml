@@ -7,7 +7,7 @@
 #
 # Platforms:
 #   macOS ARM   (Apple Silicon)  →  .zip
-#   Windows x64                  →  .zip
+#   Windows x64                  →  .exe (NSIS installer)
 #   Android APK (arm64 + x86_64)→  .apk
 # ─────────────────────────────────────────────────────────────
 name: Build & Release
@@ -192,13 +192,33 @@ jobs:
             -DCMAKE_SYSTEM_VERSION=10.0
           cmake --build build --config Release --parallel
 
-      - name: Package
+      - name: Download ADB platform-tools
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive `
-            -Path "build\desktop\windows\Release\droidscreen_desktop.exe" `
-            -DestinationPath "dist\DroidScreen-Windows-x64-v$env:VERSION.zip"
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "platform-tools.zip"
+          Expand-Archive -Path "platform-tools.zip" -DestinationPath "."
+
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          # Stage files
+          New-Item -ItemType Directory -Force -Path "staging/app"
+          New-Item -ItemType Directory -Force -Path "staging/adb"
+          Copy-Item "build\desktop\windows\Release\droidscreen_desktop.exe" "staging\app\"
+          Copy-Item "platform-tools\adb.exe" "staging\adb\"
+          Copy-Item "platform-tools\AdbWinApi.dll" "staging\adb\"
+          Copy-Item "platform-tools\AdbWinUsbApi.dll" "staging\adb\"
+
+          # Build installer
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=$env:VERSION /DSTAGING_DIR=staging installer\windows\DroidScreen.nsi
+
+          # Copy to dist
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "installer\windows\DroidScreen-Setup.exe" "dist\DroidScreen-Windows-x64-v$env:VERSION-Setup.exe"
 
       - uses: actions/upload-artifact@v4
         with:
