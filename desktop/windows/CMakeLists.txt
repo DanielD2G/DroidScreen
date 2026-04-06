@@ -1,25 +1,33 @@
 cmake_minimum_required(VERSION 3.14)
 
+# Find FFmpeg libraries (vcpkg provides these automatically).
+find_path(AVCODEC_INCLUDE_DIR libavcodec/avcodec.h)
+find_library(AVCODEC_LIBRARY avcodec)
+find_library(AVUTIL_LIBRARY avutil)
+find_library(SWSCALE_LIBRARY swscale)
+
 add_executable(droidscreen_desktop WIN32
     src/main.cpp
     src/wgc_capturer.cpp
-    src/nvenc_encoder.cpp
-    src/color_converter.cpp
+    src/ffmpeg_encoder.cpp
     src/touch_injector_win.cpp
 )
 
 target_include_directories(droidscreen_desktop
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${AVCODEC_INCLUDE_DIR}
 )
 
 target_link_libraries(droidscreen_desktop
     PRIVATE
         droidscreen_common
         droidscreen_protocol
+        ${AVCODEC_LIBRARY}
+        ${AVUTIL_LIBRARY}
+        ${SWSCALE_LIBRARY}
         d3d11
         dxgi
-        d3dcompiler
         ws2_32
         windowsapp    # WinRT / C++/WinRT support
         shell32       # Shell_NotifyIcon, SHGetFolderPath

@@ -2,7 +2,8 @@
  * DroidScreen Windows - System Tray Application
  *
  * A Win32 system-tray app that captures the screen via WGC, encodes with
- * NVENC, and streams H.264 to an Android tablet over USB (adb forward).
+ * FFmpeg (hw auto-detect + software fallback), and streams H.264 to an
+ * Android tablet over USB (adb forward).
  *
  * Mirrors the macOS menu-bar app functionality:
  *   - System tray icon with right-click popup menu
@@ -28,7 +29,7 @@
 #include <shlobj.h>
 
 #include "wgc_capturer.h"
-#include "nvenc_encoder.h"
+#include "ffmpeg_encoder.h"
 #include "touch_injector_win.h"
 #include "droidscreen/pipeline.h"
 #include "droidscreen/server.h"
@@ -439,7 +440,7 @@ struct AppState {
 
     // Pipeline components.
     std::unique_ptr<droidscreen::WGCCapturer>     capturer;
-    std::unique_ptr<droidscreen::NvencEncoder>     encoder;
+    std::unique_ptr<droidscreen::FFmpegEncoder>     encoder;
     std::unique_ptr<droidscreen::TCPClient>        client;
     std::unique_ptr<droidscreen::WinTouchInjector> touch;
     std::unique_ptr<droidscreen::Pipeline>         pipeline;
@@ -819,23 +820,22 @@ static void connect_sync() {
 
     // 4. Create encoder.
     update_status(L"Initializing encoder...");
-    log_msg("[Stream] Creating NVENC encoder (D3D device=%p, context=%p)",
+    log_msg("[Stream] Creating FFmpeg encoder (D3D device=%p, context=%p)",
             g_app.capturer->device(), g_app.capturer->context());
-    g_app.encoder = std::make_unique<droidscreen::NvencEncoder>();
+    g_app.encoder = std::make_unique<droidscreen::FFmpegEncoder>();
     g_app.encoder->set_d3d_device(g_app.capturer->device(),
                                    g_app.capturer->context());
 
-    // Flush stderr before init so any NVENC messages are captured.
+    // Flush stderr before init so any encoder messages are captured.
     fflush(stderr);
     if (!g_app.encoder->init(cap_w, cap_h, settings.fps, settings.bitrate_kbps)) {
         fflush(stderr);
-        // Read back any stderr output that NVENC wrote.
-        // Also log a diagnostic summary.
-        log_msg("[Stream] NVENC encoder init failed for %ux%u@%ufps %ukbps",
+        // Read back any stderr output that the encoder wrote.
+        log_msg("[Stream] Encoder init failed for %ux%u@%ufps %ukbps",
                 cap_w, cap_h, settings.fps, settings.bitrate_kbps);
-        log_msg("[Stream] Check: 1) NVIDIA GPU present? 2) Latest drivers? "
-                "3) nvEncodeAPI64.dll in PATH or system?");
-        update_status(L"NVENC encoder init failed");
+        log_msg("[Stream] No suitable H.264 encoder found "
+                "(tried NVENC, QSV, AMF, libx264)");
+        update_status(L"Encoder init failed");
         g_app.encoder.reset();
         g_app.capturer.reset();
         adb_forward_remove(settings.port);
