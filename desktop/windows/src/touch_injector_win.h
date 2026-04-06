@@ -40,6 +40,7 @@ public:
 
     /// Per-pointer tracking state.
     struct PointerState {
+        bool     assigned       = false;
         bool     present        = false;
         bool     in_range       = false;
         bool     in_contact     = false;
@@ -47,6 +48,7 @@ public:
         bool     edge_down      = false;
         bool     edge_up        = false;
         bool     edge_canceled  = false;
+        uint8_t  external_id    = 0;
         int32_t  pixel_x        = 0;
         int32_t  pixel_y        = 0;
         uint16_t pressure       = 0;
@@ -86,6 +88,9 @@ private:
     bool inject_current_state_locked();
     bool has_repeatable_touches_locked() const;
     void clear_edge_flags_locked();
+    void cancel_all_locked();
+    int find_slot_by_external_id_locked(uint8_t external_id) const;
+    int allocate_slot_locked(uint8_t external_id);
     uint32_t pointer_flags_locked(const PointerState& ptr) const;
     void repeat_loop();
 };

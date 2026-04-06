@@ -46,6 +46,9 @@ static constexpr uint8_t kTouchDown   = 0;
 static constexpr uint8_t kTouchMove   = 1;
 static constexpr uint8_t kTouchUp     = 2;
 static constexpr uint8_t kTouchCancel = 3;
+static constexpr uint8_t kTouchHover = 4;
+static constexpr uint8_t kTouchHoverLeave = 5;
+static constexpr uint8_t kTouchButtonOnly = 6;
 
 } // extern "C"
 
@@ -118,9 +121,19 @@ bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!device_) return false;
-    if (ptr_id >= kMaxContacts) {
-        fprintf(stderr, "[touch] pointer_id %u exceeds max contacts\n", ptr_id);
-        return false;
+    int slot = find_slot_by_external_id_locked(ptr_id);
+    if (slot < 0 && (action == kTouchDown || action == kTouchHover)) {
+        slot = allocate_slot_locked(ptr_id);
+        if (slot < 0) {
+            fprintf(stderr, "[touch] no free touch slots; cancelling all active touches\n");
+            cancel_all_locked();
+            slot = allocate_slot_locked(ptr_id);
+            if (slot < 0) {
+                return false;
+            }
+        }
+    } else if (slot < 0) {
+        return true;
     }
 
     // Convert fractional coordinates (0..65535) to pixel coordinates
@@ -147,10 +160,11 @@ bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
     if (pixel_y >= vdesk_height_) pixel_y = vdesk_height_ - 1;
 
     // Update per-pointer state.
-    auto& ptr = pointers_[ptr_id];
+    auto& ptr = pointers_[slot];
 
     switch (action) {
         case kTouchDown:
+            ptr.assigned      = true;
             ptr.present       = true;
             ptr.in_range      = true;
             ptr.in_contact    = true;
@@ -181,6 +195,23 @@ bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
             ptr.pixel_x       = pixel_x;
             ptr.pixel_y       = pixel_y;
             ptr.pressure      = pressure;
+            ptr.touch_major   = touch_major;
+            ptr.touch_minor   = touch_minor;
+            ptr.orientation   = orientation;
+            break;
+
+        case kTouchHover:
+            ptr.assigned      = true;
+            ptr.present       = true;
+            ptr.in_range      = true;
+            ptr.in_contact    = false;
+            ptr.edge_update   = true;
+            ptr.edge_down     = false;
+            ptr.edge_up       = false;
+            ptr.edge_canceled = false;
+            ptr.pixel_x       = pixel_x;
+            ptr.pixel_y       = pixel_y;
+            ptr.pressure      = 0;
             ptr.touch_major   = touch_major;
             ptr.touch_minor   = touch_minor;
             ptr.orientation   = orientation;
@@ -220,6 +251,39 @@ bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
             ptr.edge_canceled = true;
             ptr.in_contact    = false;
             ptr.in_range      = false;
+            break;
+
+        case kTouchHoverLeave:
+            if (!ptr.present) {
+                return true;
+            }
+            ptr.pixel_x       = pixel_x;
+            ptr.pixel_y       = pixel_y;
+            ptr.touch_major   = touch_major;
+            ptr.touch_minor   = touch_minor;
+            ptr.orientation   = orientation;
+            ptr.pressure      = 0;
+            ptr.in_contact    = false;
+            ptr.in_range      = false;
+            ptr.edge_update   = true;
+            ptr.edge_down     = false;
+            ptr.edge_up       = false;
+            ptr.edge_canceled = false;
+            break;
+
+        case kTouchButtonOnly:
+            if (!ptr.present) {
+                return true;
+            }
+            ptr.pixel_x       = pixel_x;
+            ptr.pixel_y       = pixel_y;
+            ptr.touch_major   = touch_major;
+            ptr.touch_minor   = touch_minor;
+            ptr.orientation   = orientation;
+            ptr.edge_update   = true;
+            ptr.edge_down     = false;
+            ptr.edge_up       = false;
+            ptr.edge_canceled = false;
             break;
 
         default:
@@ -347,7 +411,7 @@ bool WinTouchInjector::has_repeatable_touches_locked() const {
 
 void WinTouchInjector::clear_edge_flags_locked() {
     for (auto& ptr : pointers_) {
-        if (!ptr.present) {
+        if (!ptr.assigned) {
             continue;
         }
 
@@ -357,13 +421,61 @@ void WinTouchInjector::clear_edge_flags_locked() {
         ptr.edge_canceled = false;
 
         if (!ptr.in_range && !ptr.in_contact) {
+            ptr.assigned = false;
             ptr.present = false;
+            ptr.external_id = 0;
             ptr.pressure = 0;
             ptr.touch_major = 0;
             ptr.touch_minor = 0;
             ptr.orientation = DS_TOUCH_ORIENTATION_UNKNOWN;
         }
     }
+}
+
+void WinTouchInjector::cancel_all_locked() {
+    bool has_active = false;
+    for (auto& ptr : pointers_) {
+        if (!ptr.assigned) {
+            continue;
+        }
+        const bool was_in_contact = ptr.in_contact;
+        ptr.in_contact = false;
+        ptr.in_range = false;
+        ptr.edge_down = false;
+        ptr.edge_update = !was_in_contact;
+        ptr.edge_up = was_in_contact;
+        ptr.edge_canceled = true;
+        ptr.pressure = 0;
+        has_active = true;
+    }
+
+    if (has_active) {
+        inject_current_state_locked();
+    }
+}
+
+int WinTouchInjector::find_slot_by_external_id_locked(uint8_t external_id) const {
+    for (uint32_t i = 0; i < kMaxContacts; ++i) {
+        const auto& ptr = pointers_[i];
+        if (ptr.assigned && ptr.external_id == external_id) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+int WinTouchInjector::allocate_slot_locked(uint8_t external_id) {
+    for (uint32_t i = 0; i < kMaxContacts; ++i) {
+        auto& ptr = pointers_[i];
+        if (!ptr.assigned) {
+            ptr = {};
+            ptr.assigned = true;
+            ptr.external_id = external_id;
+            ptr.orientation = DS_TOUCH_ORIENTATION_UNKNOWN;
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
 }
 
 uint32_t WinTouchInjector::pointer_flags_locked(const PointerState& ptr) const {

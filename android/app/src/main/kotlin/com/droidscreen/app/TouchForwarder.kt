@@ -16,9 +16,12 @@ object TouchForwarder {
     private const val DS_TOUCH_MOVE = 1
     private const val DS_TOUCH_UP = 2
     private const val DS_TOUCH_CANCEL = 3
+    private const val DS_TOUCH_HOVER = 4
+    private const val DS_TOUCH_HOVER_LEAVE = 5
+    private const val DS_TOUCH_BUTTON_ONLY = 6
     private const val ORIENTATION_UNKNOWN = 0xFFFF
 
-    fun forward(event: MotionEvent, surfaceWidth: Int, surfaceHeight: Int, activity: MainActivity) {
+    fun forwardTouch(event: MotionEvent, surfaceWidth: Int, surfaceHeight: Int, activity: MainActivity) {
         val actionMasked = event.actionMasked
         val pointerIndex = event.actionIndex
 
@@ -50,6 +53,36 @@ object TouchForwarder {
                     sendPointer(event, i, surfaceWidth, surfaceHeight, DS_TOUCH_CANCEL, activity)
                 }
             }
+        }
+    }
+
+    fun forwardGenericMotion(
+        event: MotionEvent,
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+        activity: MainActivity
+    ): Boolean {
+        val pointerIndex = event.actionIndex.coerceIn(0, event.pointerCount - 1)
+
+        return when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER,
+            MotionEvent.ACTION_HOVER_MOVE -> {
+                sendPointer(event, pointerIndex, surfaceWidth, surfaceHeight, DS_TOUCH_HOVER, activity)
+                true
+            }
+
+            MotionEvent.ACTION_HOVER_EXIT -> {
+                sendPointer(event, pointerIndex, surfaceWidth, surfaceHeight, DS_TOUCH_HOVER_LEAVE, activity)
+                true
+            }
+
+            MotionEvent.ACTION_BUTTON_PRESS,
+            MotionEvent.ACTION_BUTTON_RELEASE -> {
+                sendPointer(event, pointerIndex, surfaceWidth, surfaceHeight, DS_TOUCH_BUTTON_ONLY, activity)
+                true
+            }
+
+            else -> false
         }
     }
 

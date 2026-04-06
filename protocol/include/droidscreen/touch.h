@@ -17,10 +17,13 @@ extern "C" {
  * Touch action types
  */
 typedef enum {
-    DS_TOUCH_DOWN   = 0,
-    DS_TOUCH_MOVE   = 1,
-    DS_TOUCH_UP     = 2,
-    DS_TOUCH_CANCEL = 3
+    DS_TOUCH_DOWN        = 0,
+    DS_TOUCH_MOVE        = 1,
+    DS_TOUCH_UP          = 2,
+    DS_TOUCH_CANCEL      = 3,
+    DS_TOUCH_HOVER       = 4,
+    DS_TOUCH_HOVER_LEAVE = 5,
+    DS_TOUCH_BUTTON_ONLY = 6
 } ds_touch_action_t;
 
 #define DS_TOUCH_EVENT_SIZE  20

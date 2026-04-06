@@ -47,6 +47,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         statusText = findViewById(R.id.status_text)
         statusDetail = findViewById(R.id.status_detail)
 
+        surfaceView.isFocusable = true
+        surfaceView.isFocusableInTouchMode = true
+        surfaceView.requestFocus()
+        surfaceView.setOnTouchListener { v, event ->
+            handleTouchEvent(v, event)
+        }
+        surfaceView.setOnGenericMotionListener { v, event ->
+            handleGenericMotionEvent(v, event)
+        }
         surfaceView.holder.addCallback(this)
 
         // Show initial waiting state
@@ -112,12 +121,42 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        val width = surfaceView.width
-        val height = surfaceView.height
-        if (width > 0 && height > 0) {
-            TouchForwarder.forward(event, width, height, this)
+        return handleTouchEvent(surfaceView, event)
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        return handleGenericMotionEvent(surfaceView, event) || super.onGenericMotionEvent(event)
+    }
+
+    private fun handleTouchEvent(view: SurfaceView, event: MotionEvent): Boolean {
+        val width = view.width
+        val height = view.height
+        if (width <= 0 || height <= 0) {
+            return false
         }
+
+        view.requestUnbufferedDispatch(event)
+        TouchForwarder.forwardTouch(event, width, height, this)
         return true
+    }
+
+    private fun handleGenericMotionEvent(view: SurfaceView, event: MotionEvent): Boolean {
+        val width = view.width
+        val height = view.height
+        if (width <= 0 || height <= 0) {
+            return false
+        }
+
+        val source = event.source
+        val isPointerSource =
+            (source and android.view.InputDevice.SOURCE_TOUCHSCREEN) == android.view.InputDevice.SOURCE_TOUCHSCREEN ||
+            (source and android.view.InputDevice.SOURCE_STYLUS) == android.view.InputDevice.SOURCE_STYLUS
+        if (!isPointerSource) {
+            return false
+        }
+
+        view.requestUnbufferedDispatch(event)
+        return TouchForwarder.forwardGenericMotion(event, width, height, this)
     }
 
     /**
