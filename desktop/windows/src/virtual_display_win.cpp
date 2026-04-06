@@ -289,9 +289,25 @@ bool VirtualDisplayWin::configure_display(uint32_t width, uint32_t height,
 // Find the HMONITOR for the Parsec virtual display
 // ---------------------------------------------------------------------------
 
-struct MonitorSearchCtx {
-    HMONITOR result;
+struct MonitorMatchCtx {
+    std::wstring target_device;
+    HMONITOR     result;
 };
+
+static BOOL CALLBACK monitor_enum_callback(HMONITOR hmon, HDC /*hdc*/,
+                                            LPRECT /*rc*/, LPARAM lparam) {
+    auto* ctx = reinterpret_cast<MonitorMatchCtx*>(lparam);
+
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hmon, &mi)) {
+        if (ctx->target_device == mi.szDevice) {
+            ctx->result = hmon;
+            return FALSE; // Stop enumeration.
+        }
+    }
+    return TRUE; // Continue.
+}
 
 HMONITOR VirtualDisplayWin::find_parsec_monitor() {
     // Enumerate display devices to find the Parsec VDD device name.
@@ -334,30 +350,57 @@ HMONITOR VirtualDisplayWin::find_parsec_monitor() {
         return nullptr;
     }
 
-    // Get the desktop coordinates for this display device.
-    DEVMODEW dm = {};
-    dm.dmSize = sizeof(dm);
-    if (!EnumDisplaySettingsW(parsec_device_name.c_str(),
-                              ENUM_CURRENT_SETTINGS, &dm)) {
-        fprintf(stderr, "[vdd] Could not get display settings for Parsec device\n");
-        return nullptr;
+    // Method 1: EnumDisplayMonitors — matches by device name (most reliable).
+    MonitorMatchCtx ctx;
+    ctx.target_device = parsec_device_name;
+    ctx.result = nullptr;
+
+    EnumDisplayMonitors(nullptr, nullptr, monitor_enum_callback,
+                        reinterpret_cast<LPARAM>(&ctx));
+
+    if (ctx.result) {
+        fprintf(stderr, "[vdd] Found HMONITOR=%p via EnumDisplayMonitors\n",
+                ctx.result);
+        return ctx.result;
     }
 
-    // Use MonitorFromPoint with a point inside this display's area.
-    POINT pt;
-    pt.x = dm.dmPosition.x + static_cast<LONG>(dm.dmPelsWidth / 2);
-    pt.y = dm.dmPosition.y + static_cast<LONG>(dm.dmPelsHeight / 2);
+    // Method 2: Fallback — use MonitorFromPoint with display coordinates.
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(parsec_device_name.c_str(),
+                              ENUM_CURRENT_SETTINGS, &dm)) {
+        POINT pt;
+        pt.x = dm.dmPosition.x + static_cast<LONG>(dm.dmPelsWidth / 2);
+        pt.y = dm.dmPosition.y + static_cast<LONG>(dm.dmPelsHeight / 2);
 
-    HMONITOR hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
-    if (hmon) {
-        fprintf(stderr, "[vdd] Found HMONITOR=%p at (%ld, %ld)\n",
-                hmon, pt.x, pt.y);
-    } else {
+        HMONITOR hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+        if (hmon) {
+            fprintf(stderr, "[vdd] Found HMONITOR=%p via MonitorFromPoint "
+                    "at (%ld, %ld)\n", hmon, pt.x, pt.y);
+            return hmon;
+        }
         fprintf(stderr, "[vdd] MonitorFromPoint returned null for (%ld, %ld)\n",
                 pt.x, pt.y);
     }
 
-    return hmon;
+    // Method 3: Last resort — try all monitors and pick the last one
+    // (the virtual display is typically the most recently added).
+    HMONITOR last_monitor = nullptr;
+    EnumDisplayMonitors(nullptr, nullptr,
+        [](HMONITOR hmon, HDC, LPRECT, LPARAM lp) -> BOOL {
+            *reinterpret_cast<HMONITOR*>(lp) = hmon;
+            return TRUE; // Continue — we want the last one.
+        }, reinterpret_cast<LPARAM>(&last_monitor));
+
+    if (last_monitor) {
+        MONITORINFOEXW mi = {};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(last_monitor, &mi);
+        fprintf(stderr, "[vdd] Using last monitor as fallback: %ls, "
+                "HMONITOR=%p\n", mi.szDevice, last_monitor);
+    }
+
+    return last_monitor;
 }
 
 } // namespace droidscreen
