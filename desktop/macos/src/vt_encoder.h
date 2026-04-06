@@ -61,6 +61,9 @@ private:
                                 OSStatus status,
                                 VTEncodeInfoFlags info_flags,
                                 CMSampleBufferRef sample_buf);
+
+    /// Pre-allocated buffer for AVCC→Annex B conversion (avoids per-frame malloc).
+    std::vector<uint8_t> annex_b_buf_;
 };
 
 } // namespace droidscreen

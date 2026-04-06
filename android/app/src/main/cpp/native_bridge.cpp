@@ -267,13 +267,13 @@ static void* decode_thread_func(void* /*arg*/) {
             continue;
         }
 
-        /* Check for Annex B start codes and find NAL type */
+        /* H.264 NAL type: bits 0-4 of first byte after start code.
+         * SPS=7, PPS=8 → BUFFER_FLAG_CODEC_CONFIG. */
         uint32_t flags = 0;
         const uint8_t *nal_ptr = nal_buf;
         size_t nal_remain = nal_len;
 
-        /* Skip leading start code if present */
-        if (nal_remain >= 4 && nal_ptr[0] == 0 && nal_ptr[1] == 0 &&
+        if (nal_remain >= 5 && nal_ptr[0] == 0 && nal_ptr[1] == 0 &&
             nal_ptr[2] == 0 && nal_ptr[3] == 1) {
             uint8_t nal_type = nal_ptr[4] & 0x1F;
             if (nal_type == 7 || nal_type == 8) {

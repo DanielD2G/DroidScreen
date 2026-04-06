@@ -17,7 +17,8 @@ extern "C" {
  * Codec identifiers
  */
 typedef enum {
-    DS_CODEC_H264 = 0
+    DS_CODEC_H264 = 0,
+    DS_CODEC_HEVC = 1
 } ds_codec_t;
 
 #define DS_HANDSHAKE_REQ_SIZE   20

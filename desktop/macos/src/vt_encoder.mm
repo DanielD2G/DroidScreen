@@ -1,10 +1,10 @@
 /*
- * DroidScreen macOS - VideoToolbox H.264 encoder (optimized)
+ * DroidScreen macOS - VideoToolbox HEVC encoder (optimized)
  *
  * Key optimizations vs naive implementation:
  *   1. EnableLowLatencyRateControl — uses Apple's dedicated low-latency path
  *   2. RequireHardwareAcceleratedVideoEncoder — forces Media Engine, no software
- *   3. Baseline profile — fastest encode, no CABAC overhead
+ *   3. Main profile — good balance of speed and compression
  *   4. ASYNC callbacks — NO CompleteFrames per frame (was 13-24ms bottleneck!)
  *   5. PrioritizeEncodingSpeedOverQuality — max speed
  *   6. NV12 pixel format hint — avoids internal BGRA→YUV conversion
@@ -92,7 +92,7 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
 
-    // Baseline profile — fastest, no CABAC, no B-frames implicitly.
+    // Main profile — good compression, no B-frames implicitly.
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_ProfileLevel,
         kVTProfileLevel_H264_Baseline_AutoLevel);
@@ -159,7 +159,7 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
     keyframe_pending_.store(false);
 
     fprintf(stderr, "[vt] encoder initialized: %ux%u@%u, %u kbps "
-            "(low-latency, HW, baseline)\n",
+            "(low-latency, HW, h264 baseline)\n",
             width, height, fps, bitrate_kbps);
     return true;
 }
@@ -250,7 +250,7 @@ void VTEncoder::output_callback(void* refcon,
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buf);
     int64_t timestamp_us = (int64_t)(CMTimeGetSeconds(pts) * 1e6);
 
-    // On keyframe or first frame, emit SPS/PPS config.
+    // On keyframe or first frame, emit VPS/SPS/PPS config.
     if (is_keyframe || !self->config_sent_) {
         CMFormatDescriptionRef fmt =
             CMSampleBufferGetFormatDescription(sample_buf);
@@ -269,24 +269,18 @@ void VTEncoder::emit_config(CMFormatDescriptionRef fmt,
                             int64_t timestamp_us) {
     std::vector<uint8_t> config_data;
 
-    const uint8_t* sps_ptr = nullptr;
-    size_t sps_len = 0;
-    if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            fmt, 0, &sps_ptr, &sps_len, nullptr, nullptr) == noErr
-        && sps_ptr && sps_len > 0) {
-        config_data.insert(config_data.end(),
-                           kAnnexBStartCode, kAnnexBStartCode + 4);
-        config_data.insert(config_data.end(), sps_ptr, sps_ptr + sps_len);
-    }
-
-    const uint8_t* pps_ptr = nullptr;
-    size_t pps_len = 0;
-    if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            fmt, 1, &pps_ptr, &pps_len, nullptr, nullptr) == noErr
-        && pps_ptr && pps_len > 0) {
-        config_data.insert(config_data.end(),
-                           kAnnexBStartCode, kAnnexBStartCode + 4);
-        config_data.insert(config_data.end(), pps_ptr, pps_ptr + pps_len);
+    // H.264: SPS (index 0) + PPS (index 1).
+    for (int i = 0; i < 2; i++) {
+        const uint8_t* param_ptr = nullptr;
+        size_t param_len = 0;
+        if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                fmt, i, &param_ptr, &param_len, nullptr, nullptr) == noErr
+            && param_ptr && param_len > 0) {
+            config_data.insert(config_data.end(),
+                               kAnnexBStartCode, kAnnexBStartCode + 4);
+            config_data.insert(config_data.end(),
+                               param_ptr, param_ptr + param_len);
+        }
     }
 
     if (config_data.empty()) return;
@@ -320,24 +314,22 @@ void VTEncoder::emit_frame(CMSampleBufferRef sample_buf, bool is_keyframe) {
     int64_t timestamp_us = (int64_t)(CMTimeGetSeconds(pts) * 1e6);
 
     // AVCC → Annex B: replace 4-byte length prefixes with start codes.
-    // In-place is safe because the replacement is same size (4 bytes).
-    // But we need a copy since the CMBlockBuffer is read-only.
-    std::vector<uint8_t> annex_b(total_len);
-    memcpy(annex_b.data(), data_ptr, total_len);
+    // Pre-allocated buffer avoids per-frame heap allocation.
+    annex_b_buf_.resize(total_len);
+    memcpy(annex_b_buf_.data(), data_ptr, total_len);
 
     size_t offset = 0;
     while (offset + 4 <= total_len) {
         uint32_t nal_len =
-            (static_cast<uint32_t>((uint8_t)annex_b[offset])     << 24) |
-            (static_cast<uint32_t>((uint8_t)annex_b[offset + 1]) << 16) |
-            (static_cast<uint32_t>((uint8_t)annex_b[offset + 2]) <<  8) |
-            (static_cast<uint32_t>((uint8_t)annex_b[offset + 3]));
+            (static_cast<uint32_t>((uint8_t)annex_b_buf_[offset])     << 24) |
+            (static_cast<uint32_t>((uint8_t)annex_b_buf_[offset + 1]) << 16) |
+            (static_cast<uint32_t>((uint8_t)annex_b_buf_[offset + 2]) <<  8) |
+            (static_cast<uint32_t>((uint8_t)annex_b_buf_[offset + 3]));
 
-        // Replace length prefix with Annex B start code.
-        annex_b[offset]     = 0x00;
-        annex_b[offset + 1] = 0x00;
-        annex_b[offset + 2] = 0x00;
-        annex_b[offset + 3] = 0x01;
+        annex_b_buf_[offset]     = 0x00;
+        annex_b_buf_[offset + 1] = 0x00;
+        annex_b_buf_[offset + 2] = 0x00;
+        annex_b_buf_[offset + 3] = 0x01;
 
         offset += 4 + nal_len;
     }
@@ -345,8 +337,8 @@ void VTEncoder::emit_frame(CMSampleBufferRef sample_buf, bool is_keyframe) {
     std::lock_guard<std::mutex> lock(encode_mutex_);
     if (current_callback_) {
         EncodedPacket pkt;
-        pkt.data         = annex_b.data();
-        pkt.size         = annex_b.size();
+        pkt.data         = annex_b_buf_.data();
+        pkt.size         = annex_b_buf_.size();
         pkt.is_keyframe  = is_keyframe;
         pkt.is_config    = false;
         pkt.timestamp_us = timestamp_us;

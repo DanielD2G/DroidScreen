@@ -1,8 +1,11 @@
 /*
- * DroidScreen - H.264 hardware decoder implementation
+ * DroidScreen - HEVC hardware decoder implementation
  *
- * Uses the Android NDK AMediaCodec API to decode H.264 NAL units
+ * Uses the Android NDK AMediaCodec API to decode HEVC NAL units
  * and render directly to an ANativeWindow (SurfaceView).
+ *
+ * Vendor-specific low-latency flags sourced from Moonlight's
+ * MediaCodecHelper.java — unrecognized keys are silently ignored.
  */
 
 #include "decoder.h"
@@ -68,15 +71,25 @@ int decoder_configure(DecoderContext *ctx, int width, int height) {
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
 
-    /* Priority 0 = real-time (API 28+). Use string literal for compat. */
-    AMediaFormat_setInt32(format, "priority", 0);
-
-    /* Request low latency decoding (API 30+, ignored on older) */
+    /* Standard Android 11+ low-latency keys */
     AMediaFormat_setInt32(format, "low-latency", 1);
+    AMediaFormat_setInt32(format, "priority", 0); /* real-time priority (API 28+) */
 
-    /* Vendor-specific low-latency hints (silently ignored when unsupported) */
-    AMediaFormat_setInt32(format, "vendor.low-latency.enable", 1); /* Qualcomm / generic */
-    AMediaFormat_setInt32(format, "vdec-lowlatency", 1);           /* MediaTek / Amlogic */
+    /* Qualcomm vendor extensions */
+    AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1);
+    AMediaFormat_setInt32(format, "vendor.qti-ext-dec-picture-order.enable", 0);
+
+    /* Samsung Exynos */
+    AMediaFormat_setInt32(format, "vendor.rtc-ext-dec-low-latency.enable", 1);
+
+    /* MediaTek */
+    AMediaFormat_setInt32(format, "vdec-lowlatency", 1);
+
+    /* Amlogic (Fire TV etc.) */
+    AMediaFormat_setInt32(format, "vendor.low-latency.enable", 1);
+
+    /* Force maximum decode speed (Moonlight uses this) */
+    AMediaFormat_setInt32(format, "operating-rate", 32767); /* Short.MAX_VALUE */
 
     media_status_t status = AMediaCodec_configure(
         ctx->codec, format, ctx->window, nullptr /* crypto */, 0 /* flags */);
@@ -167,10 +180,8 @@ int decoder_drain(DecoderContext *ctx) {
             break;
         }
 
-        /* Release to surface with target presentation timestamp for vsync alignment.
-         * Using the buffer's own presentationTimeUs converted to nanoseconds. */
-        AMediaCodec_releaseOutputBufferAtTime(ctx->codec, (size_t)idx,
-                                              info.presentationTimeUs * 1000);
+        /* Render immediately — lower latency than scheduled vsync for live streams */
+        AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)idx, true);
         rendered++;
     }
 

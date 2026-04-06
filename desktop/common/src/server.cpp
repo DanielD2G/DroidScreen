@@ -14,6 +14,7 @@
 #else
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -172,10 +173,53 @@ bool TCPClient::send_message(uint8_t type, uint8_t flags,
     uint8_t hdr_buf[DS_HEADER_SIZE];
     ds_header_serialize(hdr_buf, &header);
 
+#ifdef _WIN32
+    // Windows: two separate sends (no writev).
     if (!send_all(hdr_buf, DS_HEADER_SIZE)) return false;
     if (len > 0 && data != nullptr) {
         if (!send_all(data, len)) return false;
     }
+#else
+    // POSIX: use writev() to send header+payload atomically in one syscall,
+    // eliminating any Nagle-related delay between header and payload.
+    struct iovec iov[2];
+    int iovcnt = 1;
+
+    iov[0].iov_base = hdr_buf;
+    iov[0].iov_len  = DS_HEADER_SIZE;
+
+    if (len > 0 && data != nullptr) {
+        iov[1].iov_base = const_cast<void*>(data);
+        iov[1].iov_len  = len;
+        iovcnt = 2;
+    }
+
+    size_t total = DS_HEADER_SIZE + (iovcnt == 2 ? len : 0);
+    size_t written = 0;
+
+    while (written < total) {
+        ssize_t n = ::writev(fd_, iov, iovcnt);
+        if (n <= 0) {
+            fprintf(stderr, "[tcp] writev() failed\n");
+            return false;
+        }
+        written += static_cast<size_t>(n);
+
+        // Advance iovec past bytes already written.
+        size_t advance = static_cast<size_t>(n);
+        for (int i = 0; i < iovcnt; ) {
+            if (advance >= iov[i].iov_len) {
+                advance -= iov[i].iov_len;
+                iov[i].iov_len = 0;
+                i++;
+            } else {
+                iov[i].iov_base = static_cast<uint8_t*>(iov[i].iov_base) + advance;
+                iov[i].iov_len -= advance;
+                break;
+            }
+        }
+    }
+#endif
     return true;
 }
 

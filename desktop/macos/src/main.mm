@@ -2,7 +2,7 @@
  * DroidScreen macOS - CLI entry point
  *
  * Creates a virtual display at the tablet's resolution, captures it,
- * encodes as H.264, and streams to an Android tablet via USB.
+ * encodes as HEVC, and streams to an Android tablet via USB.
  */
 
 #import <Foundation/Foundation.h>
@@ -224,18 +224,15 @@ int main(int argc, const char* argv[]) {
             double mbps    = (byt - prev_bytes) * 8.0 / dt / 1e6;
 
             fprintf(stderr,
-                "[stats] cap=%.0f fps | enc=%.0f fps | "
+                "[stats] cap=%.0f | enc=%.0f fps | "
                 "%.1f Mbps | enc=%lld us | send=%lld us | "
-                "rtt=%lld us | drop=%llu idle=%llu | "
-                "cq=%zu sq=%zu\n",
+                "rtt=%lld us | drop=%llu idle=%llu\n",
                 cap_fps, enc_fps, mbps,
                 (long long)pipeline.last_encode_us(),
                 (long long)pipeline.last_send_us(),
                 (long long)pipeline.last_rtt_us(),
                 (unsigned long long)drop,
-                (unsigned long long)idle,
-                pipeline.capture_queue_depth(),
-                pipeline.send_queue_depth());
+                (unsigned long long)idle);
 
             prev_encoded  = enc;
             prev_captured = cap;
