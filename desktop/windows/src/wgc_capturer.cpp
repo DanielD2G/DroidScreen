@@ -104,43 +104,84 @@ WGCCapturer::~WGCCapturer() {
     stop();
 }
 
-bool WGCCapturer::ensure_staging_texture(
+WGCCapturer::FrameSlot* WGCCapturer::acquire_frame_slot(
         uint32_t width, uint32_t height, DXGI_FORMAT format) {
-    if (staging_texture_ && format == staging_format_) {
-        D3D11_TEXTURE2D_DESC current_desc = {};
-        staging_texture_->GetDesc(&current_desc);
-        if (current_desc.Width == width && current_desc.Height == height) {
-            return true;
+    std::lock_guard<std::mutex> lock(frame_pool_mutex_);
+
+    for (size_t i = 0; i < kFrameSlotCount; ++i) {
+        const size_t slot_index = (next_frame_slot_ + i) % kFrameSlotCount;
+        auto& slot = frame_slots_[slot_index];
+
+        bool expected = false;
+        if (!slot.in_use.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            continue;
         }
+
+        if (!slot.texture ||
+            slot.width != width ||
+            slot.height != height ||
+            slot.format != format) {
+            D3D11_TEXTURE2D_DESC desc = {};
+            desc.Width            = width;
+            desc.Height           = height;
+            desc.MipLevels        = 1;
+            desc.ArraySize        = 1;
+            desc.Format           = format;
+            desc.SampleDesc.Count = 1;
+            desc.Usage            = D3D11_USAGE_DEFAULT;
+            desc.BindFlags        = 0;
+
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+            HRESULT hr = device_->CreateTexture2D(
+                &desc, nullptr, texture.ReleaseAndGetAddressOf());
+            if (FAILED(hr)) {
+                fprintf(stderr,
+                        "[wgc] CreateTexture2D (slot %zu, %ux%u fmt=%u) failed: 0x%08lx\n",
+                        slot_index, width, height, format, hr);
+                slot.in_use.store(false, std::memory_order_release);
+                return nullptr;
+            }
+
+            slot.texture = std::move(texture);
+            slot.width = width;
+            slot.height = height;
+            slot.format = format;
+        }
+
+        next_frame_slot_ = (slot_index + 1) % kFrameSlotCount;
+        return &slot;
     }
 
-    D3D11_TEXTURE2D_DESC staging_desc = {};
-    staging_desc.Width            = width;
-    staging_desc.Height           = height;
-    staging_desc.MipLevels        = 1;
-    staging_desc.ArraySize        = 1;
-    staging_desc.Format           = format;
-    staging_desc.SampleDesc.Count = 1;
-    staging_desc.Usage            = D3D11_USAGE_DEFAULT;
-    staging_desc.BindFlags        = 0;
-
-    HRESULT hr = device_->CreateTexture2D(
-        &staging_desc, nullptr, staging_texture_.ReleaseAndGetAddressOf());
-    if (FAILED(hr)) {
-        fprintf(stderr,
-                "[wgc] CreateTexture2D (staging %ux%u fmt=%u) failed: 0x%08lx\n",
-                width, height, format, hr);
-        staging_format_ = DXGI_FORMAT_UNKNOWN;
-        return false;
+    static bool warned = false;
+    if (!warned) {
+        fprintf(stderr, "[wgc] frame slot pool exhausted; dropping frames\n");
+        warned = true;
     }
+    return nullptr;
+}
 
-    staging_format_ = format;
-    fprintf(stderr, "[wgc] staging texture ready: %ux%u fmt=%u\n",
-            width, height, format);
-    return true;
+void WGCCapturer::release_frame_slot(void* release_ctx, void* /*native_handle*/) {
+    if (!release_ctx) return;
+    auto* slot = static_cast<FrameSlot*>(release_ctx);
+    slot->in_use.store(false, std::memory_order_release);
+}
+
+void WGCCapturer::reset_frame_slots() {
+    std::lock_guard<std::mutex> lock(frame_pool_mutex_);
+    for (auto& slot : frame_slots_) {
+        slot.texture.Reset();
+        slot.format = DXGI_FORMAT_UNKNOWN;
+        slot.width = 0;
+        slot.height = 0;
+        slot.in_use.store(false, std::memory_order_release);
+    }
+    next_frame_slot_ = 0;
 }
 
 bool WGCCapturer::init(uint32_t display_index) {
+    reset_frame_slots();
+
     // Create D3D11 device with BGRA support (required for WGC).
     UINT creation_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifndef NDEBUG
@@ -290,6 +331,8 @@ bool WGCCapturer::init_with_monitor(HMONITOR monitor) {
         fprintf(stderr, "[wgc] init_with_monitor: null HMONITOR\n");
         return false;
     }
+
+    reset_frame_slots();
 
     // Create D3D11 device with BGRA support (required for WGC).
     UINT creation_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -472,7 +515,9 @@ void WGCCapturer::on_frame_arrived() {
 
     D3D11_TEXTURE2D_DESC src_desc = {};
     source_texture->GetDesc(&src_desc);
-    if (!ensure_staging_texture(src_box.right, src_box.bottom, src_desc.Format)) {
+    auto* frame_slot = acquire_frame_slot(
+        src_box.right, src_box.bottom, src_desc.Format);
+    if (!frame_slot) {
         frame.Close();
         return;
     }
@@ -482,7 +527,7 @@ void WGCCapturer::on_frame_arrived() {
     {
         std::lock_guard<std::mutex> d3d_lock(d3d_mutex_);
         context_->CopySubresourceRegion(
-            staging_texture_.Get(), 0,   // dst subresource, x, y, z
+            frame_slot->texture.Get(), 0, // dst subresource, x, y, z
             0, 0, 0,
             source_texture.Get(), 0,     // src subresource
             &src_box);
@@ -495,7 +540,9 @@ void WGCCapturer::on_frame_arrived() {
     // directly, so we always report not-idle; the pipeline handles
     // duplicate detection if needed).
     CapturedFrame captured;
-    captured.native_handle = staging_texture_.Get();
+    captured.native_handle = frame_slot->texture.Get();
+    captured.release_ctx = frame_slot;
+    captured.release_fn = &WGCCapturer::release_frame_slot;
     captured.width         = src_box.right;
     captured.height        = src_box.bottom;
     captured.timestamp_us  = timestamp_us;
@@ -503,6 +550,8 @@ void WGCCapturer::on_frame_arrived() {
 
     if (on_frame_) {
         on_frame_(captured);
+    } else {
+        release_frame_slot(frame_slot, frame_slot->texture.Get());
     }
 }
 
@@ -520,11 +569,6 @@ void WGCCapturer::stop() {
         // Release all WinRT objects.
         wrt_.reset();
     }
-
-    // Release the staging texture.
-    staging_texture_.Reset();
-    staging_format_ = DXGI_FORMAT_UNKNOWN;
-
     fprintf(stderr, "[wgc] capture stopped\n");
 }
 

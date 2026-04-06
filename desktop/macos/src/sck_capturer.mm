@@ -11,6 +11,11 @@
 
 #include <cstdio>
 
+static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) {
+    if (!native_handle) return;
+    CVPixelBufferRelease(static_cast<CVPixelBufferRef>(native_handle));
+}
+
 // ---------------------------------------------------------------------------
 // Objective-C delegate that bridges SCStreamOutput to the C++ callback
 // ---------------------------------------------------------------------------
@@ -50,7 +55,9 @@
                     CMSampleBufferGetImageBuffer(sampleBuffer);
                 if (pixelBuf) {
                     droidscreen::CapturedFrame frame;
-                    frame.native_handle = pixelBuf;
+                    frame.native_handle = nullptr;
+                    frame.release_ctx = nullptr;
+                    frame.release_fn = nullptr;
                     frame.width  = (uint32_t)CVPixelBufferGetWidth(pixelBuf);
                     frame.height = (uint32_t)CVPixelBufferGetHeight(pixelBuf);
                     frame.timestamp_us = 0;
@@ -80,6 +87,8 @@
 
     droidscreen::CapturedFrame frame;
     frame.native_handle = pixelBuf;
+    frame.release_ctx = nullptr;
+    frame.release_fn = release_cv_pixel_buffer;
     frame.width  = (uint32_t)CVPixelBufferGetWidth(pixelBuf);
     frame.height = (uint32_t)CVPixelBufferGetHeight(pixelBuf);
     frame.timestamp_us = timestamp_us;

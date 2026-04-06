@@ -10,6 +10,7 @@
 
 #include "droidscreen/capturer.h"
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -52,7 +53,17 @@ public:
 private:
     /// Called by the FramePool.FrameArrived event.
     void on_frame_arrived();
-    bool ensure_staging_texture(uint32_t width, uint32_t height, DXGI_FORMAT format);
+    struct FrameSlot {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        std::atomic<bool> in_use{false};
+    };
+
+    FrameSlot* acquire_frame_slot(uint32_t width, uint32_t height, DXGI_FORMAT format);
+    static void release_frame_slot(void* release_ctx, void* native_handle);
+    void reset_frame_slots();
 
     uint32_t width_  = 0;
     uint32_t height_ = 0;
@@ -65,17 +76,16 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext>  context_;
     Microsoft::WRL::ComPtr<IDXGIOutput1>         output_;
 
-    // Staging texture for copying frames (the capture texture must be
-    // released as quickly as possible to avoid frame pool starvation).
-    Microsoft::WRL::ComPtr<ID3D11Texture2D>      staging_texture_;
-    DXGI_FORMAT                                  staging_format_ = DXGI_FORMAT_UNKNOWN;
-
     // WinRT capture objects — stored via pimpl to keep WinRT headers
     // out of this header. Defined in the .cpp.
     struct WinRTState;
     std::unique_ptr<WinRTState> wrt_;
 
     std::mutex frame_mutex_;
+    std::mutex frame_pool_mutex_;
+    static constexpr size_t kFrameSlotCount = 4;
+    std::array<FrameSlot, kFrameSlotCount> frame_slots_{};
+    size_t next_frame_slot_ = 0;
 
     // Mutex protecting D3D11 immediate context access. Shared with
     // the encoder to prevent concurrent context calls from the WGC

@@ -12,8 +12,12 @@
 
 namespace droidscreen {
 
+using CapturedFrameReleaseFn = void(*)(void* release_ctx, void* native_handle);
+
 struct CapturedFrame {
     void* native_handle;   // CVPixelBufferRef on macOS, ID3D11Texture2D* on Windows
+    void* release_ctx = nullptr;
+    CapturedFrameReleaseFn release_fn = nullptr;
     uint32_t width;
     uint32_t height;
     int64_t timestamp_us;

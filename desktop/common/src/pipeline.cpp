@@ -22,10 +22,6 @@
 #include <chrono>
 #include <vector>
 
-#ifdef __APPLE__
-#include <CoreVideo/CoreVideo.h>
-#endif
-
 extern "C" {
 #include "droidscreen/protocol.h"
 #include "droidscreen/handshake.h"
@@ -38,6 +34,15 @@ static int64_t now_us() {
     auto tp = std::chrono::steady_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(
         tp.time_since_epoch()).count();
+}
+
+static void release_captured_frame(CapturedFrame& frame) {
+    if (frame.native_handle && frame.release_fn) {
+        frame.release_fn(frame.release_ctx, frame.native_handle);
+    }
+    frame.native_handle = nullptr;
+    frame.release_ctx = nullptr;
+    frame.release_fn = nullptr;
 }
 
 Pipeline::Pipeline(Capturer* capturer, Encoder* encoder,
@@ -145,10 +150,16 @@ bool Pipeline::start(uint32_t width, uint32_t height,
     // Start capture -- frames get pushed into capture_queue_.
     // Newest-frame-wins: we keep at most 1 frame, always the latest.
     capturer_->start([this](const CapturedFrame& frame) {
-        if (!running_.load()) return;
+        if (!running_.load()) {
+            CapturedFrame releasable = frame;
+            release_captured_frame(releasable);
+            return;
+        }
 
         if (frame.is_idle) {
             frames_idle_.fetch_add(1);
+            CapturedFrame releasable = frame;
+            release_captured_frame(releasable);
             return;
         }
 
@@ -158,14 +169,8 @@ bool Pipeline::start(uint32_t width, uint32_t height,
 
         // Drop ALL older frames -- always encode the freshest one.
         while (!capture_queue_.empty()) {
-#ifdef __APPLE__
-            // Release the CVPixelBuffer for the dropped frame.
             auto& old = capture_queue_.front();
-            if (old.native_handle) {
-                CVPixelBufferRelease(
-                    static_cast<CVPixelBufferRef>(old.native_handle));
-            }
-#endif
+            release_captured_frame(old);
             capture_queue_.pop_front();
             frames_dropped_.fetch_add(1);
         }
@@ -223,20 +228,15 @@ void Pipeline::stop() {
         return;
     }
 
-    // Drain any remaining frames in capture_queue_ (release CVPixelBuffers).
-#ifdef __APPLE__
+    // Drain any remaining frames in capture_queue_.
     {
         std::lock_guard<std::mutex> lock(capture_mutex_);
         while (!capture_queue_.empty()) {
             auto& f = capture_queue_.front();
-            if (f.native_handle) {
-                CVPixelBufferRelease(
-                    static_cast<CVPixelBufferRef>(f.native_handle));
-            }
+            release_captured_frame(f);
             capture_queue_.pop_front();
         }
     }
-#endif
 
     // Shut down encoder and touch.
     encoder_->shutdown();
@@ -273,13 +273,8 @@ void Pipeline::encode_loop() {
 
             // Drop any remaining stale frames.
             while (!capture_queue_.empty()) {
-#ifdef __APPLE__
                 auto& old = capture_queue_.front();
-                if (old.native_handle) {
-                    CVPixelBufferRelease(
-                        static_cast<CVPixelBufferRef>(old.native_handle));
-                }
-#endif
+                release_captured_frame(old);
                 capture_queue_.pop_front();
                 frames_dropped_.fetch_add(1);
             }
@@ -329,15 +324,7 @@ void Pipeline::encode_loop() {
             fprintf(stderr, "[encode] encode submit failed\n");
         }
 
-        // Release the capturer's retain of the CVPixelBuffer.
-        // The VT encoder has its own retain (via sourceFrameRefcon)
-        // so the buffer stays alive until VT's output callback fires.
-#ifdef __APPLE__
-        if (frame.native_handle) {
-            CVPixelBufferRelease(
-                static_cast<CVPixelBufferRef>(frame.native_handle));
-        }
-#endif
+        release_captured_frame(frame);
     }
 
     fprintf(stderr, "[encode] thread exiting\n");
