@@ -231,9 +231,12 @@ jobs:
           Write-Host "Staged files:"
           Get-ChildItem -Recurse staging
 
-          # Build installer
+          # Build installer (NSIS resolves File paths relative to .nsi location,
+          # so we pass the absolute path to the staging directory)
           $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
-          & $nsis /DVERSION=$env:VERSION /DSTAGING_DIR=staging "installer\windows\DroidScreen.nsi"
+          $absStaging = (Resolve-Path "staging").Path
+          Write-Host "NSIS staging dir: $absStaging"
+          & $nsis /DVERSION=$env:VERSION /DSTAGING_DIR=$absStaging "installer\windows\DroidScreen.nsi"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Copy to dist
