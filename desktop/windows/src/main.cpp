@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <io.h>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -408,6 +409,11 @@ static void setup_logging() {
         std::string logPath = logDir + "\\droidscreen.log";
         g_logFile = fopen(logPath.c_str(), "w");
         if (g_logFile) {
+            // Redirect stderr to the log file so that fprintf(stderr, ...)
+            // from sub-components (NVENC, WGC, pipeline, etc.) is captured.
+            // In a /SUBSYSTEM:WINDOWS app, stderr goes nowhere by default.
+            _dup2(_fileno(g_logFile), _fileno(stderr));
+            setvbuf(stderr, nullptr, _IONBF, 0);
             log_msg("=== DroidScreen Debug Log ===");
         }
     }
