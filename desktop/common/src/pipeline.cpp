@@ -1,9 +1,18 @@
 /*
- * DroidScreen Desktop - Pipeline implementation
+ * DroidScreen Desktop - Pipeline implementation (near-zero latency)
  *
- * Orchestrates capture -> encode -> send, plus recv and ping threads.
- * The frame queue has bounded capacity (3); when full, oldest frames
- * are dropped to keep latency low.
+ * True 3-stage pipeline:
+ *   Stage 1 (SCK thread):    Capture callback -> capture_queue (newest only)
+ *   Stage 2 (encode thread): Pop capture_queue -> encoder->encode() (async VT)
+ *   Stage 3 (VT callback):   Push encoded packet to send_queue
+ *   Stage 4 (send thread):   Pop send_queue -> TCP send
+ *
+ * The VT output callback never touches the socket. This decouples
+ * encode latency from send latency: a slow TCP write cannot block
+ * Apple's internal VideoToolbox encode thread.
+ *
+ * Capture queue is newest-frame-wins: we always encode the freshest
+ * frame and skip stale ones to keep pipeline latency minimal.
  */
 
 #include "droidscreen/pipeline.h"
@@ -66,7 +75,7 @@ bool Pipeline::handshake(uint32_t width, uint32_t height,
         return false;
     }
 
-    fprintf(stderr, "[pipeline] handshake sent: %ux%u@%u fps, %u kbps\n",
+    fprintf(stderr, "[pipeline] handshake sent: %ux%u@%u fps, %u kbps (fixed)\n",
             width, height, fps, bitrate_kbps);
 
     // Wait for Android's HANDSHAKE_RESP.
@@ -113,15 +122,11 @@ bool Pipeline::start(uint32_t width, uint32_t height,
         return false;
     }
 
-    // Initialize encoder.
+    // Initialize encoder with fixed bitrate (no ramping on USB).
     if (!encoder_->init(width, height, fps, bitrate_kbps)) {
         fprintf(stderr, "[pipeline] encoder init failed\n");
         return false;
     }
-
-    // Initialize rate controller.
-    rate_ctrl_ = std::make_unique<RateController>(
-        encoder_, bitrate_kbps, 500, 25000);
 
     // Initialize touch injector.
     if (touch_enabled) {
@@ -137,7 +142,8 @@ bool Pipeline::start(uint32_t width, uint32_t height,
     last_encode_us_.store(0);
     last_send_us_.store(0);
 
-    // Start capture -- frames get pushed into the queue.
+    // Start capture -- frames get pushed into capture_queue_.
+    // Newest-frame-wins: we keep at most 1 frame, always the latest.
     capturer_->start([this](const CapturedFrame& frame) {
         if (!running_.load()) return;
 
@@ -148,27 +154,32 @@ bool Pipeline::start(uint32_t width, uint32_t height,
 
         frames_captured_.fetch_add(1);
 
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(capture_mutex_);
 
-        // Drop oldest if queue is full to keep latency bounded.
-        while (frame_queue_.size() >= kMaxQueueSize) {
-            frame_queue_.pop_front();
-            frames_dropped_.fetch_add(1);
+        // Drop ALL older frames -- always encode the freshest one.
+        while (!capture_queue_.empty()) {
 #ifdef __APPLE__
-            // Release dropped frame's CVPixelBuffer
-            // (already retained by capturer)
+            // Release the CVPixelBuffer for the dropped frame.
+            auto& old = capture_queue_.front();
+            if (old.native_handle) {
+                CVPixelBufferRelease(
+                    static_cast<CVPixelBufferRef>(old.native_handle));
+            }
 #endif
+            capture_queue_.pop_front();
+            frames_dropped_.fetch_add(1);
         }
-        frame_queue_.push_back(frame);
-        queue_cv_.notify_one();
+        capture_queue_.push_back(frame);
+        capture_cv_.notify_one();
     });
 
     // Launch worker threads.
-    encode_thread_ = std::thread(&Pipeline::encode_send_loop, this);
+    encode_thread_ = std::thread(&Pipeline::encode_loop, this);
+    send_thread_   = std::thread(&Pipeline::send_loop, this);
     recv_thread_   = std::thread(&Pipeline::recv_loop, this);
     ping_thread_   = std::thread(&Pipeline::ping_loop, this);
 
-    fprintf(stderr, "[pipeline] started\n");
+    fprintf(stderr, "[pipeline] started (4 threads: encode, send, recv, ping)\n");
     return true;
 }
 
@@ -182,8 +193,14 @@ void Pipeline::stop() {
 
     // Wake the encode thread so it can exit.
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        queue_cv_.notify_all();
+        std::lock_guard<std::mutex> lock(capture_mutex_);
+        capture_cv_.notify_all();
+    }
+
+    // Wake the send thread so it can exit.
+    {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        send_cv_.notify_all();
     }
 
     // Close the socket to unblock recv().
@@ -191,8 +208,24 @@ void Pipeline::stop() {
 
     // Join threads.
     if (encode_thread_.joinable()) encode_thread_.join();
+    if (send_thread_.joinable()) send_thread_.join();
     if (recv_thread_.joinable()) recv_thread_.join();
     if (ping_thread_.joinable()) ping_thread_.join();
+
+    // Drain any remaining frames in capture_queue_ (release CVPixelBuffers).
+#ifdef __APPLE__
+    {
+        std::lock_guard<std::mutex> lock(capture_mutex_);
+        while (!capture_queue_.empty()) {
+            auto& f = capture_queue_.front();
+            if (f.native_handle) {
+                CVPixelBufferRelease(
+                    static_cast<CVPixelBufferRef>(f.native_handle));
+            }
+            capture_queue_.pop_front();
+        }
+    }
+#endif
 
     // Shut down encoder and touch.
     encoder_->shutdown();
@@ -203,25 +236,54 @@ void Pipeline::stop() {
             static_cast<unsigned long long>(bytes_sent_.load()));
 }
 
-void Pipeline::encode_send_loop() {
+// --------------------------------------------------------------------------
+// Stage 2: encode thread
+// Pops the newest frame from capture_queue_ and submits to encoder.
+// The VT output callback fires asynchronously and pushes to send_queue_.
+// We NEVER do TCP I/O here.
+// --------------------------------------------------------------------------
+void Pipeline::encode_loop() {
     fprintf(stderr, "[encode] thread started\n");
 
     while (running_.load()) {
         CapturedFrame frame;
 
-        // Wait for a frame.
+        // Wait for a frame in the capture queue.
         {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] {
-                return !frame_queue_.empty() || !running_.load();
+            std::unique_lock<std::mutex> lock(capture_mutex_);
+            capture_cv_.wait(lock, [this] {
+                return !capture_queue_.empty() || !running_.load();
             });
             if (!running_.load()) break;
-            frame = frame_queue_.front();
-            frame_queue_.pop_front();
+
+            // Take the NEWEST frame, drop everything older.
+            frame = capture_queue_.back();
+            capture_queue_.pop_back();
+
+            // Drop any remaining stale frames.
+            while (!capture_queue_.empty()) {
+#ifdef __APPLE__
+                auto& old = capture_queue_.front();
+                if (old.native_handle) {
+                    CVPixelBufferRelease(
+                        static_cast<CVPixelBufferRef>(old.native_handle));
+                }
+#endif
+                capture_queue_.pop_front();
+                frames_dropped_.fetch_add(1);
+            }
         }
 
         int64_t t_enc_start = now_us();
 
+        // The callback pushes encoded packets into send_queue_ instead
+        // of sending over TCP. This is the critical change: the VT
+        // internal thread is never blocked by a slow socket.
+        //
+        // CVPixelBuffer lifetime: The VT encoder retains its own
+        // reference via sourceFrameRefcon and releases it in the
+        // output callback. We release the capturer's retain below,
+        // right after encode() returns.
         bool ok = encoder_->encode(
             frame.native_handle, frame.timestamp_us,
             [this, t_enc_start](const EncodedPacket& pkt) {
@@ -232,15 +294,21 @@ void Pipeline::encode_send_loop() {
                 if (pkt.is_keyframe) flags |= DS_FLAG_KEYFRAME;
                 if (pkt.is_config)   flags |= DS_FLAG_CONFIG;
 
-                int64_t t_send_start = now_us();
-                if (client_->send_message(DS_MSG_VIDEO_FRAME, flags,
-                                          pkt.data, pkt.size)) {
-                    int64_t t_send_end = now_us();
-                    last_send_us_.store(t_send_end - t_send_start);
-                    bytes_sent_.fetch_add(DS_HEADER_SIZE + pkt.size);
-                } else {
-                    fprintf(stderr, "[encode] send failed\n");
-                    running_.store(false);
+                // Copy the encoded data into a self-contained packet.
+                SendPacket sp;
+                sp.data.assign(pkt.data, pkt.data + pkt.size);
+                sp.flags = flags;
+                sp.encode_done_us = t_enc_end;
+
+                // Push to send queue. If the queue is full, drop the
+                // oldest packet to avoid unbounded growth.
+                {
+                    std::lock_guard<std::mutex> lock(send_mutex_);
+                    while (send_queue_.size() >= kMaxSendQueueSize) {
+                        send_queue_.pop_front();
+                    }
+                    send_queue_.push_back(std::move(sp));
+                    send_cv_.notify_one();
                 }
 
                 frames_encoded_.fetch_add(1);
@@ -250,20 +318,60 @@ void Pipeline::encode_send_loop() {
             fprintf(stderr, "[encode] encode submit failed\n");
         }
 
+        // Release the capturer's retain of the CVPixelBuffer.
+        // The VT encoder has its own retain (via sourceFrameRefcon)
+        // so the buffer stays alive until VT's output callback fires.
 #ifdef __APPLE__
-        // Release the CVPixelBufferRef that was retained by the capturer.
         if (frame.native_handle) {
-            CVPixelBufferRelease(static_cast<CVPixelBufferRef>(frame.native_handle));
+            CVPixelBufferRelease(
+                static_cast<CVPixelBufferRef>(frame.native_handle));
         }
 #endif
-
-        // Periodically update rate controller.
-        if (rate_ctrl_ && (frames_encoded_.load() % 30 == 0)) {
-            rate_ctrl_->update();
-        }
     }
 
     fprintf(stderr, "[encode] thread exiting\n");
+}
+
+// --------------------------------------------------------------------------
+// Stage 4: send thread
+// Drains send_queue_ and writes to TCP. This is the ONLY thread that
+// touches the TCP socket for video data. If the socket blocks, it only
+// affects this thread -- encode and VT callback continue at full speed.
+// --------------------------------------------------------------------------
+void Pipeline::send_loop() {
+    fprintf(stderr, "[send] thread started\n");
+
+    while (running_.load()) {
+        SendPacket pkt;
+
+        // Wait for a packet in the send queue.
+        {
+            std::unique_lock<std::mutex> lock(send_mutex_);
+            send_cv_.wait(lock, [this] {
+                return !send_queue_.empty() || !running_.load();
+            });
+            if (!running_.load() && send_queue_.empty()) break;
+            if (send_queue_.empty()) continue;
+
+            pkt = std::move(send_queue_.front());
+            send_queue_.pop_front();
+        }
+
+        int64_t t_send_start = now_us();
+
+        if (client_->send_message(DS_MSG_VIDEO_FRAME, pkt.flags,
+                                  pkt.data.data(), pkt.data.size())) {
+            int64_t t_send_end = now_us();
+            last_send_us_.store(t_send_end - t_send_start);
+            bytes_sent_.fetch_add(DS_HEADER_SIZE + pkt.data.size());
+        } else {
+            fprintf(stderr, "[send] TCP send failed\n");
+            running_.store(false);
+            break;
+        }
+    }
+
+    fprintf(stderr, "[send] thread exiting\n");
 }
 
 void Pipeline::recv_loop() {
@@ -296,8 +404,13 @@ void Pipeline::recv_loop() {
                 int64_t sent = ping_sent_us_.load();
                 int64_t rtt = now - sent;
                 last_rtt_us_.store(rtt);
-                if (rate_ctrl_) {
-                    rate_ctrl_->on_pong(rtt);
+
+                // Track RTT for stats (no bitrate adjustment on USB).
+                {
+                    std::lock_guard<std::mutex> lock(rtt_mutex_);
+                    rtt_window_[rtt_index_] = rtt;
+                    rtt_index_ = (rtt_index_ + 1) % kRttWindowSize;
+                    if (rtt_count_ < kRttWindowSize) rtt_count_++;
                 }
                 break;
             }
@@ -394,6 +507,18 @@ void Pipeline::handle_control(const uint8_t* data, size_t len) {
                     ctrl_type);
             break;
     }
+}
+
+size_t Pipeline::capture_queue_depth() const {
+    std::lock_guard<std::mutex> lock(
+        const_cast<std::mutex&>(capture_mutex_));
+    return capture_queue_.size();
+}
+
+size_t Pipeline::send_queue_depth() const {
+    std::lock_guard<std::mutex> lock(
+        const_cast<std::mutex&>(send_mutex_));
+    return send_queue_.size();
 }
 
 } // namespace droidscreen

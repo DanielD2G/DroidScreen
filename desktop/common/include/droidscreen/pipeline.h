@@ -1,8 +1,14 @@
 /*
  * DroidScreen Desktop - Pipeline orchestrator
  *
- * Ties together capture, encoding, networking, and touch injection
- * into a coherent pipeline with proper threading and flow control.
+ * True 3-stage pipeline for near-zero latency:
+ *   Stage 1 (SCK thread):    Capture callback -> push to capture_queue (newest only)
+ *   Stage 2 (encode thread): Pop capture_queue -> encoder->encode() (VT fires async)
+ *   Stage 3 (VT callback):   Push encoded packet to send_queue
+ *   Stage 4 (send thread):   Pop send_queue -> TCP send (can block without stalling encode)
+ *
+ * The VT output callback never touches the socket -- it only enqueues packets.
+ * This decouples encode latency from network latency entirely.
  */
 
 #pragma once
@@ -13,12 +19,12 @@
 #include <condition_variable>
 #include <atomic>
 #include <deque>
+#include <vector>
 
 #include "droidscreen/capturer.h"
 #include "droidscreen/encoder.h"
 #include "droidscreen/server.h"
 #include "droidscreen/touch_injector.h"
-#include "droidscreen/rate_controller.h"
 
 namespace droidscreen {
 
@@ -32,7 +38,7 @@ public:
     /// @param width Capture/encode width.
     /// @param height Capture/encode height.
     /// @param fps Target frame rate.
-    /// @param bitrate_kbps Initial bitrate.
+    /// @param bitrate_kbps Fixed bitrate (no ramping on USB).
     /// @param touch_enabled Whether to process touch events.
     /// @return true on success.
     bool start(uint32_t width, uint32_t height,
@@ -55,6 +61,8 @@ public:
     int64_t last_rtt_us() const { return last_rtt_us_.load(); }
     int64_t last_encode_us() const { return last_encode_us_.load(); }
     int64_t last_send_us() const { return last_send_us_.load(); }
+    size_t capture_queue_depth() const;
+    size_t send_queue_depth() const;
 
 private:
     // Perform the protocol handshake with the Android device.
@@ -62,8 +70,12 @@ private:
                    uint32_t fps, uint32_t bitrate_kbps,
                    bool touch_enabled);
 
-    // Thread: encode frames from queue and send over TCP.
-    void encode_send_loop();
+    // Thread: pop frames from capture_queue and submit to encoder.
+    // VT callback pushes results to send_queue (never blocks on TCP).
+    void encode_loop();
+
+    // Thread: drain send_queue and write to TCP socket.
+    void send_loop();
 
     // Thread: receive messages from the Android device.
     void recv_loop();
@@ -79,15 +91,25 @@ private:
     TCPClient*     client_;
     TouchInjector* touch_;
 
-    std::unique_ptr<RateController> rate_ctrl_;
+    // --- Capture queue: newest-frame-wins (not FIFO) ---
+    // Only holds the most recent frame; stale frames are dropped.
+    std::deque<CapturedFrame> capture_queue_;
+    std::mutex capture_mutex_;
+    std::condition_variable capture_cv_;
 
-    // Frame queue with bounded capacity.
-    static constexpr size_t kMaxQueueSize = 3;
-    std::deque<CapturedFrame> frame_queue_;
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
+    // --- Send queue: encoded packets waiting for TCP send ---
+    struct SendPacket {
+        std::vector<uint8_t> data;
+        uint8_t flags;
+        int64_t encode_done_us;   // timestamp when VT callback fired
+    };
+    static constexpr size_t kMaxSendQueueSize = 8;
+    std::deque<SendPacket> send_queue_;
+    std::mutex send_mutex_;
+    std::condition_variable send_cv_;
 
     std::thread encode_thread_;
+    std::thread send_thread_;
     std::thread recv_thread_;
     std::thread ping_thread_;
 
@@ -103,6 +125,13 @@ private:
 
     // Timestamp of last ping sent, for RTT calculation.
     std::atomic<int64_t> ping_sent_us_{0};
+
+    // RTT tracking (replaces RateController for stats-only use).
+    static constexpr size_t kRttWindowSize = 10;
+    int64_t rtt_window_[kRttWindowSize] = {};
+    size_t rtt_count_ = 0;
+    size_t rtt_index_ = 0;
+    std::mutex rtt_mutex_;
 };
 
 } // namespace droidscreen

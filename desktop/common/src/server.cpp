@@ -63,8 +63,8 @@ bool TCPClient::connect(uint16_t port) {
     setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 #endif
 
-    // Set send and receive buffer sizes to 256 KB.
-    int buf_size = 256 * 1024;
+    // Set send and receive buffer sizes to 512 KB for throughput headroom.
+    int buf_size = 512 * 1024;  // 524288
 #ifdef _WIN32
     setsockopt(fd_, SOL_SOCKET, SO_SNDBUF,
                reinterpret_cast<const char*>(&buf_size), sizeof(buf_size));
@@ -73,6 +73,12 @@ bool TCPClient::connect(uint16_t port) {
 #else
     setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
     setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+#endif
+
+#ifdef __linux__
+    // TCP_QUICKACK disables delayed ACKs for lower RTT on Linux.
+    int quickack = 1;
+    setsockopt(fd_, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
 #endif
 
     struct sockaddr_in addr{};

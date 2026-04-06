@@ -19,8 +19,10 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-/* Input buffer dequeue timeout in microseconds */
-#define INPUT_TIMEOUT_US  5000   /* 5ms */
+/* Input buffer dequeue timeout: 0 = non-blocking.
+ * If no buffer is available the caller retries on the next iteration,
+ * avoiding any stall on the decode thread. */
+#define INPUT_TIMEOUT_US  0
 /* Output buffer dequeue timeout (0 = non-blocking poll) */
 #define OUTPUT_TIMEOUT_US 0
 
@@ -71,6 +73,10 @@ int decoder_configure(DecoderContext *ctx, int width, int height) {
 
     /* Request low latency decoding (API 30+, ignored on older) */
     AMediaFormat_setInt32(format, "low-latency", 1);
+
+    /* Vendor-specific low-latency hints (silently ignored when unsupported) */
+    AMediaFormat_setInt32(format, "vendor.low-latency.enable", 1); /* Qualcomm / generic */
+    AMediaFormat_setInt32(format, "vdec-lowlatency", 1);           /* MediaTek / Amlogic */
 
     media_status_t status = AMediaCodec_configure(
         ctx->codec, format, ctx->window, nullptr /* crypto */, 0 /* flags */);
@@ -161,8 +167,10 @@ int decoder_drain(DecoderContext *ctx) {
             break;
         }
 
-        /* Release output buffer to surface (render = true) */
-        AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)idx, true /* render */);
+        /* Release to surface with target presentation timestamp for vsync alignment.
+         * Using the buffer's own presentationTimeUs converted to nanoseconds. */
+        AMediaCodec_releaseOutputBufferAtTime(ctx->codec, (size_t)idx,
+                                              info.presentationTimeUs * 1000);
         rendered++;
     }
 

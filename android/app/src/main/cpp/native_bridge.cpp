@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <pthread.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/resource.h>
 
 #include "tcp_server.h"
@@ -137,14 +138,10 @@ static void* recv_thread_func(void* /*arg*/) {
     }
     LOGI("recv_thread: handshake complete");
 
-    /* ---- Message loop ---- */
-    auto* payload_buf = static_cast<uint8_t*>(malloc(MAX_FRAME_SIZE));
-    if (!payload_buf) {
-        LOGE("recv_thread: failed to allocate payload buffer");
-        tcp_close(g_client_fd);
-        g_client_fd = -1;
-        return nullptr;
-    }
+    /* ---- Message loop ----
+     * Use a static thread-local buffer to avoid per-connection malloc.
+     * Only one recv thread runs at a time so a plain static is also fine. */
+    static uint8_t payload_buf[MAX_FRAME_SIZE];
 
     while (g_running.load(std::memory_order_acquire)) {
         /* Read message header */
@@ -203,7 +200,6 @@ static void* recv_thread_func(void* /*arg*/) {
     }
 
 exit_loop:
-    free(payload_buf);
     LOGI("recv_thread: exiting");
     return nullptr;
 }
@@ -214,6 +210,22 @@ exit_loop:
 static void* decode_thread_func(void* /*arg*/) {
     /* Set high priority */
     setpriority(PRIO_PROCESS, 0, -8);
+
+    /* Try to pin decode thread to big cores (cores 4-7 on typical ARM big.LITTLE).
+     * Non-fatal if it fails — the scheduler will still respect our nice value. */
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        int ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+        /* Pin to the upper half of available cores (big cores on most SoCs) */
+        int first_big = ncpus > 4 ? ncpus / 2 : 0;
+        for (int i = first_big; i < ncpus; i++) {
+            CPU_SET(i, &cpuset);
+        }
+        if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+            LOGI("decode_thread: pinned to cores %d-%d", first_big, ncpus - 1);
+        }
+    }
 
     LOGI("decode_thread: waiting for decoder configuration...");
 
@@ -244,13 +256,14 @@ static void* decode_thread_func(void* /*arg*/) {
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
     while (g_running.load(std::memory_order_acquire)) {
+        /* Always try to drain first — output may be ready even without new input */
+        int r = decoder_drain(g_decoder);
+        if (r > 0) frames_rendered += r;
+
         /* Try to read a NAL unit from the ring buffer */
         size_t nal_len = ring_buffer_read_message(g_ring_buf, nal_buf, MAX_FRAME_SIZE);
         if (nal_len == 0) {
-            /* No data available — still drain decoder output */
-            int r = decoder_drain(g_decoder);
-            if (r > 0) frames_rendered += r;
-            usleep(500);
+            usleep(100); /* 100us — 5x faster polling than before */
             continue;
         }
 
@@ -273,7 +286,7 @@ static void* decode_thread_func(void* /*arg*/) {
             }
         }
 
-        /* Feed to decoder */
+        /* Feed to decoder (non-blocking — timeout 0) */
         int ret = decoder_feed(g_decoder, nal_buf, nal_len, pts_us, flags);
         if (ret == 0) {
             frames_fed++;
@@ -282,8 +295,8 @@ static void* decode_thread_func(void* /*arg*/) {
         }
         pts_us += 16667; /* ~60fps timestamp increment */
 
-        /* Drain rendered output buffers */
-        int r = decoder_drain(g_decoder);
+        /* Immediately drain again after feeding */
+        r = decoder_drain(g_decoder);
         if (r > 0) frames_rendered += r;
 
         /* Log stats every ~2 seconds */

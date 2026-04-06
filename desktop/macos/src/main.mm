@@ -226,13 +226,16 @@ int main(int argc, const char* argv[]) {
             fprintf(stderr,
                 "[stats] cap=%.0f fps | enc=%.0f fps | "
                 "%.1f Mbps | enc=%lld us | send=%lld us | "
-                "rtt=%lld us | drop=%llu idle=%llu\n",
+                "rtt=%lld us | drop=%llu idle=%llu | "
+                "cq=%zu sq=%zu\n",
                 cap_fps, enc_fps, mbps,
                 (long long)pipeline.last_encode_us(),
                 (long long)pipeline.last_send_us(),
                 (long long)pipeline.last_rtt_us(),
                 (unsigned long long)drop,
-                (unsigned long long)idle);
+                (unsigned long long)idle,
+                pipeline.capture_queue_depth(),
+                pipeline.send_queue_depth());
 
             prev_encoded  = enc;
             prev_captured = cap;

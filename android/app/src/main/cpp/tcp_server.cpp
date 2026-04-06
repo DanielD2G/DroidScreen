@@ -103,6 +103,17 @@ int tcp_send_all(int fd, const uint8_t *buf, size_t len) {
 void tcp_set_nodelay(int fd) {
     int flag = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    /* Larger socket buffers for burst traffic (512 KB each) */
+    int bufsize = 524288;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
+    /* Disable delayed ACKs for lower round-trip latency (Linux/Android only) */
+#ifdef TCP_QUICKACK
+    int quickack = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
+#endif
 }
 
 void tcp_close(int fd) {
