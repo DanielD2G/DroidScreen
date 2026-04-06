@@ -1118,6 +1118,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 // ============================================================================
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+    // Make the process DPI-aware so that all Win32 APIs (GetMonitorInfoW,
+    // DXGI output descs, etc.) return physical pixel coordinates instead of
+    // DPI-scaled logical coordinates.  Without this, a 2560x1600 monitor at
+    // 125% scaling would report as 2048x1280, causing resolution mismatches
+    // between the virtual display and the WGC capturer / encoder.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     // Initialize WinRT apartment (required for Windows.Graphics.Capture).
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
