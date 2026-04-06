@@ -9,6 +9,8 @@ add_library(droidscreen_protocol STATIC
     src/handshake.c
     src/frame.c
     src/touch.c
+    src/pen.c
+    src/mouse.c
 )
 
 target_include_directories(droidscreen_protocol

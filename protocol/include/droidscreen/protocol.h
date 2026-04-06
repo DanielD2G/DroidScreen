@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 /* Protocol version */
-#define DS_PROTOCOL_VERSION  4
+#define DS_PROTOCOL_VERSION  5
 
 /* Default TCP port */
 #define DS_DEFAULT_PORT      38271
@@ -33,6 +33,8 @@ typedef enum {
     DS_MSG_HANDSHAKE_RESP = 0x02,
     DS_MSG_VIDEO_FRAME    = 0x10,
     DS_MSG_TOUCH_EVENT    = 0x20,
+    DS_MSG_PEN_EVENT      = 0x21,
+    DS_MSG_MOUSE_EVENT    = 0x22,
     DS_MSG_CONTROL        = 0x30,
     DS_MSG_PING           = 0xF0,
     DS_MSG_PONG           = 0xF1

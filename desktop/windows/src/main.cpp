@@ -30,6 +30,7 @@
 
 #include "wgc_capturer.h"
 #include "ffmpeg_encoder.h"
+#include "mouse_injector_win.h"
 #include "touch_injector_win.h"
 #include "virtual_display_win.h"
 #include "droidscreen/pipeline.h"
@@ -456,6 +457,7 @@ struct AppState {
     std::unique_ptr<droidscreen::WGCCapturer>     capturer;
     std::unique_ptr<droidscreen::FFmpegEncoder>     encoder;
     std::unique_ptr<droidscreen::TCPClient>        client;
+    std::unique_ptr<droidscreen::WinMouseInjector> mouse;
     std::unique_ptr<droidscreen::WinTouchInjector> touch;
     std::unique_ptr<droidscreen::Pipeline>         pipeline;
 
@@ -896,6 +898,7 @@ static void connect_sync() {
     }
 
     // 6. Create touch injector.
+    g_app.mouse = std::make_unique<droidscreen::WinMouseInjector>();
     g_app.touch = std::make_unique<droidscreen::WinTouchInjector>();
     if (settings.touch) {
         MONITORINFOEXW mi = {};
@@ -904,6 +907,13 @@ static void connect_sync() {
             log_msg("[Stream] GetMonitorInfo failed for virtual display: %lu",
                     GetLastError());
             log_msg("[Stream] Touch injector disabled");
+            settings.touch = false;
+        } else if (!g_app.mouse->init(
+                cap_w,
+                cap_h,
+                mi.rcMonitor.left,
+                mi.rcMonitor.top)) {
+            log_msg("[Stream] Mouse injector init failed, continuing without input");
             settings.touch = false;
         } else if (!g_app.touch->init(
                 cap_w,
@@ -931,8 +941,12 @@ static void connect_sync() {
         g_app.encoder->shutdown();
         g_app.encoder.reset();
         g_app.capturer.reset();
-        if (settings.touch) g_app.touch->shutdown();
+        if (settings.touch) {
+            g_app.touch->shutdown();
+            g_app.mouse->shutdown();
+        }
         g_app.touch.reset();
+        g_app.mouse.reset();
         g_app.client.reset();
         if (g_app.vdisplay) { g_app.vdisplay->destroy(); g_app.vdisplay.reset(); }
         adb_forward_remove(settings.port);
@@ -943,7 +957,7 @@ static void connect_sync() {
     // 8. Create and start pipeline.
     g_app.pipeline = std::make_unique<droidscreen::Pipeline>(
         g_app.capturer.get(), g_app.encoder.get(),
-        g_app.client.get(), g_app.touch.get());
+        g_app.client.get(), g_app.touch.get(), g_app.mouse.get());
 
     if (!g_app.pipeline->start(cap_w, cap_h, settings.fps,
                                 settings.bitrate_kbps, settings.touch)) {
@@ -955,8 +969,12 @@ static void connect_sync() {
         g_app.client->close();
         g_app.client.reset();
         g_app.capturer.reset();
-        if (settings.touch) g_app.touch->shutdown();
+        if (settings.touch) {
+            g_app.touch->shutdown();
+            g_app.mouse->shutdown();
+        }
         g_app.touch.reset();
+        g_app.mouse.reset();
         if (g_app.vdisplay) { g_app.vdisplay->destroy(); g_app.vdisplay.reset(); }
         adb_forward_remove(settings.port);
         g_app.isBusy.store(false);
@@ -1002,6 +1020,10 @@ static void disconnect_sync() {
     if (g_app.touch) {
         g_app.touch->shutdown();
         g_app.touch.reset();
+    }
+    if (g_app.mouse) {
+        g_app.mouse->shutdown();
+        g_app.mouse.reset();
     }
     if (g_app.client) {
         g_app.client->close();

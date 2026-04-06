@@ -25,6 +25,8 @@
 extern "C" {
 #include "droidscreen/protocol.h"
 #include "droidscreen/handshake.h"
+#include "droidscreen/mouse.h"
+#include "droidscreen/pen.h"
 #include "droidscreen/touch.h"
 }
 
@@ -46,11 +48,13 @@ static void release_captured_frame(CapturedFrame& frame) {
 }
 
 Pipeline::Pipeline(Capturer* capturer, Encoder* encoder,
-                   TCPClient* client, TouchInjector* touch)
+                   TCPClient* client, TouchInjector* touch,
+                   MouseInjector* mouse)
     : capturer_(capturer)
     , encoder_(encoder)
     , client_(client)
     , touch_(touch)
+    , mouse_(mouse)
 {
 }
 
@@ -242,6 +246,7 @@ void Pipeline::stop() {
     // Shut down encoder and touch.
     encoder_->shutdown();
     touch_->shutdown();
+    mouse_->shutdown();
 
     fprintf(stderr, "[pipeline] stopped (encoded %llu frames, sent %llu bytes)\n",
             static_cast<unsigned long long>(frames_encoded_.load()),
@@ -424,11 +429,32 @@ void Pipeline::recv_loop() {
                 if (hdr.length == DS_TOUCH_EVENT_SIZE) {
                     ds_touch_event_t ev;
                     ds_touch_deserialize(payload.data(), &ev);
-                    touch_->inject(ev.action, ev.pointer_id,
-                                   ev.tool_type, ev.buttons,
-                                   ev.x_frac, ev.y_frac, ev.pressure,
-                                   ev.touch_major, ev.touch_minor,
-                                   ev.orientation, ev.distance, ev.tilt);
+                    touch_->inject_touch(ev.action, ev.pointer_id,
+                                         ev.x_frac, ev.y_frac, ev.pressure,
+                                         ev.touch_major, ev.touch_minor,
+                                         ev.orientation);
+                }
+                break;
+            }
+
+            case DS_MSG_PEN_EVENT: {
+                if (hdr.length == DS_PEN_EVENT_SIZE) {
+                    ds_pen_event_t ev;
+                    ds_pen_deserialize(payload.data(), &ev);
+                    touch_->inject_pen(ev.action, ev.pointer_id,
+                                       ev.tool_type, ev.buttons,
+                                       ev.x_frac, ev.y_frac, ev.pressure,
+                                       ev.distance, ev.tilt, ev.rotation);
+                }
+                break;
+            }
+
+            case DS_MSG_MOUSE_EVENT: {
+                if (hdr.length == DS_MOUSE_EVENT_SIZE) {
+                    ds_mouse_event_t ev;
+                    ds_mouse_deserialize(payload.data(), &ev);
+                    mouse_->inject_mouse(ev.action, ev.buttons,
+                                         ev.x_frac, ev.y_frac);
                 }
                 break;
             }

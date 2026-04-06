@@ -110,12 +110,10 @@ bool WinTouchInjector::init(uint32_t w, uint32_t h,
     return true;
 }
 
-bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
-                              uint8_t tool_type, uint32_t buttons,
-                              uint16_t x, uint16_t y, uint16_t pressure,
-                              uint16_t touch_major, uint16_t touch_minor,
-                              uint16_t orientation, uint16_t distance,
-                              uint16_t tilt) {
+bool WinTouchInjector::inject_touch(uint8_t action, uint8_t ptr_id,
+                                    uint16_t x, uint16_t y, uint16_t pressure,
+                                    uint16_t touch_major, uint16_t touch_minor,
+                                    uint16_t orientation) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!touch_device_) {
@@ -126,17 +124,9 @@ bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
     int32_t pixel_y = 0;
     map_to_virtual_desktop_locked(x, y, &pixel_x, &pixel_y);
 
-    const bool use_pen =
-        tool_type == DS_TOUCH_TOOL_STYLUS ||
-        tool_type == DS_TOUCH_TOOL_ERASER;
-
-    const bool ok = (use_pen && pen_device_)
-        ? inject_pen_locked(action, ptr_id, tool_type, buttons,
-                            pixel_x, pixel_y, pressure, touch_major,
-                            touch_minor, orientation, distance, tilt)
-        : inject_touch_locked(action, ptr_id, tool_type, buttons,
-                              pixel_x, pixel_y, pressure, touch_major,
-                              touch_minor, orientation, distance, tilt);
+    const bool ok = inject_touch_locked(action, ptr_id, pixel_x, pixel_y,
+                                        pressure, touch_major, touch_minor,
+                                        orientation);
 
     if (ok) {
         repeat_reset_pending_ = true;
@@ -145,15 +135,37 @@ bool WinTouchInjector::inject(uint8_t action, uint8_t ptr_id,
     return ok;
 }
 
+bool WinTouchInjector::inject_pen(uint8_t action, uint8_t ptr_id,
+                                  uint8_t tool_type, uint32_t buttons,
+                                  uint16_t x, uint16_t y, uint16_t pressure,
+                                  uint16_t distance, uint16_t tilt,
+                                  uint16_t rotation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (!pen_device_) {
+        return false;
+    }
+
+    int32_t pixel_x = 0;
+    int32_t pixel_y = 0;
+    map_to_virtual_desktop_locked(x, y, &pixel_x, &pixel_y);
+
+    const bool ok = inject_pen_locked(action, ptr_id, tool_type, buttons,
+                                      pixel_x, pixel_y, pressure, distance,
+                                      tilt, rotation);
+    if (ok) {
+        repeat_reset_pending_ = true;
+        repeat_cv_.notify_one();
+    }
+    return ok;
+}
+
 bool WinTouchInjector::inject_touch_locked(uint8_t action, uint8_t ptr_id,
-                                           uint8_t tool_type, uint32_t buttons,
                                            int32_t pixel_x, int32_t pixel_y,
                                            uint16_t pressure,
                                            uint16_t touch_major,
                                            uint16_t touch_minor,
-                                           uint16_t orientation,
-                                           uint16_t distance,
-                                           uint16_t tilt) {
+                                           uint16_t orientation) {
     int slot = find_touch_slot_by_external_id_locked(ptr_id);
     if (slot < 0 && (action == kTouchDown || action == kTouchHover)) {
         slot = allocate_touch_slot_locked(ptr_id);
@@ -170,10 +182,8 @@ bool WinTouchInjector::inject_touch_locked(uint8_t action, uint8_t ptr_id,
         return true;
     }
 
-    update_pointer_state_locked(touch_pointers_[slot], action, tool_type,
-                                buttons, pixel_x, pixel_y, pressure,
-                                touch_major, touch_minor, orientation,
-                                distance, tilt);
+    update_touch_state_locked(touch_pointers_[slot], action, pixel_x, pixel_y,
+                              pressure, touch_major, touch_minor, orientation);
     return inject_touch_state_locked();
 }
 
@@ -181,11 +191,9 @@ bool WinTouchInjector::inject_pen_locked(uint8_t action, uint8_t ptr_id,
                                          uint8_t tool_type, uint32_t buttons,
                                          int32_t pixel_x, int32_t pixel_y,
                                          uint16_t pressure,
-                                         uint16_t touch_major,
-                                         uint16_t touch_minor,
-                                         uint16_t orientation,
                                          uint16_t distance,
-                                         uint16_t tilt) {
+                                         uint16_t tilt,
+                                         uint16_t rotation) {
     if (!pen_pointer_.assigned &&
         action != kTouchDown &&
         action != kTouchHover) {
@@ -203,9 +211,9 @@ bool WinTouchInjector::inject_pen_locked(uint8_t action, uint8_t ptr_id,
         pen_pointer_.external_id = ptr_id;
     }
 
-    update_pointer_state_locked(pen_pointer_, action, tool_type, buttons,
-                                pixel_x, pixel_y, pressure, touch_major,
-                                touch_minor, orientation, distance, tilt);
+    update_pen_state_locked(pen_pointer_, action, tool_type, buttons,
+                            pixel_x, pixel_y, pressure, distance, tilt,
+                            rotation);
     return inject_pen_state_locked();
 }
 
@@ -348,27 +356,142 @@ void WinTouchInjector::cancel_pen_locked() {
     inject_pen_state_locked();
 }
 
-void WinTouchInjector::update_pointer_state_locked(PointerState& ptr,
-                                                   uint8_t action,
-                                                   uint8_t tool_type,
-                                                   uint32_t buttons,
-                                                   int32_t pixel_x,
-                                                   int32_t pixel_y,
-                                                   uint16_t pressure,
-                                                   uint16_t touch_major,
-                                                   uint16_t touch_minor,
-                                                   uint16_t orientation,
-                                                   uint16_t distance,
-                                                   uint16_t tilt) {
+void WinTouchInjector::update_touch_state_locked(PointerState& ptr,
+                                                 uint8_t action,
+                                                 int32_t pixel_x,
+                                                 int32_t pixel_y,
+                                                 uint16_t pressure,
+                                                 uint16_t touch_major,
+                                                 uint16_t touch_minor,
+                                                 uint16_t orientation) {
+    const bool should_update_position =
+        action != kTouchUp && action != kTouchCancel && action != kTouchButtonOnly;
+
+    ptr.assigned = true;
+    ptr.tool_type = DS_TOUCH_TOOL_FINGER;
+    ptr.buttons = 0;
+    ptr.touch_major = touch_major;
+    ptr.touch_minor = touch_minor;
+    ptr.orientation = orientation;
+    ptr.distance = DS_TOUCH_DISTANCE_UNKNOWN;
+    ptr.tilt = DS_TOUCH_TILT_UNKNOWN;
+
+    if (should_update_position || !ptr.present) {
+        ptr.pixel_x = pixel_x;
+        ptr.pixel_y = pixel_y;
+    }
+
+    switch (action) {
+        case kTouchDown:
+            ptr.present = true;
+            ptr.in_range = true;
+            ptr.in_contact = true;
+            ptr.edge_update = false;
+            ptr.edge_down = true;
+            ptr.edge_up = false;
+            ptr.edge_canceled = false;
+            ptr.pressure = pressure;
+            break;
+
+        case kTouchMove:
+            if (!ptr.present) {
+                return;
+            }
+            ptr.present = true;
+            ptr.in_range = true;
+            ptr.in_contact = true;
+            ptr.edge_update = true;
+            ptr.edge_down = false;
+            ptr.edge_up = false;
+            ptr.edge_canceled = false;
+            ptr.pressure = pressure;
+            break;
+
+        case kTouchHover:
+            ptr.present = true;
+            ptr.in_range = true;
+            ptr.in_contact = false;
+            ptr.edge_update = true;
+            ptr.edge_down = false;
+            ptr.edge_up = false;
+            ptr.edge_canceled = false;
+            ptr.pressure = 0;
+            break;
+
+        case kTouchUp:
+            if (!ptr.present) {
+                return;
+            }
+            ptr.in_contact = false;
+            ptr.in_range = false;
+            ptr.edge_update = false;
+            ptr.edge_down = false;
+            ptr.edge_up = true;
+            ptr.edge_canceled = false;
+            ptr.pressure = 0;
+            break;
+
+        case kTouchCancel:
+            if (!ptr.present) {
+                return;
+            }
+            ptr.edge_update = !ptr.in_contact;
+            ptr.edge_down = false;
+            ptr.edge_up = ptr.in_contact;
+            ptr.edge_canceled = true;
+            ptr.in_contact = false;
+            ptr.in_range = false;
+            ptr.pressure = 0;
+            break;
+
+        case kTouchHoverLeave:
+            if (!ptr.present) {
+                return;
+            }
+            ptr.in_contact = false;
+            ptr.in_range = false;
+            ptr.edge_update = true;
+            ptr.edge_down = false;
+            ptr.edge_up = false;
+            ptr.edge_canceled = false;
+            ptr.pressure = 0;
+            break;
+
+        case kTouchButtonOnly:
+            if (!ptr.present) {
+                return;
+            }
+            ptr.edge_update = true;
+            ptr.edge_down = false;
+            ptr.edge_up = false;
+            ptr.edge_canceled = false;
+            break;
+
+        default:
+            fprintf(stderr, "[touch] unknown action %u\n", action);
+            return;
+    }
+}
+
+void WinTouchInjector::update_pen_state_locked(PointerState& ptr,
+                                               uint8_t action,
+                                               uint8_t tool_type,
+                                               uint32_t buttons,
+                                               int32_t pixel_x,
+                                               int32_t pixel_y,
+                                               uint16_t pressure,
+                                               uint16_t distance,
+                                               uint16_t tilt,
+                                               uint16_t rotation) {
     const bool should_update_position =
         action != kTouchUp && action != kTouchCancel && action != kTouchButtonOnly;
 
     ptr.assigned = true;
     ptr.tool_type = tool_type;
     ptr.buttons = buttons;
-    ptr.touch_major = touch_major;
-    ptr.touch_minor = touch_minor;
-    ptr.orientation = orientation;
+    ptr.touch_major = 0;
+    ptr.touch_minor = 0;
+    ptr.orientation = rotation;
     ptr.distance = distance;
     ptr.tilt = tilt;
 
@@ -464,7 +587,7 @@ void WinTouchInjector::update_pointer_state_locked(PointerState& ptr,
             break;
 
         default:
-            fprintf(stderr, "[touch] unknown action %u\n", action);
+            fprintf(stderr, "[touch] unknown pen action %u\n", action);
             return;
     }
 }

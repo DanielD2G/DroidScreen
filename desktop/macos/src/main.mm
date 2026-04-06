@@ -16,6 +16,7 @@
 #include "vt_encoder.h"
 #include "virtual_display.h"
 #include "droidscreen/pipeline.h"
+#include "droidscreen/mouse_injector.h"
 #include "droidscreen/server.h"
 #include "droidscreen/touch_injector.h"
 
@@ -416,6 +417,7 @@ static NSImage* CreateStatusBarIcon() {
     std::unique_ptr<droidscreen::SCKCapturer>       _capturer;
     std::unique_ptr<droidscreen::VTEncoder>         _encoder;
     std::unique_ptr<droidscreen::TCPClient>         _client;
+    std::unique_ptr<droidscreen::NullMouseInjector> _mouse;
     std::unique_ptr<droidscreen::NullTouchInjector> _touch;
     std::unique_ptr<droidscreen::Pipeline>          _pipeline;
 
@@ -959,9 +961,10 @@ struct StreamSettings {
 
         // 5. Create encoder, touch injector, pipeline.
         _encoder = std::make_unique<droidscreen::VTEncoder>();
+        _mouse   = std::make_unique<droidscreen::NullMouseInjector>();
         _touch   = std::make_unique<droidscreen::NullTouchInjector>();
         _pipeline = std::make_unique<droidscreen::Pipeline>(
-            _capturer.get(), _encoder.get(), _client.get(), _touch.get());
+            _capturer.get(), _encoder.get(), _client.get(), _touch.get(), _mouse.get());
 
         if (!_pipeline->start(_streamWidth, _streamHeight,
                               settings.fps, settings.bitrate_kbps, false)) {
@@ -970,6 +973,7 @@ struct StreamSettings {
             [self updateConnectMenuTitle:@"Connect"];
             _pipeline.reset();
             _encoder.reset();
+            _mouse.reset();
             _touch.reset();
             _client->close();
             _client.reset();
@@ -1023,6 +1027,9 @@ struct StreamSettings {
         }
         if (_touch) {
             _touch.reset();
+        }
+        if (_mouse) {
+            _mouse.reset();
         }
         if (_client) {
             _client->close();

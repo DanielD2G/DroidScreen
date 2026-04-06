@@ -23,6 +23,7 @@
 
 #include "droidscreen/capturer.h"
 #include "droidscreen/encoder.h"
+#include "droidscreen/mouse_injector.h"
 #include "droidscreen/server.h"
 #include "droidscreen/touch_injector.h"
 
@@ -31,7 +32,8 @@ namespace droidscreen {
 class Pipeline {
 public:
     Pipeline(Capturer* capturer, Encoder* encoder,
-             TCPClient* client, TouchInjector* touch);
+             TCPClient* client, TouchInjector* touch,
+             MouseInjector* mouse);
     ~Pipeline();
 
     /// Start the pipeline: perform handshake, launch threads.
@@ -90,6 +92,7 @@ private:
     Encoder*       encoder_;
     TCPClient*     client_;
     TouchInjector* touch_;
+    MouseInjector* mouse_;
 
     // --- Capture queue: newest-frame-wins (not FIFO) ---
     // Only holds the most recent frame; stale frames are dropped.

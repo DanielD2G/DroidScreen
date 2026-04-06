@@ -24,25 +24,19 @@ static uint32_t get_timestamp_ms(void) {
 }
 
 int touch_sender_send(int fd, int action, int pointer_id,
-                      int tool_type, int buttons,
                       int x_frac, int y_frac, int pressure,
-                      int touch_major, int touch_minor, int orientation,
-                      int distance, int tilt) {
+                      int touch_major, int touch_minor, int orientation) {
     /* Build touch event */
     ds_touch_event_t event;
     memset(&event, 0, sizeof(event));
     event.action       = (uint8_t)action;
     event.pointer_id   = (uint8_t)pointer_id;
-    event.tool_type    = (uint8_t)tool_type;
     event.x_frac       = (uint16_t)x_frac;
     event.y_frac       = (uint16_t)y_frac;
     event.pressure     = (uint16_t)pressure;
     event.touch_major  = (uint16_t)touch_major;
     event.touch_minor  = (uint16_t)touch_minor;
     event.orientation  = (uint16_t)orientation;
-    event.distance     = (uint16_t)distance;
-    event.tilt         = (uint16_t)tilt;
-    event.buttons      = (uint32_t)buttons;
     event.timestamp_ms = get_timestamp_ms();
 
     /* Serialize payload */

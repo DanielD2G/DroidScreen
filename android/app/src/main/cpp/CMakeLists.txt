@@ -18,6 +18,8 @@ add_library(droidscreen_native SHARED
     tcp_server.cpp
     decoder.cpp
     touch_sender.cpp
+    pen_sender.cpp
+    mouse_sender.cpp
 )
 
 target_include_directories(droidscreen_native PRIVATE

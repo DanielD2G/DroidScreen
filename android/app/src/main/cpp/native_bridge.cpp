@@ -22,6 +22,8 @@
 #include "tcp_server.h"
 #include "decoder.h"
 #include "ring_buffer.h"
+#include "mouse_sender.h"
+#include "pen_sender.h"
 #include "touch_sender.h"
 #include "sps_patch.h"
 
@@ -29,6 +31,8 @@ extern "C" {
 #include "droidscreen/protocol.h"
 #include "droidscreen/handshake.h"
 #include "droidscreen/frame.h"
+#include "droidscreen/mouse.h"
+#include "droidscreen/pen.h"
 #include "droidscreen/touch.h"
 }
 
@@ -599,18 +603,43 @@ Java_com_droidscreen_app_MainActivity_nativeStop(
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendTouch(
         JNIEnv* /*env*/, jobject /*thiz*/,
-        jint action, jint pointerId, jint toolType, jint buttons,
-        jint xFrac, jint yFrac, jint pressure,
-        jint touchMajor, jint touchMinor, jint orientation,
-        jint distance, jint tilt) {
+        jint action, jint pointerId, jint xFrac, jint yFrac,
+        jint pressure, jint touchMajor, jint touchMinor,
+        jint orientation) {
 
     if (g_client_fd < 0) {
         return;
     }
 
-    touch_sender_send(g_client_fd, action, pointerId, toolType, buttons,
-                      xFrac, yFrac, pressure, touchMajor, touchMinor,
-                      orientation, distance, tilt);
+    touch_sender_send(g_client_fd, action, pointerId, xFrac, yFrac, pressure,
+                      touchMajor, touchMinor, orientation);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droidscreen_app_MainActivity_nativeSendPen(
+        JNIEnv* /*env*/, jobject /*thiz*/,
+        jint action, jint pointerId, jint toolType, jint buttons,
+        jint xFrac, jint yFrac, jint pressure,
+        jint distance, jint tilt, jint rotation) {
+
+    if (g_client_fd < 0) {
+        return;
+    }
+
+    pen_sender_send(g_client_fd, action, pointerId, toolType, buttons,
+                    xFrac, yFrac, pressure, distance, tilt, rotation);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droidscreen_app_MainActivity_nativeSendMouse(
+        JNIEnv* /*env*/, jobject /*thiz*/,
+        jint action, jint buttons, jint xFrac, jint yFrac) {
+
+    if (g_client_fd < 0) {
+        return;
+    }
+
+    mouse_sender_send(g_client_fd, action, buttons, xFrac, yFrac);
 }
 
 } /* extern "C" */

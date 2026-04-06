@@ -30,12 +30,15 @@ public:
 
     bool init(uint32_t w, uint32_t h,
               int32_t ox = 0, int32_t oy = 0) override;
-    bool inject(uint8_t action, uint8_t ptr_id,
-                uint8_t tool_type, uint32_t buttons,
-                uint16_t x, uint16_t y, uint16_t pressure,
-                uint16_t touch_major, uint16_t touch_minor,
-                uint16_t orientation, uint16_t distance,
-                uint16_t tilt) override;
+    bool inject_touch(uint8_t action, uint8_t ptr_id,
+                      uint16_t x, uint16_t y, uint16_t pressure,
+                      uint16_t touch_major, uint16_t touch_minor,
+                      uint16_t orientation) override;
+    bool inject_pen(uint8_t action, uint8_t ptr_id,
+                    uint8_t tool_type, uint32_t buttons,
+                    uint16_t x, uint16_t y, uint16_t pressure,
+                    uint16_t distance, uint16_t tilt,
+                    uint16_t rotation) override;
     void shutdown() override;
 
     struct PointerState {
@@ -85,16 +88,14 @@ private:
     bool stop_repeat_ = false;
     bool repeat_reset_pending_ = false;
 
-    bool inject_touch_locked(uint8_t action, uint8_t ptr_id, uint8_t tool_type,
-                             uint32_t buttons, int32_t pixel_x, int32_t pixel_y,
+    bool inject_touch_locked(uint8_t action, uint8_t ptr_id,
+                             int32_t pixel_x, int32_t pixel_y,
                              uint16_t pressure, uint16_t touch_major,
-                             uint16_t touch_minor, uint16_t orientation,
-                             uint16_t distance, uint16_t tilt);
+                             uint16_t touch_minor, uint16_t orientation);
     bool inject_pen_locked(uint8_t action, uint8_t ptr_id, uint8_t tool_type,
                            uint32_t buttons, int32_t pixel_x, int32_t pixel_y,
-                           uint16_t pressure, uint16_t touch_major,
-                           uint16_t touch_minor, uint16_t orientation,
-                           uint16_t distance, uint16_t tilt);
+                           uint16_t pressure, uint16_t distance,
+                           uint16_t tilt, uint16_t rotation);
     bool inject_touch_state_locked();
     bool inject_pen_state_locked();
     bool has_repeatable_inputs_locked() const;
@@ -104,12 +105,15 @@ private:
     void reset_pointer_locked(PointerState& ptr);
     void cancel_all_touches_locked();
     void cancel_pen_locked();
-    void update_pointer_state_locked(PointerState& ptr, uint8_t action,
-                                     uint8_t tool_type, uint32_t buttons,
-                                     int32_t pixel_x, int32_t pixel_y,
-                                     uint16_t pressure, uint16_t touch_major,
-                                     uint16_t touch_minor, uint16_t orientation,
-                                     uint16_t distance, uint16_t tilt);
+    void update_touch_state_locked(PointerState& ptr, uint8_t action,
+                                   int32_t pixel_x, int32_t pixel_y,
+                                   uint16_t pressure, uint16_t touch_major,
+                                   uint16_t touch_minor, uint16_t orientation);
+    void update_pen_state_locked(PointerState& ptr, uint8_t action,
+                                 uint8_t tool_type, uint32_t buttons,
+                                 int32_t pixel_x, int32_t pixel_y,
+                                 uint16_t pressure, uint16_t distance,
+                                 uint16_t tilt, uint16_t rotation);
     void map_to_virtual_desktop_locked(uint16_t x, uint16_t y,
                                        int32_t* pixel_x, int32_t* pixel_y) const;
     int find_touch_slot_by_external_id_locked(uint8_t external_id) const;

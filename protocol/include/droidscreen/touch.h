@@ -34,13 +34,12 @@ typedef enum {
     DS_TOUCH_TOOL_MOUSE   = 4
 } ds_touch_tool_t;
 
-#define DS_TOUCH_EVENT_SIZE  32
 #define DS_TOUCH_ORIENTATION_UNKNOWN  0xFFFFu
 #define DS_TOUCH_DISTANCE_UNKNOWN     0xFFFFu
 #define DS_TOUCH_TILT_UNKNOWN         0xFFFFu
 
 /*
- * Touch event (32 bytes)
+ * Touch event (20 bytes)
  *
  * Coordinates are stored as fractional values (0..65535) representing
  * the position as a fraction of the display dimensions.
@@ -48,27 +47,20 @@ typedef enum {
  *
  * touch_major / touch_minor are normalized contact ellipse dimensions.
  * orientation is degrees (0..359) or DS_TOUCH_ORIENTATION_UNKNOWN.
- * distance is normalized hover distance (0..65535) or
- * DS_TOUCH_DISTANCE_UNKNOWN if unavailable.
- * tilt is degrees (0..90) or DS_TOUCH_TILT_UNKNOWN if unavailable.
  */
+#define DS_TOUCH_EVENT_SIZE  20
 #pragma pack(push, 1)
 typedef struct {
     uint8_t  action;
     uint8_t  pointer_id;
-    uint8_t  tool_type;
-    uint8_t  reserved0;
     uint16_t x_frac;
     uint16_t y_frac;
     uint16_t pressure;
     uint16_t touch_major;
     uint16_t touch_minor;
     uint16_t orientation;
-    uint16_t distance;
-    uint16_t tilt;
-    uint32_t buttons;
     uint32_t timestamp_ms;
-    uint8_t  reserved[4];
+    uint8_t  reserved[2];
 } ds_touch_event_t;
 #pragma pack(pop)
 

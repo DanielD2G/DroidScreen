@@ -23,6 +23,7 @@ add_executable(droidscreen_desktop WIN32
     src/main.cpp
     src/wgc_capturer.cpp
     src/ffmpeg_encoder.cpp
+    src/mouse_injector_win.cpp
     src/touch_injector_win.cpp
     src/virtual_display_win.cpp
 )
