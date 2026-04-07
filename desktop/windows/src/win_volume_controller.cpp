@@ -1,8 +1,8 @@
 #include "win_volume_controller.h"
 
+#include <windows.h>
 #include <endpointvolume.h>
 #include <mmdeviceapi.h>
-#include <windows.h>
 #include <wrl/client.h>
 
 #include <atomic>

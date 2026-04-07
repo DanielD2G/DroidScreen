@@ -1,5 +1,6 @@
 #include "win_app_launcher.h"
 
+#include <windows.h>
 #include <gdiplus.h>
 #include <objidl.h>
 #include <shellapi.h>
@@ -7,7 +8,6 @@
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <wincrypt.h>
-#include <windows.h>
 
 #include <mutex>
 #include <string>
