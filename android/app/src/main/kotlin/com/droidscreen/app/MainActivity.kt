@@ -17,15 +17,19 @@ import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
+import com.droidscreen.app.deck.DeckConfig
+import com.droidscreen.app.deck.DeckOverlayView
+import com.droidscreen.app.deck.MediaState
 
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
     companion object {
         private const val TAG = "DroidScreen"
-        private const val CONTROLS_AUTO_HIDE_DELAY_MS = 3_000L
+        private const val DECK_AUTO_HIDE_MS = 6_000L
 
         // Status constants — must match native_bridge.cpp
         const val STATUS_WAITING = 0
@@ -49,8 +53,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var fingerModeSpinner: Spinner
     private lateinit var stylusModeSpinner: Spinner
     private lateinit var unknownModeSpinner: Spinner
+    private lateinit var deckOverlayContainer: FrameLayout
+    private lateinit var lockButton: Button
+    private lateinit var hideButton: Button
+    private var deckOverlay: DeckOverlayView? = null
+    private var isDeckVisible = false
+    private var isDeckLocked = false
+    private var currentDeckConfig: DeckConfig = DeckConfig.createDefault()
+    private var currentMediaState: MediaState? = null
+    private var currentVolumeLevel = 0
+    private var currentVolumeMuted = false
     private var nativeStarted = false
-    private var controlsVisible = true
     private lateinit var inputSettings: InputSettings
     private lateinit var statsToggleButton: Button
     private lateinit var statsPanel: LinearLayout
@@ -71,9 +84,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
         }
     }
-    private val hideControlsRunnable = Runnable {
-        if (statusOverlay.visibility == View.GONE && controlsVisible) {
-            setControlsVisible(false)
+    private val hideDeckRunnable = Runnable {
+        if (isDeckVisible && !isDeckLocked) {
+            hideDeckAndControls()
         }
     }
 
@@ -119,6 +132,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         bindInputSettingsUi()
         bindStatsUi()
 
+        deckOverlayContainer = findViewById(R.id.deck_overlay_container)
+        lockButton = findViewById(R.id.lock_toggle)
+        hideButton = findViewById(R.id.hide_toggle)
+        lockButton.setOnClickListener {
+            isDeckLocked = !isDeckLocked
+            lockButton.text = if (isDeckLocked) "Unlock" else "Lock"
+            if (isDeckLocked) uiHandler.removeCallbacks(hideDeckRunnable)
+            else scheduleDeckAutoHide()
+        }
+        hideButton.setOnClickListener { hideDeckAndControls() }
         setImmersiveMode()
     }
 
@@ -128,7 +151,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onDestroy() {
-        uiHandler.removeCallbacks(hideControlsRunnable)
+        uiHandler.removeCallbacks(hideDeckRunnable)
         uiHandler.removeCallbacks(statsUpdateRunnable)
         if (nativeStarted) {
             nativeStop()
@@ -138,6 +161,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onBackPressed() {
+        // If deck is showing, hide everything
+        if (isDeckVisible) {
+            hideDeckAndControls()
+            return
+        }
+
         if (statsVisible) {
             closeStatsPanel()
             return
@@ -148,8 +177,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             return
         }
 
-        if (statusOverlay.visibility == View.GONE && !controlsVisible) {
-            setControlsVisible(true)
+        // If streaming with no UI → show deck + controls
+        if (statusOverlay.visibility == View.GONE) {
+            showDeckAndControls()
             return
         }
 
@@ -210,11 +240,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun handleTouchEvent(view: View, event: MotionEvent): Boolean {
         val width = surfaceView.width
         val height = surfaceView.height
-        if (width <= 0 || height <= 0) {
-            return false
-        }
+        if (width <= 0 || height <= 0) return false
+        if (!isPointerLikeSource(event)) return false
 
-        if (!isPointerLikeSource(event)) {
+        // When deck is visible, reset auto-hide timer and let overlay handle touches
+        if (isDeckVisible) {
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) scheduleDeckAutoHide()
             return false
         }
 
@@ -247,7 +278,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun bindInputSettingsUi() {
         val touchRescheduler = View.OnTouchListener { _, event ->
             if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                scheduleControlsAutoHide()
+                scheduleDeckAutoHide()
             }
             false
         }
@@ -255,13 +286,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         controlsContainer.setOnTouchListener(touchRescheduler)
         inputSettingsScrim.setOnClickListener {
             closeInputPanel()
-            scheduleControlsAutoHide()
+            scheduleDeckAutoHide()
         }
         inputSettingsScrim.setOnTouchListener(touchRescheduler)
 
         inputToggleButton.setOnClickListener {
             toggleInputPanel()
-            scheduleControlsAutoHide()
+            scheduleDeckAutoHide()
         }
 
         bindSpinner(
@@ -273,7 +304,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 fingerInputMode = FingerInputMode.values()[index]
             )
             persistInputSettings()
-            scheduleControlsAutoHide()
+            scheduleDeckAutoHide()
         }
 
         bindSpinner(
@@ -285,7 +316,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 stylusInputMode = StylusInputMode.values()[index]
             )
             persistInputSettings()
-            scheduleControlsAutoHide()
+            scheduleDeckAutoHide()
         }
 
         bindSpinner(
@@ -297,7 +328,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 unknownPointerFallback = UnknownPointerFallback.values()[index]
             )
             persistInputSettings()
-            scheduleControlsAutoHide()
+            scheduleDeckAutoHide()
         }
     }
 
@@ -339,13 +370,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         inputPanel.visibility = View.GONE
         inputSettingsScrim.visibility = View.GONE
         inputToggleButton.text = "Input"
-        scheduleControlsAutoHide()
+        scheduleDeckAutoHide()
     }
 
     private fun bindStatsUi() {
         statsToggleButton.setOnClickListener {
             toggleStatsPanel()
-            scheduleControlsAutoHide()
+            scheduleDeckAutoHide()
         }
     }
 
@@ -407,21 +438,74 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         lastStatsTime = now
     }
 
-    private fun setControlsVisible(visible: Boolean) {
-        controlsVisible = visible
-        controlsContainer.visibility = if (visible) View.VISIBLE else View.GONE
-        if (!visible) {
-            uiHandler.removeCallbacks(hideControlsRunnable)
-            closeInputPanel()
-        } else {
-            scheduleControlsAutoHide()
+    private fun showDeckAndControls() {
+        if (isDeckVisible) return
+        isDeckVisible = true
+        isDeckLocked = false
+        lockButton.text = "Lock"
+
+        // Re-force immersive mode so system bars don't steal space
+        setImmersiveMode()
+
+        // Expand container with negative margins to cover any residual inset gaps
+        val margin = -200
+        val lp = deckOverlayContainer.layoutParams as FrameLayout.LayoutParams
+        lp.setMargins(margin, margin, margin, margin)
+        deckOverlayContainer.layoutParams = lp
+
+        controlsContainer.visibility = View.VISIBLE
+
+        val overlay = DeckOverlayView(this).apply {
+            onDeckAction = { actionType, slotIndex ->
+                nativeSendDeckAction(actionType, slotIndex)
+                scheduleDeckAutoHide()
+            }
+            onVolumeChange = { volume, muted ->
+                nativeSendVolumeChange(volume, if (muted) 1 else 0)
+                scheduleDeckAutoHide()
+            }
+            onDismiss = { hideDeckAndControls() }
+        }
+
+        overlay.buildFromConfig(currentDeckConfig)
+        currentMediaState?.let(overlay::updateMediaState)
+        overlay.updateVolume(currentVolumeLevel, currentVolumeMuted)
+
+        deckOverlayContainer.removeAllViews()
+        deckOverlayContainer.addView(overlay, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        deckOverlayContainer.visibility = View.VISIBLE
+        overlay.animateIn()
+        deckOverlay = overlay
+
+        scheduleDeckAutoHide()
+    }
+
+    private fun hideDeckAndControls() {
+        uiHandler.removeCallbacks(hideDeckRunnable)
+        closeInputPanel()
+
+        if (!isDeckVisible) {
+            controlsContainer.visibility = View.GONE
+            return
+        }
+
+        deckOverlay?.animateOut {
+            deckOverlayContainer.removeAllViews()
+            deckOverlayContainer.visibility = View.GONE
+            deckOverlay = null
+            isDeckVisible = false
+            isDeckLocked = false
+            controlsContainer.visibility = View.GONE
         }
     }
 
-    private fun scheduleControlsAutoHide() {
-        uiHandler.removeCallbacks(hideControlsRunnable)
-        if (statusOverlay.visibility == View.GONE && controlsVisible) {
-            uiHandler.postDelayed(hideControlsRunnable, CONTROLS_AUTO_HIDE_DELAY_MS)
+    private fun scheduleDeckAutoHide() {
+        uiHandler.removeCallbacks(hideDeckRunnable)
+        if (isDeckVisible && !isDeckLocked) {
+            uiHandler.postDelayed(hideDeckRunnable, DECK_AUTO_HIDE_MS)
         }
     }
 
@@ -440,32 +524,65 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         when (status) {
             STATUS_WAITING -> {
                 closeStatsPanel()
-                setControlsVisible(true)
-                uiHandler.removeCallbacks(hideControlsRunnable)
+                hideDeckAndControls()
                 statusOverlay.visibility = View.VISIBLE
                 statusText.text = "Waiting for connection..."
                 statusDetail.text = "Port: ${USBConnectionManager.PORT}"
             }
             STATUS_CONNECTED -> {
-                setControlsVisible(false)
+                hideDeckAndControls()
                 statusOverlay.visibility = View.GONE
             }
             STATUS_DISCONNECTED -> {
                 closeStatsPanel()
-                setControlsVisible(true)
-                uiHandler.removeCallbacks(hideControlsRunnable)
+                hideDeckAndControls()
                 statusOverlay.visibility = View.VISIBLE
                 statusText.text = "Disconnected"
                 statusDetail.text = "Reconnecting..."
             }
             STATUS_ERROR -> {
                 closeStatsPanel()
-                setControlsVisible(true)
-                uiHandler.removeCallbacks(hideControlsRunnable)
+                hideDeckAndControls()
                 statusOverlay.visibility = View.VISIBLE
                 statusText.text = "Error"
                 statusDetail.text = "Please restart the app"
             }
+        }
+    }
+
+    @Suppress("unused") // Called from JNI
+    fun onDeckConfigReceived(json: String) {
+        runOnUiThread {
+            try {
+                currentDeckConfig = DeckConfig.fromJson(json)
+                deckOverlay?.buildFromConfig(currentDeckConfig)
+                currentMediaState?.let { deckOverlay?.updateMediaState(it) }
+                deckOverlay?.updateVolume(currentVolumeLevel, currentVolumeMuted)
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "Failed to parse deck config", e)
+            }
+        }
+    }
+
+    @Suppress("unused") // Called from JNI
+    fun onMediaStateReceived(json: String) {
+        runOnUiThread {
+            try {
+                val state = MediaState.fromJson(json, currentMediaState)
+                currentMediaState = state
+                deckOverlay?.updateMediaState(state)
+            } catch (e: Exception) {
+                android.util.Log.w(TAG, "Failed to parse media state", e)
+            }
+        }
+    }
+
+    @Suppress("unused") // Called from JNI
+    fun onVolumeStateReceived(volume: Int, muted: Boolean) {
+        runOnUiThread {
+            currentVolumeLevel = volume
+            currentVolumeMuted = muted
+            deckOverlay?.updateVolume(volume, muted)
         }
     }
 
@@ -500,4 +617,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         yFrac: Int
     )
     private external fun nativeGetStats(): LongArray
+    external fun nativeSendDeckAction(actionType: Int, slotIndex: Int)
+    external fun nativeSendVolumeChange(volume: Int, muted: Int)
 }

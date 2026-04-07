@@ -11,6 +11,7 @@ add_library(droidscreen_protocol STATIC
     src/touch.c
     src/pen.c
     src/mouse.c
+    src/deck.c
 )
 
 target_include_directories(droidscreen_protocol

@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.14)
 add_library(droidscreen_common STATIC
     src/server.cpp
     src/pipeline.cpp
+    src/deck_manager.cpp
     src/rate_controller.cpp
 )
 

@@ -26,6 +26,9 @@ add_executable(droidscreen_desktop WIN32
     src/mouse_injector_win.cpp
     src/touch_injector_win.cpp
     src/virtual_display_win.cpp
+    src/win_app_launcher.cpp
+    src/win_media_controller.cpp
+    src/win_volume_controller.cpp
 )
 
 target_include_directories(droidscreen_desktop
@@ -50,6 +53,10 @@ target_link_libraries(droidscreen_desktop
         advapi32      # Registry API
         setupapi      # SetupDi* functions (parsec-vdd)
         cfgmgr32      # CM_Get_DevNode_Status (parsec-vdd)
+        gdiplus
+        shlwapi
+        crypt32
+        ole32
 )
 
 target_compile_features(droidscreen_desktop PRIVATE cxx_std_17)

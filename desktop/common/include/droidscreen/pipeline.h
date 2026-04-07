@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "droidscreen/capturer.h"
+#include "droidscreen/deck_manager.h"
 #include "droidscreen/encoder.h"
 #include "droidscreen/mouse_injector.h"
 #include "droidscreen/server.h"
@@ -33,7 +34,7 @@ class Pipeline {
 public:
     Pipeline(Capturer* capturer, Encoder* encoder,
              TCPClient* client, TouchInjector* touch,
-             MouseInjector* mouse);
+             MouseInjector* mouse, DeckManager* deck = nullptr);
     ~Pipeline();
 
     /// Start the pipeline: perform handshake, launch threads.
@@ -49,6 +50,15 @@ public:
 
     /// Stop all threads and clean up.
     void stop();
+
+    /// Send the deck configuration to Android.
+    void send_deck_config();
+
+    /// Send the current volume state to Android.
+    void send_volume_state(uint16_t level, bool muted);
+
+    /// Send media state JSON to Android.
+    void send_media_state(const std::string& json);
 
     /// True if the pipeline is actively running.
     bool is_running() const { return running_.load(); }
@@ -93,6 +103,7 @@ private:
     TCPClient*     client_;
     TouchInjector* touch_;
     MouseInjector* mouse_;
+    DeckManager*   deck_;
 
     // --- Capture queue: newest-frame-wins (not FIFO) ---
     // Only holds the most recent frame; stale frames are dropped.
