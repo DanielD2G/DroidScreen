@@ -104,6 +104,16 @@ WGCCapturer::~WGCCapturer() {
     stop();
 }
 
+void WGCCapturer::set_target_fps(uint32_t fps) {
+    if (fps == 0) {
+        min_frame_interval_us_.store(0, std::memory_order_relaxed);
+        return;
+    }
+
+    min_frame_interval_us_.store(
+        static_cast<int64_t>(1000000ull / fps), std::memory_order_relaxed);
+}
+
 WGCCapturer::FrameSlot* WGCCapturer::acquire_frame_slot(
         uint32_t width, uint32_t height, DXGI_FORMAT format) {
     std::lock_guard<std::mutex> lock(frame_pool_mutex_);
@@ -308,9 +318,10 @@ bool WGCCapturer::init(uint32_t display_index) {
         fprintf(stderr, "[wgc] IsBorderRequired not supported on this build\n");
     }
 
-    // Disable cursor rendering in the capture (optional).
+    // Avoid cursor-only invalidations. Input is injected separately, so the
+    // cursor does not need to be baked into the video stream.
     try {
-        session.IsCursorCaptureEnabled(true);
+        session.IsCursorCaptureEnabled(false);
     } catch (...) {
         // Not available on older builds.
     }
@@ -423,9 +434,10 @@ bool WGCCapturer::init_with_monitor(HMONITOR monitor) {
         fprintf(stderr, "[wgc] IsBorderRequired not supported on this build\n");
     }
 
-    // Disable cursor rendering in the capture (optional).
+    // Avoid cursor-only invalidations. Input is injected separately, so the
+    // cursor does not need to be baked into the video stream.
     try {
-        session.IsCursorCaptureEnabled(true);
+        session.IsCursorCaptureEnabled(false);
     } catch (...) {
     }
 
@@ -448,6 +460,8 @@ bool WGCCapturer::start(std::function<void(const CapturedFrame&)> on_frame) {
 
     on_frame_ = std::move(on_frame);
     running_.store(true);
+    last_delivered_ts_us_.store(0, std::memory_order_relaxed);
+    frames_rate_limited_.store(0, std::memory_order_relaxed);
 
     // Subscribe to the FrameArrived event.
     wrt_->frame_arrived_token = wrt_->pool.FrameArrived(
@@ -502,6 +516,17 @@ void WGCCapturer::on_frame_arrived() {
     int64_t timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
         sys_relative).count();
 
+    const int64_t min_interval_us =
+        min_frame_interval_us_.load(std::memory_order_relaxed);
+    const int64_t last_delivered_us =
+        last_delivered_ts_us_.load(std::memory_order_relaxed);
+    if (min_interval_us > 0 && last_delivered_us > 0 &&
+        (timestamp_us - last_delivered_us) < min_interval_us) {
+        frames_rate_limited_.fetch_add(1, std::memory_order_relaxed);
+        frame.Close();
+        return;
+    }
+
     // Copy the captured texture to the staging texture.
     // We must release the frame as quickly as possible to avoid stalling
     // the frame pool.
@@ -535,6 +560,7 @@ void WGCCapturer::on_frame_arrived() {
 
     // Release the WGC frame immediately.
     frame.Close();
+    last_delivered_ts_us_.store(timestamp_us, std::memory_order_relaxed);
 
     // Determine if the frame is idle (WGC doesn't provide an idle flag
     // directly, so we always report not-idle; the pipeline handles
@@ -569,7 +595,9 @@ void WGCCapturer::stop() {
         // Release all WinRT objects.
         wrt_.reset();
     }
-    fprintf(stderr, "[wgc] capture stopped\n");
+    fprintf(stderr, "[wgc] capture stopped (rate-limited=%llu)\n",
+            static_cast<unsigned long long>(
+                frames_rate_limited_.load(std::memory_order_relaxed)));
 }
 
 } // namespace droidscreen
