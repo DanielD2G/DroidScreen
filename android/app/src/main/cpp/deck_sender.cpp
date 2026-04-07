@@ -7,7 +7,6 @@
 
 #include <android/log.h>
 #include <string.h>
-#include <stdlib.h>
 #include <time.h>
 
 extern "C" {
@@ -24,15 +23,14 @@ static uint32_t get_timestamp_ms(void) {
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
-int deck_action_send(int fd, int action_type, const char* tile_id) {
+int deck_action_send(int fd, int action_type, int button_id) {
     /* Build deck action */
     ds_deck_action_t action;
     memset(&action, 0, sizeof(action));
     action.action       = (uint8_t)action_type;
     action.timestamp_ms = get_timestamp_ms();
 
-    /* tile_id is the tile index as a numeric string (e.g. "0", "3"). */
-    action.button_id = tile_id ? (uint8_t)atoi(tile_id) : 0;
+    action.button_id = (button_id >= 0 && button_id <= 255) ? (uint8_t)button_id : 0;
 
     /* Serialize payload */
     uint8_t payload[DS_DECK_ACTION_SIZE];

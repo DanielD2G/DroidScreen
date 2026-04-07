@@ -38,6 +38,8 @@ class VolumeTileView(
     private var dragStartX = 0f
     private var dragStartVolume = 0
     private var isDragging = false
+    private var lastDragEndTime = 0L   // SystemClock.uptimeMillis – cooldown after drag
+    private var lastSendTime = 0L      // throttle outgoing volume messages during drag
 
     // -- Paints -----------------------------------------------------------
 
@@ -235,8 +237,13 @@ class VolumeTileView(
                         if (newVol != volume) {
                             volume = newVol
                             if (muted && volume > 0) muted = false
-                            onVolumeChange(volume, muted)
                             invalidate()
+                            // Throttle outgoing messages to ~20/sec during drag
+                            val now = android.os.SystemClock.uptimeMillis()
+                            if (now - lastSendTime >= SEND_THROTTLE_MS) {
+                                lastSendTime = now
+                                onVolumeChange(volume, muted)
+                            }
                         }
                     }
                 }
@@ -259,12 +266,17 @@ class VolumeTileView(
                         onVolumeChange(volume, muted)
                         invalidate()
                     }
+                } else {
+                    // Drag ended: always send final value (may have been throttled)
+                    onVolumeChange(volume, muted)
                 }
                 isDragging = false
+                lastDragEndTime = android.os.SystemClock.uptimeMillis()
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
                 isDragging = false
+                lastDragEndTime = android.os.SystemClock.uptimeMillis()
                 return true
             }
         }
@@ -276,6 +288,12 @@ class VolumeTileView(
     // ------------------------------------------------------------------
 
     fun updateVolume(volume: Int, muted: Boolean) {
+        // Ignore incoming state while user is actively dragging or within
+        // the cooldown window after release — prevents the desktop's polling
+        // echo from fighting with the user's adjustment.
+        if (isDragging) return
+        if (android.os.SystemClock.uptimeMillis() - lastDragEndTime < DRAG_COOLDOWN_MS) return
+
         this.volume = volume.coerceIn(0, MAX_VOLUME)
         this.muted = muted
         invalidate()
@@ -287,6 +305,9 @@ class VolumeTileView(
 
     companion object {
         const val MAX_VOLUME = 65535
+
+        private const val DRAG_COOLDOWN_MS = 500L  // ignore incoming state after drag
+        private const val SEND_THROTTLE_MS = 50L   // max ~20 sends/sec during drag
 
         private const val TRACK_HEIGHT_DP = 6f
         private const val THUMB_RADIUS_DP = 8f

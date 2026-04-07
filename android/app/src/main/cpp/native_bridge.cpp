@@ -833,19 +833,14 @@ Java_com_droidscreen_app_MainActivity_nativeGetStats(
 
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendDeckAction(
-        JNIEnv* env, jobject /*thiz*/,
-        jint actionType, jstring tileId) {
+        JNIEnv* /*env*/, jobject /*thiz*/,
+        jint actionType, jint slotIndex) {
 
     if (g_client_fd < 0) {
         return;
     }
 
-    const char* tile_str = env->GetStringUTFChars(tileId, nullptr);
-    if (!tile_str) return;
-
-    deck_action_send(g_client_fd, actionType, tile_str);
-
-    env->ReleaseStringUTFChars(tileId, tile_str);
+    deck_action_send(g_client_fd, actionType, slotIndex);
 }
 
 JNIEXPORT void JNICALL

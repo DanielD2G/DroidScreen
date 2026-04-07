@@ -456,8 +456,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         controlsContainer.visibility = View.VISIBLE
 
         val overlay = DeckOverlayView(this).apply {
-            onDeckAction = { actionType, tileId ->
-                nativeSendDeckAction(actionType, tileId)
+            onDeckAction = { actionType, slotIndex ->
+                nativeSendDeckAction(actionType, slotIndex)
                 scheduleDeckAutoHide()
             }
             onVolumeChange = { volume, muted ->
@@ -617,6 +617,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         yFrac: Int
     )
     private external fun nativeGetStats(): LongArray
-    external fun nativeSendDeckAction(actionType: Int, tileId: String)
+    external fun nativeSendDeckAction(actionType: Int, slotIndex: Int)
     external fun nativeSendVolumeChange(volume: Int, muted: Int)
 }

@@ -23,7 +23,7 @@ import android.widget.FrameLayout
  */
 class DeckOverlayView(context: Context) : FrameLayout(context) {
 
-    var onDeckAction: ((actionType: Int, tileId: String) -> Unit)? = null
+    var onDeckAction: ((actionType: Int, slotIndex: Int) -> Unit)? = null
     var onVolumeChange: ((volume: Int, muted: Boolean) -> Unit)? = null
     var onDismiss: (() -> Unit)? = null
 
@@ -130,19 +130,18 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
         mediaTileView = null
         volumeTileView = null
 
-        for ((index, tile) in config.tiles.withIndex()) {
-            val tileIndex = index
+        for (tile in config.tiles) {
             val view: View = when (tile) {
                 is TileConfig.AppTile -> {
                     val v = DeckTileView(context, tile) { actionType, _ ->
-                        onDeckAction?.invoke(actionType, tileIndex.toString())
+                        onDeckAction?.invoke(actionType, tile.slotIndex)
                     }
                     appTileViews.add(v)
                     v
                 }
                 is TileConfig.MediaTile -> {
                     val v = MediaTileView(context, tile) { actionType, _ ->
-                        onDeckAction?.invoke(actionType, tileIndex.toString())
+                        onDeckAction?.invoke(actionType, tile.slotIndex)
                     }
                     mediaTileView = v
                     v

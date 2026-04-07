@@ -15,11 +15,9 @@ extern "C" {
  * Serialize and send a deck action over the TCP connection.
  * Sends DS_HEADER_SIZE + DS_DECK_ACTION_SIZE bytes.
  *
- * tile_id is converted to a button_id (max 11 chars + NUL).
- *
  * Returns 0 on success, -1 on error.
  */
-int deck_action_send(int fd, int action_type, const char* tile_id);
+int deck_action_send(int fd, int action_type, int button_id);
 
 /*
  * Serialize and send a volume change over the TCP connection.
