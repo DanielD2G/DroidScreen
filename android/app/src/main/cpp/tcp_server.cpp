@@ -104,8 +104,9 @@ void tcp_set_nodelay(int fd) {
     int flag = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
-    /* Larger socket buffers for burst traffic (512 KB each) */
-    int bufsize = 524288;
+    /* Moderate socket buffers — large enough for keyframes, small enough
+     * to avoid OS-level queuing latency on USB connections (128 KB each). */
+    int bufsize = 131072;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 

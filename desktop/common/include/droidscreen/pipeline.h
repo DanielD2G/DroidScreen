@@ -118,7 +118,7 @@ private:
         uint8_t flags;
         int64_t encode_done_us;   // timestamp when VT callback fired
     };
-    static constexpr size_t kMaxSendQueueSize = 8;
+    static constexpr size_t kMaxSendQueueSize = 4;
     std::deque<SendPacket> send_queue_;
     std::mutex send_mutex_;
     std::condition_variable send_cv_;
@@ -146,8 +146,8 @@ private:
 
     // Maximum interval between frames during idle periods (microseconds).
     // When no new capture arrives within this interval, the last frame is
-    // re-encoded to keep the decoder pipeline warm.  Default: 100 ms = 10 fps min.
-    static constexpr int64_t kMaxIdleIntervalUs = 100000;
+    // re-encoded to keep the decoder pipeline warm.  33 ms ≈ 30 fps min.
+    static constexpr int64_t kMaxIdleIntervalUs = 33333;
 
     // Timestamp of last ping sent, for RTT calculation.
     std::atomic<int64_t> ping_sent_us_{0};

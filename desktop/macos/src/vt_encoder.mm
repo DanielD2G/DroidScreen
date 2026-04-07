@@ -121,13 +121,15 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
         kVTCompressionPropertyKey_AverageBitRate, br);
     CFRelease(br);
 
-    // Data rate limits: allow 1.5x burst over 1 second.
-    int64_t byte_limit = (int64_t)(bitrate_bps * 1.5 / 8);
-    int64_t duration_s = 1;
+    // Data rate limits: allow 1.5x burst over a tight 100ms window.
+    // A short window prevents the encoder from front-loading large frames
+    // and then going silent — keeps output uniform for low-latency streaming.
+    int64_t byte_limit = (int64_t)(bitrate_bps * 1.5 * 0.1 / 8);
+    double duration_s = 0.1;
     CFNumberRef limit_bytes = CFNumberCreate(kCFAllocatorDefault,
         kCFNumberSInt64Type, &byte_limit);
     CFNumberRef limit_dur = CFNumberCreate(kCFAllocatorDefault,
-        kCFNumberSInt64Type, &duration_s);
+        kCFNumberFloat64Type, &duration_s);
     CFNumberRef limits[] = { limit_bytes, limit_dur };
     CFArrayRef limit_array = CFArrayCreate(kCFAllocatorDefault,
         (const void**)limits, 2, &kCFTypeArrayCallBacks);

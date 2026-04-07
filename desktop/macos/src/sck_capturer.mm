@@ -182,7 +182,7 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
     config.width  = width_;
     config.height = height_;
     config.minimumFrameInterval = CMTimeMake(1, target_fps > 0 ? target_fps : 60);
-    config.queueDepth = 4;
+    config.queueDepth = 3;  /* reduced from 4 — less buffering, still reliable delivery */
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.showsCursor = YES;
 
@@ -271,7 +271,7 @@ bool SCKCapturer::init(uint32_t display_index) {
     config.width  = cap_w;
     config.height = cap_h;
     config.minimumFrameInterval = CMTimeMake(1, 60);  // 60 fps
-    config.queueDepth = 4;
+    config.queueDepth = 3;  /* reduced from 4 — less buffering, still reliable delivery */
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.showsCursor = YES;
 

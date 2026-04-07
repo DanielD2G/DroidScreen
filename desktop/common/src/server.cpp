@@ -66,8 +66,9 @@ bool TCPClient::connect(uint16_t port) {
     setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 #endif
 
-    // Set send and receive buffer sizes to 512 KB for throughput headroom.
-    int buf_size = 512 * 1024;  // 524288
+    // Moderate socket buffers — enough for keyframes, small enough to
+    // avoid OS-level queuing latency on USB connections (128 KB each).
+    int buf_size = 128 * 1024;  // 131072
 #ifdef _WIN32
     setsockopt(fd_, SOL_SOCKET, SO_SNDBUF,
                reinterpret_cast<const char*>(&buf_size), sizeof(buf_size));
