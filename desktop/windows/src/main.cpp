@@ -20,13 +20,13 @@
 #define NOMINMAX
 #endif
 
+#include <winsock2.h>
+#include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <dxgi1_2.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include <windows.h>
-#include <winsock2.h>
 #include <wrl/client.h>
 
 #include "droidscreen/deck_manager.h"
