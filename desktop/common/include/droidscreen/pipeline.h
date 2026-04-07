@@ -69,6 +69,7 @@ public:
     uint64_t frames_captured() const { return frames_captured_.load(); }
     uint64_t frames_dropped() const { return frames_dropped_.load(); }
     uint64_t frames_idle() const { return frames_idle_.load(); }
+    uint64_t frames_idle_resent() const { return frames_idle_resent_.load(); }
     uint64_t bytes_sent() const { return bytes_sent_.load(); }
     int64_t last_rtt_us() const { return last_rtt_us_.load(); }
     int64_t last_encode_us() const { return last_encode_us_.load(); }
@@ -137,10 +138,16 @@ private:
     std::atomic<uint64_t> frames_captured_{0};
     std::atomic<uint64_t> frames_dropped_{0};
     std::atomic<uint64_t> frames_idle_{0};
+    std::atomic<uint64_t> frames_idle_resent_{0};
     std::atomic<uint64_t> bytes_sent_{0};
     std::atomic<int64_t>  last_rtt_us_{0};
     std::atomic<int64_t>  last_encode_us_{0};
     std::atomic<int64_t>  last_send_us_{0};
+
+    // Maximum interval between frames during idle periods (microseconds).
+    // When no new capture arrives within this interval, the last frame is
+    // re-encoded to keep the decoder pipeline warm.  Default: 100 ms = 10 fps min.
+    static constexpr int64_t kMaxIdleIntervalUs = 100000;
 
     // Timestamp of last ping sent, for RTT calculation.
     std::atomic<int64_t> ping_sent_us_{0};

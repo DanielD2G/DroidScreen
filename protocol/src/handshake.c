@@ -45,20 +45,22 @@ size_t ds_handshake_req_serialize(uint8_t *buf, const ds_handshake_req_t *req)
     buf[7] = req->codec;
     write_le32(buf + 8, req->max_bitrate_kbps);
     buf[12] = req->touch_enabled;
-    memset(buf + 13, 0, 7);
+    write_le32(buf + 13, req->frame_interval_us);
+    memset(buf + 17, 0, 3);
     return DS_HANDSHAKE_REQ_SIZE;
 }
 
 size_t ds_handshake_req_deserialize(const uint8_t *buf, ds_handshake_req_t *req)
 {
-    req->protocol_version = read_le16(buf + 0);
-    req->width            = read_le16(buf + 2);
-    req->height           = read_le16(buf + 4);
-    req->fps              = buf[6];
-    req->codec            = buf[7];
-    req->max_bitrate_kbps = read_le32(buf + 8);
-    req->touch_enabled    = buf[12];
-    memcpy(req->reserved, buf + 13, 7);
+    req->protocol_version  = read_le16(buf + 0);
+    req->width             = read_le16(buf + 2);
+    req->height            = read_le16(buf + 4);
+    req->fps               = buf[6];
+    req->codec             = buf[7];
+    req->max_bitrate_kbps  = read_le32(buf + 8);
+    req->touch_enabled     = buf[12];
+    req->frame_interval_us = read_le32(buf + 13);
+    memcpy(req->reserved, buf + 17, 3);
     return DS_HANDSHAKE_REQ_SIZE;
 }
 

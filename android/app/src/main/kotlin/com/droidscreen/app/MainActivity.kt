@@ -427,10 +427,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
             val totalFed = stats[2]
             val errors = stats[3]
+            val skipped = if (stats.size > 6) stats[6] else 0L
             val stability = if (totalFed > 0) {
                 ((1.0 - (errors.toDouble() / totalFed)).coerceIn(0.0, 1.0) * 100).toInt()
             } else 100
-            statsStability.text = String.format("Stability: %d%%", stability)
+            statsStability.text = String.format("Stability: %d%% (skip: %d)", stability, skipped)
         }
 
         lastBytesReceived = stats[0]

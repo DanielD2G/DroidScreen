@@ -37,7 +37,8 @@ typedef struct {
     uint8_t  codec;
     uint32_t max_bitrate_kbps;
     uint8_t  touch_enabled;
-    uint8_t  reserved[7];
+    uint32_t frame_interval_us;  /* 0 = derive from fps field; >0 = precise interval */
+    uint8_t  reserved[3];
 } ds_handshake_req_t;
 #pragma pack(pop)
 

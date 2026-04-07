@@ -79,6 +79,7 @@ static std::atomic<uint64_t> g_stats_frames_fed{0};
 static std::atomic<uint64_t> g_stats_feed_errors{0};
 static std::atomic<int64_t>  g_stats_last_frame_arrival_us{0};
 static std::atomic<int64_t>  g_stats_frame_jitter_us{0};
+static std::atomic<uint64_t> g_stats_frames_skipped{0};
 
 /* ---- JNI callback state ---- */
 static JavaVM*           g_jvm      = nullptr;
@@ -272,11 +273,17 @@ static void* recv_thread_func(void* /*arg*/) {
             g_client_fd = -1;
             continue;
         }
-        LOGI("recv_thread: handshake req: %ux%u @ %u fps, codec=%u",
-             req.width, req.height, req.fps, req.codec);
+        LOGI("recv_thread: handshake req: %ux%u @ %u fps, codec=%u, interval=%u us",
+             req.width, req.height, req.fps, req.codec, req.frame_interval_us);
 
-        uint32_t fps = req.fps > 0 ? req.fps : 60;
-        g_stream_frame_interval_us.store(1000000u / fps, std::memory_order_release);
+        /* Prefer the precise frame_interval_us when available (non-zero).
+         * Old desktops zero-fill reserved bytes → falls back to 1000000/fps. */
+        uint32_t interval_us = req.frame_interval_us;
+        if (interval_us == 0) {
+            uint32_t fps = req.fps > 0 ? req.fps : 60;
+            interval_us = 1000000u / fps;
+        }
+        g_stream_frame_interval_us.store(interval_us, std::memory_order_release);
 
         /* Configure decoder with the negotiated resolution */
         if (g_decoder) {
@@ -454,6 +461,7 @@ static void* recv_thread_func(void* /*arg*/) {
         g_stats_feed_errors.store(0, std::memory_order_relaxed);
         g_stats_last_frame_arrival_us.store(0, std::memory_order_relaxed);
         g_stats_frame_jitter_us.store(0, std::memory_order_relaxed);
+        g_stats_frames_skipped.store(0, std::memory_order_relaxed);
 
         /* Give decode thread time to notice and stop touching the decoder */
         usleep(5000);  /* 5ms — decode thread polls at 100us */
@@ -492,6 +500,15 @@ static void* recv_thread_func(void* /*arg*/) {
 /* ---- Decode thread ----
  * Reads NAL units from ring buffer and feeds them to MediaCodec decoder.
  * Survives reconnections — pauses when decoder is unconfigured.
+ *
+ * Burst processing with skip-to-newest:
+ *   1. Drain decoder output (render queue depth = 1).
+ *   2. Read ALL pending messages from ring buffer in one burst.
+ *      - Config NALs (SPS/PPS) are always fed immediately.
+ *      - Stale video NALs are skipped when newer ones are queued.
+ *      - Only the newest video NAL is fed to the decoder.
+ *   3. Drain again after the burst feed.
+ *   4. Brief sleep only when the ring buffer was empty.
  */
 static void* decode_thread_func(void* /*arg*/) {
     /* Set high priority */
@@ -523,6 +540,8 @@ static void* decode_thread_func(void* /*arg*/) {
     uint32_t frames_fed = 0;
     uint32_t frames_rendered = 0;
     uint32_t feed_errors = 0;
+    uint32_t frames_skipped = 0;
+    uint32_t last_logged_fed = 0;  /* guard against repeated log lines */
     struct timespec ts_start, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
@@ -534,75 +553,94 @@ static void* decode_thread_func(void* /*arg*/) {
             frames_fed = 0;
             frames_rendered = 0;
             feed_errors = 0;
+            frames_skipped = 0;
+            last_logged_fed = 0;
             pts_us = 0;
             clock_gettime(CLOCK_MONOTONIC, &ts_start);
             continue;
         }
 
-        /* Always try to drain first — output may be ready even without new input */
+        /* 1. Drain output — may have frames ready from previous feed */
         int r = decoder_drain(g_decoder);
         if (r > 0) {
             frames_rendered += r;
             g_stats_frames_decoded.fetch_add(r, std::memory_order_relaxed);
         }
 
-        /* Try to read a NAL unit from the ring buffer */
-        size_t msg_len = ring_buffer_read_message(g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
-        if (msg_len == 0) {
-            usleep(100); /* 100us — 5x faster polling than before */
-            continue;
+        /* 2. Burst-read all available messages from ring buffer.
+         *    Feed ALL NALs to the decoder — never skip video frames at
+         *    the input level.  H.264 P-frames depend on previous reference
+         *    frames; skipping any input NAL corrupts the reference chain
+         *    and produces visible glitches.
+         *
+         *    Latency is controlled at the OUTPUT level: decoder_drain()
+         *    already implements render-queue-depth=1 (Moonlight strategy),
+         *    rendering only the newest decoded frame and dropping older ones. */
+        bool any_read = false;
+
+        while (g_running.load(std::memory_order_acquire)) {
+            size_t msg_len = ring_buffer_read_message(
+                g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
+            if (msg_len < 2) {  /* minimum: 1 byte flags + 1 byte NAL */
+                break;
+            }
+            any_read = true;
+
+            uint8_t video_flags = nal_buf[0];
+            uint8_t* video_data = nal_buf + 1;
+            size_t nal_len = msg_len - 1;
+
+            uint32_t mc_flags = 0;
+            int is_config = 0;
+            ds_frame_parse_flags(video_flags, nullptr, &is_config);
+
+            if (is_config) {
+                mc_flags = 2; /* BUFFER_FLAG_CODEC_CONFIG */
+                sps_patch_constraints(video_data, nal_len);
+            }
+
+            int ret = decoder_feed(g_decoder, video_data, nal_len,
+                                   pts_us, mc_flags);
+            if (ret == 0) {
+                frames_fed++;
+                g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                feed_errors++;
+                g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            /* Advance PTS only for non-config NALs */
+            if (!is_config) {
+                pts_us += g_stream_frame_interval_us.load(
+                    std::memory_order_acquire);
+            }
         }
 
-        if (msg_len < 1) {
-            continue;
+        /* 3. Drain again after the burst feed */
+        if (any_read) {
+            r = decoder_drain(g_decoder);
+            if (r > 0) {
+                frames_rendered += r;
+                g_stats_frames_decoded.fetch_add(r, std::memory_order_relaxed);
+            }
         }
 
-        uint8_t video_flags = nal_buf[0];
-        uint8_t* video_data = nal_buf + 1;
-        size_t nal_len = msg_len - 1;
-        if (nal_len == 0) {
-            continue;
+        /* 4. Brief sleep only when the ring buffer was empty */
+        if (!any_read) {
+            usleep(50); /* 50us — reduced from 100us for tighter polling */
         }
 
-        /* Use the transport flags, not first-NAL heuristics.
-         * Windows keyframes may begin with SPS/PPS + IDR in one packet. */
-        uint32_t flags = 0;
-        int is_config = 0;
-        ds_frame_parse_flags(video_flags, nullptr, &is_config);
-
-        if (is_config) {
-            flags = 2; /* BUFFER_FLAG_CODEC_CONFIG */
-
-            /* Patch SPS constraint flags to signal no reordering needed. */
-            sps_patch_constraints(video_data, nal_len);
-        }
-
-        int ret = decoder_feed(g_decoder, video_data, nal_len, pts_us, flags);
-        if (ret == 0) {
-            frames_fed++;
-            g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            feed_errors++;
-            g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
-        }
-        pts_us += g_stream_frame_interval_us.load(std::memory_order_acquire);
-
-        /* Immediately drain again after feeding */
-        r = decoder_drain(g_decoder);
-        if (r > 0) {
-            frames_rendered += r;
-            g_stats_frames_decoded.fetch_add(r, std::memory_order_relaxed);
-        }
-
-        /* Log stats every ~2 seconds */
-        if ((frames_fed % 120) == 0 && frames_fed > 0) {
+        /* Log stats every ~120 fed frames (avoid repeated logs when idle) */
+        if ((frames_fed % 120) == 0 && frames_fed > 0
+                && frames_fed != last_logged_fed) {
+            last_logged_fed = frames_fed;
             clock_gettime(CLOCK_MONOTONIC, &ts_now);
             double elapsed = (ts_now.tv_sec - ts_start.tv_sec)
                            + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
             size_t ring_used = ring_buffer_available_read(g_ring_buf);
-            LOGI("decode: fed=%u rendered=%u err=%u | "
+            LOGI("decode: fed=%u rendered=%u skip=%u err=%u | "
                  "%.1f fed/s %.1f render/s | ring=%zu bytes",
-                 frames_fed, frames_rendered, feed_errors,
+                 frames_fed, frames_rendered, frames_skipped, feed_errors,
                  frames_fed / elapsed, frames_rendered / elapsed,
                  ring_used);
         }
@@ -818,16 +856,17 @@ Java_com_droidscreen_app_MainActivity_nativeSendMouse(
 JNIEXPORT jlongArray JNICALL
 Java_com_droidscreen_app_MainActivity_nativeGetStats(
         JNIEnv* env, jobject /*thiz*/) {
-    jlong stats[6];
+    jlong stats[7];
     stats[0] = static_cast<jlong>(g_stats_bytes_received.load(std::memory_order_relaxed));
     stats[1] = static_cast<jlong>(g_stats_frames_decoded.load(std::memory_order_relaxed));
     stats[2] = static_cast<jlong>(g_stats_frames_fed.load(std::memory_order_relaxed));
     stats[3] = static_cast<jlong>(g_stats_feed_errors.load(std::memory_order_relaxed));
     stats[4] = static_cast<jlong>(g_stats_frame_jitter_us.load(std::memory_order_relaxed));
     stats[5] = static_cast<jlong>(g_stream_frame_interval_us.load(std::memory_order_relaxed));
+    stats[6] = static_cast<jlong>(g_stats_frames_skipped.load(std::memory_order_relaxed));
 
-    jlongArray result = env->NewLongArray(6);
-    env->SetLongArrayRegion(result, 0, 6, stats);
+    jlongArray result = env->NewLongArray(7);
+    env->SetLongArrayRegion(result, 0, 7, stats);
     return result;
 }
 

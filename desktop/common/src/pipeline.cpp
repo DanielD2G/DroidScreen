@@ -68,6 +68,8 @@ bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
   req.codec = DS_CODEC_H264;
   req.max_bitrate_kbps = bitrate_kbps;
   req.touch_enabled = touch_enabled ? 1 : 0;
+  req.frame_interval_us =
+      (fps > 0) ? static_cast<uint32_t>(1000000.0 / fps + 0.5) : 16667;
 
   uint8_t req_buf[DS_HANDSHAKE_REQ_SIZE];
   ds_handshake_req_serialize(req_buf, &req);
@@ -145,6 +147,7 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   frames_captured_.store(0);
   frames_dropped_.store(0);
   frames_idle_.store(0);
+  frames_idle_resent_.store(0);
   bytes_sent_.store(0);
   last_encode_us_.store(0);
   last_send_us_.store(0);
@@ -254,8 +257,11 @@ void Pipeline::stop() {
   touch_->shutdown();
   mouse_->shutdown();
 
-  fprintf(stderr, "[pipeline] stopped (encoded %llu frames, sent %llu bytes)\n",
+  fprintf(stderr,
+          "[pipeline] stopped (encoded %llu frames, idle_resent %llu, "
+          "sent %llu bytes)\n",
           static_cast<unsigned long long>(frames_encoded_.load()),
+          static_cast<unsigned long long>(frames_idle_resent_.load()),
           static_cast<unsigned long long>(bytes_sent_.load()));
 }
 
@@ -264,87 +270,116 @@ void Pipeline::stop() {
 // Pops the newest frame from capture_queue_ and submits to encoder.
 // The VT output callback fires asynchronously and pushes to send_queue_.
 // We NEVER do TCP I/O here.
+//
+// Idle frame re-sending: when no new frame arrives within kMaxIdleIntervalUs,
+// the last captured frame is re-encoded to keep the decoder pipeline warm.
+// This prevents the "cold decoder" lag that occurs after idle periods
+// (e.g., when typing in a mostly-static text editor).
 // --------------------------------------------------------------------------
 void Pipeline::encode_loop() {
   fprintf(stderr, "[encode] thread started\n");
 
+  // Retained copy of the last non-idle frame for idle re-sending.
+  // Kept alive until the next non-idle frame arrives or the pipeline stops.
+  CapturedFrame last_frame{};
+  last_frame.native_handle = nullptr;
+  last_frame.release_fn = nullptr;
+
+  auto on_packet = [this](const EncodedPacket &pkt, int64_t t_enc_start) {
+    int64_t t_enc_end = now_us();
+    last_encode_us_.store(t_enc_end - t_enc_start);
+
+    uint8_t flags = 0;
+    if (pkt.is_keyframe)
+      flags |= DS_FLAG_KEYFRAME;
+    if (pkt.is_config)
+      flags |= DS_FLAG_CONFIG;
+
+    SendPacket sp;
+    sp.data.assign(pkt.data, pkt.data + pkt.size);
+    sp.flags = flags;
+    sp.encode_done_us = t_enc_end;
+
+    {
+      std::unique_lock<std::mutex> lock(send_mutex_);
+      send_cv_.wait(lock, [this] {
+        return send_queue_.size() < kMaxSendQueueSize || !running_.load();
+      });
+      if (!running_.load())
+        return;
+      send_queue_.push_back(std::move(sp));
+      send_cv_.notify_one();
+    }
+
+    frames_encoded_.fetch_add(1);
+  };
+
   while (running_.load()) {
     CapturedFrame frame;
+    bool got_new_frame = false;
 
-    // Wait for a frame in the capture queue.
+    // Timed wait: wake on a new frame or after kMaxIdleIntervalUs.
     {
       std::unique_lock<std::mutex> lock(capture_mutex_);
-      capture_cv_.wait(
-          lock, [this] { return !capture_queue_.empty() || !running_.load(); });
+      got_new_frame = capture_cv_.wait_for(
+          lock, std::chrono::microseconds(kMaxIdleIntervalUs),
+          [this] { return !capture_queue_.empty() || !running_.load(); });
+
       if (!running_.load())
         break;
 
-      // Take the NEWEST frame, drop everything older.
-      frame = capture_queue_.back();
-      capture_queue_.pop_back();
+      if (!capture_queue_.empty()) {
+        got_new_frame = true;
+        frame = capture_queue_.back();
+        capture_queue_.pop_back();
 
-      // Drop any remaining stale frames.
-      while (!capture_queue_.empty()) {
-        auto &old = capture_queue_.front();
-        release_captured_frame(old);
-        capture_queue_.pop_front();
-        frames_dropped_.fetch_add(1);
+        while (!capture_queue_.empty()) {
+          auto &old = capture_queue_.front();
+          release_captured_frame(old);
+          capture_queue_.pop_front();
+          frames_dropped_.fetch_add(1);
+        }
+      } else {
+        got_new_frame = false;
       }
     }
 
-    int64_t t_enc_start = now_us();
+    if (got_new_frame) {
+      // ---- Normal path: encode the new frame ----
+      int64_t t_enc_start = now_us();
+      bool ok = encoder_->encode(
+          frame.native_handle, frame.timestamp_us,
+          [&on_packet, t_enc_start](const EncodedPacket &pkt) {
+            on_packet(pkt, t_enc_start);
+          });
+      if (!ok) {
+        fprintf(stderr, "[encode] encode submit failed\n");
+      }
 
-    // The callback pushes encoded packets into send_queue_ instead
-    // of sending over TCP. This is the critical change: the VT
-    // internal thread is never blocked by a slow socket.
-    //
-    // CVPixelBuffer lifetime: The VT encoder retains its own
-    // reference via sourceFrameRefcon and releases it in the
-    // output callback. We release the capturer's retain below,
-    // right after encode() returns.
-    bool ok = encoder_->encode(
-        frame.native_handle, frame.timestamp_us,
-        [this, t_enc_start](const EncodedPacket &pkt) {
-          int64_t t_enc_end = now_us();
-          last_encode_us_.store(t_enc_end - t_enc_start);
-
-          uint8_t flags = 0;
-          if (pkt.is_keyframe)
-            flags |= DS_FLAG_KEYFRAME;
-          if (pkt.is_config)
-            flags |= DS_FLAG_CONFIG;
-
-          // Copy the encoded data into a self-contained packet.
-          SendPacket sp;
-          sp.data.assign(pkt.data, pkt.data + pkt.size);
-          sp.flags = flags;
-          sp.encode_done_us = t_enc_end;
-
-          // Push to send queue. Never drop encoded packets: losing H.264
-          // access units causes visible corruption until the next keyframe.
-          // Backpressure here is preferable; raw-frame dropping already
-          // happens upstream in capture_queue_.
-          {
-            std::unique_lock<std::mutex> lock(send_mutex_);
-            send_cv_.wait(lock, [this] {
-              return send_queue_.size() < kMaxSendQueueSize || !running_.load();
+      // Keep this frame alive for future idle re-sends.
+      // Release the previous last_frame, then take ownership of the new one.
+      release_captured_frame(last_frame);
+      last_frame = frame;
+      // Do NOT release frame — it lives on as last_frame.
+    } else {
+      // ---- Idle path: re-encode the last frame to keep decoder warm ----
+      if (last_frame.native_handle) {
+        int64_t t_enc_start = now_us();
+        bool ok = encoder_->encode(
+            last_frame.native_handle, t_enc_start,
+            [&on_packet, t_enc_start](const EncodedPacket &pkt) {
+              on_packet(pkt, t_enc_start);
             });
-            if (!running_.load()) {
-              return;
-            }
-            send_queue_.push_back(std::move(sp));
-            send_cv_.notify_one();
-          }
-
-          frames_encoded_.fetch_add(1);
-        });
-
-    if (!ok) {
-      fprintf(stderr, "[encode] encode submit failed\n");
+        if (!ok) {
+          fprintf(stderr, "[encode] idle re-encode failed\n");
+        }
+        frames_idle_resent_.fetch_add(1);
+      }
     }
-
-    release_captured_frame(frame);
   }
+
+  // Cleanup: release the retained last frame.
+  release_captured_frame(last_frame);
 
   fprintf(stderr, "[encode] thread exiting\n");
 }

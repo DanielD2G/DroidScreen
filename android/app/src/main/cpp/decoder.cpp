@@ -33,6 +33,7 @@ struct DecoderContext {
     AMediaCodec  *codec;
     ANativeWindow *window;
     bool          configured;
+    DecoderRenderMode render_mode;
 };
 
 DecoderContext* decoder_create(ANativeWindow *window) {
@@ -48,9 +49,10 @@ DecoderContext* decoder_create(ANativeWindow *window) {
         return nullptr;
     }
 
-    ctx->codec      = codec;
-    ctx->window     = window;
-    ctx->configured = false;
+    ctx->codec       = codec;
+    ctx->window      = window;
+    ctx->configured  = false;
+    ctx->render_mode = RENDER_MODE_LOWEST_LATENCY;
 
     LOGI("decoder_create: codec created successfully");
     return ctx;
@@ -145,6 +147,14 @@ int decoder_feed(DecoderContext *ctx, const uint8_t *nal_data, size_t nal_len,
     return 0;
 }
 
+void decoder_set_render_mode(DecoderContext *ctx, DecoderRenderMode mode) {
+    if (ctx) {
+        ctx->render_mode = mode;
+        LOGI("decoder_set_render_mode: %s",
+             mode == RENDER_MODE_LOWEST_LATENCY ? "LOWEST_LATENCY" : "SMOOTH");
+    }
+}
+
 int decoder_drain(DecoderContext *ctx) {
     if (!ctx || !ctx->configured) {
         return 0;
@@ -153,10 +163,14 @@ int decoder_drain(DecoderContext *ctx) {
     int rendered = 0;
     AMediaCodecBufferInfo info;
 
-    /* Moonlight strategy: drain ALL available output buffers.
-     * Keep only the LATEST one for rendering — drop older frames
-     * without rendering them (release with render=false).
-     * This ensures we always display the newest decoded frame. */
+    /* ---- Render queue depth = 1 policy (Moonlight strategy) ----
+     *
+     * Drain ALL available output buffers in a non-blocking loop.
+     * Keep only the LATEST one for rendering — drop every older frame
+     * by releasing it with render=false.
+     *
+     * This guarantees that the displayed frame is always the most
+     * recently decoded one, minimising decode-to-display latency. */
     ssize_t last_idx = -1;
 
     for (;;) {
@@ -193,7 +207,18 @@ int decoder_drain(DecoderContext *ctx) {
 
     /* Render only the newest frame */
     if (last_idx >= 0) {
-        AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, true);
+        if (ctx->render_mode == RENDER_MODE_LOWEST_LATENCY) {
+            /* Timestamp 0 = present at the earliest possible VSync.
+             * Functionally identical to releaseOutputBuffer(true) but
+             * uses the timestamp-based path which is ready for future
+             * VSync-aligned presentation (RENDER_MODE_SMOOTH). */
+            AMediaCodec_releaseOutputBufferAtTime(
+                ctx->codec, (size_t)last_idx, 0);
+        } else {
+            /* RENDER_MODE_SMOOTH (future): present at target VSync.
+             * For now, fall back to immediate rendering. */
+            AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, true);
+        }
         rendered = 1;
     }
 

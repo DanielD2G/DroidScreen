@@ -148,6 +148,40 @@ static inline size_t ring_buffer_read_message(ring_buffer *rb,
 }
 
 /**
+ * Return the number of complete messages available to read.
+ * Walks the buffer counting [u32 length][payload] frames without consuming.
+ * O(n) in the number of messages but each iteration is cheap (no data copy).
+ */
+static inline size_t ring_buffer_messages_pending(ring_buffer *rb) {
+    size_t avail = ring_buffer_available_read(rb);
+    if (avail < sizeof(uint32_t)) return 0;
+
+    size_t r = RB_ATOMIC_LOAD(&rb->read_pos, RB_MO_ACQUIRE);
+    size_t mask = rb->capacity - 1;
+    size_t count = 0;
+    size_t consumed = 0;
+
+    while (consumed + sizeof(uint32_t) <= avail) {
+        uint8_t len_bytes[4];
+        for (size_t i = 0; i < 4; i++)
+            len_bytes[i] = rb->data[(r + consumed + i) & mask];
+
+        uint32_t msg_len = (uint32_t)len_bytes[0]
+                         | ((uint32_t)len_bytes[1] << 8)
+                         | ((uint32_t)len_bytes[2] << 16)
+                         | ((uint32_t)len_bytes[3] << 24);
+
+        size_t total = sizeof(uint32_t) + msg_len;
+        if (consumed + total > avail) break;
+
+        consumed += total;
+        count++;
+    }
+
+    return count;
+}
+
+/**
  * Reset the ring buffer, discarding all data.
  * Only safe when no concurrent reads/writes are happening
  * (e.g., between client sessions when producer has stopped).
