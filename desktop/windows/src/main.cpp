@@ -122,7 +122,7 @@ static constexpr int kBitrateCount = sizeof(kBitrates) / sizeof(kBitrates[0]);
 // ============================================================================
 
 struct Settings {
-  uint32_t fps = 60;
+  uint32_t fps = 30;
   uint32_t bitrate_kbps = 15000;
   uint32_t display = 0;
   uint16_t port = 38271;
@@ -1790,6 +1790,7 @@ static void connect_sync() {
     g_app.isBusy.store(false);
     return;
   }
+  g_app.capturer->set_target_fps(settings.fps);
 
   uint32_t cap_w = g_app.capturer->width();
   uint32_t cap_h = g_app.capturer->height();
@@ -2120,11 +2121,26 @@ static void on_stats_timer() {
   }
 
   uint64_t enc = pl->frames_encoded();
+  uint64_t cap = pl->frames_captured();
+  uint64_t drop = pl->frames_dropped();
+  uint64_t idle = pl->frames_idle();
   uint64_t byt = pl->bytes_sent();
   int64_t rtt = pl->last_rtt_us();
+  int64_t enc_us = pl->last_encode_us();
+  int64_t send_us = pl->last_send_us();
+  size_t cap_q = pl->capture_queue_depth();
+  size_t send_q = pl->send_queue_depth();
+  uint64_t rate_limited =
+      g_app.capturer ? g_app.capturer->frames_rate_limited() : 0;
 
-  log_msg("[Stats] encoded=%llu bytes=%llu rtt=%lld us",
-          (unsigned long long)enc, (unsigned long long)byt, (long long)rtt);
+  log_msg(
+      "[Stats] captured=%llu encoded=%llu dropped=%llu idle=%llu "
+      "rate_limited=%llu capture_q=%zu send_q=%zu encode=%lld us "
+      "send=%lld us bytes=%llu rtt=%lld us",
+      (unsigned long long)cap, (unsigned long long)enc,
+      (unsigned long long)drop, (unsigned long long)idle,
+      (unsigned long long)rate_limited, cap_q, send_q, (long long)enc_us,
+      (long long)send_us, (unsigned long long)byt, (long long)rtt);
 }
 
 // ============================================================================

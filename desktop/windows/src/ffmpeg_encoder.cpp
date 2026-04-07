@@ -277,7 +277,7 @@ bool FFmpegEncoder::init(uint32_t width, uint32_t height,
     sws_ctx_ = sws_getContext(
         static_cast<int>(width), static_cast<int>(height), AV_PIX_FMT_BGRA,
         static_cast<int>(width), static_cast<int>(height), AV_PIX_FMT_NV12,
-        SWS_BILINEAR, nullptr, nullptr, nullptr);
+        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
 
     if (!sws_ctx_) {
         fprintf(stderr, "[ffmpeg] sws_getContext failed\n");

@@ -33,6 +33,10 @@ public:
     /// directly for the given monitor.
     bool init_with_monitor(HMONITOR monitor);
 
+    /// Caps how often frames are delivered into the pipeline. This is applied
+    /// before the costly D3D copy into our own frame slots.
+    void set_target_fps(uint32_t fps);
+
     bool start(std::function<void(const CapturedFrame&)> on_frame) override;
     void stop() override;
 
@@ -49,6 +53,7 @@ public:
     /// around all D3D11 immediate context calls to prevent races with
     /// the WGC FrameArrived callback (which runs on a threadpool thread).
     std::mutex& d3d_mutex() { return d3d_mutex_; }
+    uint64_t frames_rate_limited() const { return frames_rate_limited_.load(); }
 
 private:
     /// Called by the FramePool.FrameArrived event.
@@ -68,6 +73,9 @@ private:
     uint32_t width_  = 0;
     uint32_t height_ = 0;
     std::atomic<bool> running_{false};
+    std::atomic<int64_t> min_frame_interval_us_{0};
+    std::atomic<int64_t> last_delivered_ts_us_{0};
+    std::atomic<uint64_t> frames_rate_limited_{0};
 
     std::function<void(const CapturedFrame&)> on_frame_;
 
