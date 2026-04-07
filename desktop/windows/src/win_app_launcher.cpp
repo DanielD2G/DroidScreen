@@ -1,8 +1,8 @@
 #include "win_app_launcher.h"
 
 #include <windows.h>
-#include <gdiplus.h>
 #include <objidl.h>
+#include <gdiplus.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
