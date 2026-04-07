@@ -318,10 +318,9 @@ bool WGCCapturer::init(uint32_t display_index) {
         fprintf(stderr, "[wgc] IsBorderRequired not supported on this build\n");
     }
 
-    // Avoid cursor-only invalidations. Input is injected separately, so the
-    // cursor does not need to be baked into the video stream.
+    // Include the cursor in the captured frames so it is visible on Android.
     try {
-        session.IsCursorCaptureEnabled(false);
+        session.IsCursorCaptureEnabled(true);
     } catch (...) {
         // Not available on older builds.
     }
@@ -434,10 +433,9 @@ bool WGCCapturer::init_with_monitor(HMONITOR monitor) {
         fprintf(stderr, "[wgc] IsBorderRequired not supported on this build\n");
     }
 
-    // Avoid cursor-only invalidations. Input is injected separately, so the
-    // cursor does not need to be baked into the video stream.
+    // Include the cursor in the captured frames so it is visible on Android.
     try {
-        session.IsCursorCaptureEnabled(false);
+        session.IsCursorCaptureEnabled(true);
     } catch (...) {
     }
 

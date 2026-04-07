@@ -122,6 +122,11 @@ private:
     std::mutex send_mutex_;
     std::condition_variable send_cv_;
 
+    // Serializes ALL writes to the TCP socket (video, ping, control).
+    // send_mutex_ protects send_queue_ only; write_mutex_ prevents
+    // interleaved header+payload from different threads.
+    std::mutex write_mutex_;
+
     std::thread encode_thread_;
     std::thread send_thread_;
     std::thread recv_thread_;

@@ -378,15 +378,18 @@ void Pipeline::send_loop() {
 
     int64_t t_send_start = now_us();
 
-    if (client_->send_message(DS_MSG_VIDEO_FRAME, pkt.flags, pkt.data.data(),
-                              pkt.data.size())) {
-      int64_t t_send_end = now_us();
-      last_send_us_.store(t_send_end - t_send_start);
-      bytes_sent_.fetch_add(DS_HEADER_SIZE + pkt.data.size());
-    } else {
-      fprintf(stderr, "[send] TCP send failed\n");
-      running_.store(false);
-      break;
+    {
+      std::lock_guard<std::mutex> wlock(write_mutex_);
+      if (client_->send_message(DS_MSG_VIDEO_FRAME, pkt.flags, pkt.data.data(),
+                                pkt.data.size())) {
+        int64_t t_send_end = now_us();
+        last_send_us_.store(t_send_end - t_send_start);
+        bytes_sent_.fetch_add(DS_HEADER_SIZE + pkt.data.size());
+      } else {
+        fprintf(stderr, "[send] TCP send failed\n");
+        running_.store(false);
+        break;
+      }
     }
   }
 
@@ -508,12 +511,15 @@ void Pipeline::ping_loop() {
       break;
 
     ping_sent_us_.store(now_us());
-    if (!client_->send_message(DS_MSG_PING, 0, nullptr, 0)) {
-      if (running_.load()) {
-        fprintf(stderr, "[ping] send failed\n");
+    {
+      std::lock_guard<std::mutex> wlock(write_mutex_);
+      if (!client_->send_message(DS_MSG_PING, 0, nullptr, 0)) {
+        if (running_.load()) {
+          fprintf(stderr, "[ping] send failed\n");
+        }
+        running_.store(false);
+        break;
       }
-      running_.store(false);
-      break;
     }
   }
 
@@ -580,7 +586,7 @@ void Pipeline::send_deck_config() {
   if (!deck_ || !client_)
     return;
 
-  std::lock_guard<std::mutex> lock(send_mutex_);
+  std::lock_guard<std::mutex> wlock(write_mutex_);
   std::string json = deck_->serialize_config();
   if (!client_->send_message(DS_MSG_DECK_CONFIG, 0,
                              reinterpret_cast<const uint8_t *>(json.data()),
@@ -595,7 +601,7 @@ void Pipeline::send_volume_state(uint16_t level, bool muted) {
   if (!client_)
     return;
 
-  std::lock_guard<std::mutex> lock(send_mutex_);
+  std::lock_guard<std::mutex> wlock(write_mutex_);
   ds_volume_state_t state{};
   state.level = level;
   state.muted = muted ? 1 : 0;
@@ -616,7 +622,7 @@ void Pipeline::send_media_state(const std::string &json) {
   if (!client_)
     return;
 
-  std::lock_guard<std::mutex> lock(send_mutex_);
+  std::lock_guard<std::mutex> wlock(write_mutex_);
   if (!client_->send_message(DS_MSG_MEDIA_STATE, 0,
                              reinterpret_cast<const uint8_t *>(json.data()),
                              json.size())) {

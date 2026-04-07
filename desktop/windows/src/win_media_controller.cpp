@@ -140,6 +140,8 @@ public:
   std::atomic<bool> running{false};
   std::atomic<uint64_t> generation{0};
   std::string last_track_key;
+  std::chrono::steady_clock::time_point last_emit_time{};
+  static constexpr auto kEmitMinInterval = std::chrono::milliseconds(250);
 
   void unregister_session_locked() {
     if (session) {
@@ -171,9 +173,9 @@ public:
     media_changed_token = session.MediaPropertiesChanged(
         [this](auto &&, auto &&) { emit_state(true); });
     playback_changed_token = session.PlaybackInfoChanged(
-        [this](auto &&, auto &&) { emit_state(false); });
+        [this](auto &&, auto &&) { emit_state_throttled(false); });
     timeline_changed_token = session.TimelinePropertiesChanged(
-        [this](auto &&, auto &&) { emit_state(false); });
+        [this](auto &&, auto &&) { emit_state_throttled(false); });
   }
 
   Snapshot build_snapshot(bool include_artwork) {
@@ -248,11 +250,22 @@ public:
     {
       std::lock_guard<std::mutex> lock(mutex);
       last_track_key = snapshot.track_key;
+      last_emit_time = std::chrono::steady_clock::now();
       cb = callback;
     }
     if (cb) {
       cb(snapshot.json);
     }
+  }
+
+  void emit_state_throttled(bool include_artwork) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      auto now = std::chrono::steady_clock::now();
+      if (now - last_emit_time < kEmitMinInterval)
+        return;
+    }
+    emit_state(include_artwork);
   }
 
   void schedule_refresh_burst() {
