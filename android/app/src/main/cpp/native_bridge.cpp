@@ -14,6 +14,8 @@
 #include <atomic>
 #include <cstring>
 #include <cstdlib>
+#include <mutex>
+#include <condition_variable>
 #include <pthread.h>
 #include <unistd.h>
 #include <sched.h>
@@ -59,6 +61,16 @@ extern "C" {
 #define STATUS_CONNECTED    1
 #define STATUS_DISCONNECTED 2
 #define STATUS_ERROR        3
+
+/* ---- Decode thread condition variable ----
+ * Signalled by: async MediaCodec callbacks, ring buffer writes (recv_thread).
+ * Waited on by: decode_thread instead of polling with usleep. */
+static std::mutex              g_decode_mutex;
+static std::condition_variable g_decode_cv;
+
+static void decoder_wakeup_cb(void* /*userdata*/) {
+    g_decode_cv.notify_one();
+}
 
 /* ---- Global state ---- */
 static std::atomic<bool> g_running{false};
@@ -285,8 +297,10 @@ static void* recv_thread_func(void* /*arg*/) {
         }
         g_stream_frame_interval_us.store(interval_us, std::memory_order_release);
 
-        /* Configure decoder with the negotiated resolution */
+        /* Configure decoder with the negotiated resolution.
+         * Set wakeup callback first so async mode is enabled if API >= 28. */
         if (g_decoder) {
+            decoder_set_wakeup(g_decoder, decoder_wakeup_cb, nullptr);
             decoder_configure(g_decoder, req.width, req.height);
             g_decoder_configured.store(true, std::memory_order_release);
         }
@@ -383,6 +397,9 @@ static void* recv_thread_func(void* /*arg*/) {
                     if (ring_buffer_write_message(
                             g_ring_buf, video_msg_buf, hdr.length + 1) != 0) {
                         LOGW("recv_thread: ring buffer full, dropping frame");
+                    } else {
+                        /* Wake decode thread — new data available */
+                        g_decode_cv.notify_one();
                     }
                     break;
                 }
@@ -501,14 +518,17 @@ static void* recv_thread_func(void* /*arg*/) {
  * Reads NAL units from ring buffer and feeds them to MediaCodec decoder.
  * Survives reconnections — pauses when decoder is unconfigured.
  *
- * Burst processing with skip-to-newest:
- *   1. Drain decoder output (render queue depth = 1).
- *   2. Read ALL pending messages from ring buffer in one burst.
- *      - Config NALs (SPS/PPS) are always fed immediately.
- *      - Stale video NALs are skipped when newer ones are queued.
- *      - Only the newest video NAL is fed to the decoder.
- *   3. Drain again after the burst feed.
- *   4. Brief sleep only when the ring buffer was empty.
+ * Two operation modes (selected automatically per-session):
+ *
+ *   ASYNC (API 28+):  Event-driven via condition variable.
+ *     MediaCodec callbacks + ring-buffer writes signal g_decode_cv.
+ *     Uses decoder_pop_input() / decoder_feed_index() — zero polling.
+ *
+ *   SYNC (API 26-27): Burst-read ring buffer, feed with dequeueInputBuffer.
+ *     Falls back to 50µs polling when idle.
+ *
+ * Both modes feed ALL NALs (never skip at input) and use decoder_drain()
+ * for render-queue-depth=1 at the output level.
  */
 static void* decode_thread_func(void* /*arg*/) {
     /* Set high priority */
@@ -541,15 +561,14 @@ static void* decode_thread_func(void* /*arg*/) {
     uint32_t frames_rendered = 0;
     uint32_t feed_errors = 0;
     uint32_t frames_skipped = 0;
-    uint32_t last_logged_fed = 0;  /* guard against repeated log lines */
+    uint32_t last_logged_fed = 0;
     struct timespec ts_start, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
     while (g_running.load(std::memory_order_acquire)) {
         /* Wait for decoder to be configured (pauses between reconnections) */
         if (!g_decoder_configured.load(std::memory_order_acquire)) {
-            usleep(1000); /* 1ms spin wait */
-            /* Reset stats on reconnection */
+            usleep(1000);
             frames_fed = 0;
             frames_rendered = 0;
             feed_errors = 0;
@@ -560,64 +579,106 @@ static void* decode_thread_func(void* /*arg*/) {
             continue;
         }
 
-        /* 1. Drain output — may have frames ready from previous feed */
+        bool is_async = decoder_is_async(g_decoder);
+        bool any_work = false;
+
+        /* ---- 1. Drain output (both modes) ---- */
         int r = decoder_drain(g_decoder);
         if (r > 0) {
             frames_rendered += r;
             g_stats_frames_decoded.fetch_add(r, std::memory_order_relaxed);
+            any_work = true;
         }
 
-        /* 2. Burst-read all available messages from ring buffer.
-         *    Feed ALL NALs to the decoder — never skip video frames at
-         *    the input level.  H.264 P-frames depend on previous reference
-         *    frames; skipping any input NAL corrupts the reference chain
-         *    and produces visible glitches.
-         *
-         *    Latency is controlled at the OUTPUT level: decoder_drain()
-         *    already implements render-queue-depth=1 (Moonlight strategy),
-         *    rendering only the newest decoded frame and dropping older ones. */
-        bool any_read = false;
+        /* ---- 2. Feed NALs from ring buffer ---- */
+        if (is_async) {
+            /* ASYNC: use pre-dequeued input indices from callbacks */
+            while (g_running.load(std::memory_order_acquire)) {
+                int32_t input_idx = decoder_pop_input(g_decoder);
+                if (input_idx < 0) break;  /* no input buffer available */
 
-        while (g_running.load(std::memory_order_acquire)) {
-            size_t msg_len = ring_buffer_read_message(
-                g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
-            if (msg_len < 2) {  /* minimum: 1 byte flags + 1 byte NAL */
-                break;
+                size_t msg_len = ring_buffer_read_message(
+                    g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
+                if (msg_len < 2) {
+                    /* No data — return the input index for next time.
+                     * We can't "un-pop", so we feed an empty buffer
+                     * which the codec will silently ignore, and the
+                     * index returns to the available pool via callback. */
+                    decoder_feed_index(g_decoder, input_idx,
+                                       nullptr, 0, 0, 0);
+                    break;
+                }
+                any_work = true;
+
+                uint8_t video_flags = nal_buf[0];
+                uint8_t* video_data = nal_buf + 1;
+                size_t nal_len = msg_len - 1;
+
+                uint32_t mc_flags = 0;
+                int is_config = 0;
+                ds_frame_parse_flags(video_flags, nullptr, &is_config);
+
+                if (is_config) {
+                    mc_flags = 2; /* BUFFER_FLAG_CODEC_CONFIG */
+                    sps_patch_constraints(video_data, nal_len);
+                }
+
+                int ret = decoder_feed_index(g_decoder, input_idx,
+                                             video_data, nal_len,
+                                             pts_us, mc_flags);
+                if (ret == 0) {
+                    frames_fed++;
+                    g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    feed_errors++;
+                    g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                if (!is_config) {
+                    pts_us += g_stream_frame_interval_us.load(
+                        std::memory_order_acquire);
+                }
             }
-            any_read = true;
+        } else {
+            /* SYNC: burst-read ring buffer, dequeue input buffers inline */
+            while (g_running.load(std::memory_order_acquire)) {
+                size_t msg_len = ring_buffer_read_message(
+                    g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
+                if (msg_len < 2) break;
+                any_work = true;
 
-            uint8_t video_flags = nal_buf[0];
-            uint8_t* video_data = nal_buf + 1;
-            size_t nal_len = msg_len - 1;
+                uint8_t video_flags = nal_buf[0];
+                uint8_t* video_data = nal_buf + 1;
+                size_t nal_len = msg_len - 1;
 
-            uint32_t mc_flags = 0;
-            int is_config = 0;
-            ds_frame_parse_flags(video_flags, nullptr, &is_config);
+                uint32_t mc_flags = 0;
+                int is_config = 0;
+                ds_frame_parse_flags(video_flags, nullptr, &is_config);
 
-            if (is_config) {
-                mc_flags = 2; /* BUFFER_FLAG_CODEC_CONFIG */
-                sps_patch_constraints(video_data, nal_len);
-            }
+                if (is_config) {
+                    mc_flags = 2;
+                    sps_patch_constraints(video_data, nal_len);
+                }
 
-            int ret = decoder_feed(g_decoder, video_data, nal_len,
-                                   pts_us, mc_flags);
-            if (ret == 0) {
-                frames_fed++;
-                g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                feed_errors++;
-                g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
-            }
+                int ret = decoder_feed(g_decoder, video_data, nal_len,
+                                       pts_us, mc_flags);
+                if (ret == 0) {
+                    frames_fed++;
+                    g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    feed_errors++;
+                    g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
+                }
 
-            /* Advance PTS only for non-config NALs */
-            if (!is_config) {
-                pts_us += g_stream_frame_interval_us.load(
-                    std::memory_order_acquire);
+                if (!is_config) {
+                    pts_us += g_stream_frame_interval_us.load(
+                        std::memory_order_acquire);
+                }
             }
         }
 
-        /* 3. Drain again after the burst feed */
-        if (any_read) {
+        /* ---- 3. Drain again after feeding ---- */
+        if (any_work) {
             r = decoder_drain(g_decoder);
             if (r > 0) {
                 frames_rendered += r;
@@ -625,12 +686,20 @@ static void* decode_thread_func(void* /*arg*/) {
             }
         }
 
-        /* 4. Brief sleep only when the ring buffer was empty */
-        if (!any_read) {
-            usleep(50); /* 50us — reduced from 100us for tighter polling */
+        /* ---- 4. Wait for next event ---- */
+        if (!any_work) {
+            if (is_async) {
+                /* Event-driven: wait on condition variable.
+                 * Woken by: MediaCodec callbacks OR ring buffer writes. */
+                std::unique_lock<std::mutex> lock(g_decode_mutex);
+                g_decode_cv.wait_for(lock, std::chrono::milliseconds(5));
+            } else {
+                /* Sync fallback: brief polling sleep */
+                usleep(50);
+            }
         }
 
-        /* Log stats every ~120 fed frames (avoid repeated logs when idle) */
+        /* ---- 5. Stats logging ---- */
         if ((frames_fed % 120) == 0 && frames_fed > 0
                 && frames_fed != last_logged_fed) {
             last_logged_fed = frames_fed;
@@ -638,9 +707,10 @@ static void* decode_thread_func(void* /*arg*/) {
             double elapsed = (ts_now.tv_sec - ts_start.tv_sec)
                            + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
             size_t ring_used = ring_buffer_available_read(g_ring_buf);
-            LOGI("decode: fed=%u rendered=%u skip=%u err=%u | "
+            LOGI("decode[%s]: fed=%u rendered=%u err=%u | "
                  "%.1f fed/s %.1f render/s | ring=%zu bytes",
-                 frames_fed, frames_rendered, frames_skipped, feed_errors,
+                 is_async ? "async" : "sync",
+                 frames_fed, frames_rendered, feed_errors,
                  frames_fed / elapsed, frames_rendered / elapsed,
                  ring_used);
         }
