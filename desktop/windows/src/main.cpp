@@ -33,6 +33,7 @@
 #include "mouse_injector_win.h"
 #include "touch_injector_win.h"
 #include "virtual_display_win.h"
+#include "droidscreen/deck_manager.h"
 #include "droidscreen/pipeline.h"
 #include "droidscreen/server.h"
 
@@ -78,6 +79,7 @@ static constexpr UINT IDM_STATUS     = 4001;
 static constexpr UINT IDM_SETTINGS   = 4002;
 static constexpr UINT IDM_CONNECT    = 4003;
 static constexpr UINT IDM_QUIT       = 4004;
+static constexpr UINT IDM_DECK       = 4005;
 
 // Settings dialog control IDs.
 static constexpr UINT IDC_FPS_COMBO      = 5001;
@@ -465,6 +467,7 @@ struct AppState {
     std::unique_ptr<droidscreen::TCPClient>        client;
     std::unique_ptr<droidscreen::WinMouseInjector> mouse;
     std::unique_ptr<droidscreen::WinTouchInjector> touch;
+    std::unique_ptr<droidscreen::DeckManager>      deckManager;
     std::unique_ptr<droidscreen::Pipeline>         pipeline;
 
     // Worker thread for streaming operations.
@@ -540,6 +543,9 @@ static void show_tray_menu() {
 
     // Settings.
     AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings...");
+
+    // Deck Config.
+    AppendMenuW(menu, MF_STRING, IDM_DECK, L"Deck Config...");
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
@@ -1067,16 +1073,28 @@ static void connect_sync() {
         return;
     }
 
-    // 8. Create and start pipeline.
+    // 8. Create deck manager and pipeline.
+    g_app.deckManager = std::make_unique<droidscreen::DeckManager>();
+    g_app.deckManager->set_action_callback([](uint8_t action, uint8_t button_id, uint16_t value) {
+        log_msg("[deck] action callback: action=%u button=%u value=%u",
+                action, button_id, value);
+    });
+    g_app.deckManager->set_volume_callback([](uint16_t level, bool muted) {
+        log_msg("[deck] volume callback: level=%u muted=%d",
+                level, muted ? 1 : 0);
+    });
+
     g_app.pipeline = std::make_unique<droidscreen::Pipeline>(
         g_app.capturer.get(), g_app.encoder.get(),
-        g_app.client.get(), g_app.touch.get(), g_app.mouse.get());
+        g_app.client.get(), g_app.touch.get(), g_app.mouse.get(),
+        g_app.deckManager.get());
 
     if (!g_app.pipeline->start(cap_w, cap_h, settings.fps,
                                 settings.bitrate_kbps, settings.touch)) {
         log_msg("[Stream] Pipeline start failed");
         update_status(L"Pipeline start failed");
         g_app.pipeline.reset();
+        g_app.deckManager.reset();
         g_app.encoder->shutdown();
         g_app.encoder.reset();
         g_app.client->close();
@@ -1137,6 +1155,9 @@ static void disconnect_sync() {
     if (g_app.mouse) {
         g_app.mouse->shutdown();
         g_app.mouse.reset();
+    }
+    if (g_app.deckManager) {
+        g_app.deckManager.reset();
     }
     if (g_app.client) {
         g_app.client->close();
@@ -1244,6 +1265,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         switch (LOWORD(wParam)) {
         case IDM_SETTINGS:
             show_settings_dialog();
+            break;
+        case IDM_DECK:
+            log_msg("[DroidScreen] Deck Config... (stub)");
+            // TODO: Show deck configuration UI.
             break;
         case IDM_CONNECT:
             if (g_app.isStreaming.load()) {

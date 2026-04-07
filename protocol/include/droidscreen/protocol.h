@@ -36,6 +36,11 @@ typedef enum {
     DS_MSG_PEN_EVENT      = 0x21,
     DS_MSG_MOUSE_EVENT    = 0x22,
     DS_MSG_CONTROL        = 0x30,
+    DS_MSG_DECK_CONFIG    = 0x40,
+    DS_MSG_DECK_ACTION    = 0x41,
+    DS_MSG_MEDIA_STATE    = 0x42,
+    DS_MSG_VOLUME_STATE   = 0x43,
+    DS_MSG_VOLUME_CHANGE  = 0x44,
     DS_MSG_PING           = 0xF0,
     DS_MSG_PONG           = 0xF1
 } ds_msg_type_t;

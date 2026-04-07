@@ -24,6 +24,7 @@
 
 extern "C" {
 #include "droidscreen/protocol.h"
+#include "droidscreen/deck.h"
 #include "droidscreen/handshake.h"
 #include "droidscreen/mouse.h"
 #include "droidscreen/pen.h"
@@ -49,12 +50,13 @@ static void release_captured_frame(CapturedFrame& frame) {
 
 Pipeline::Pipeline(Capturer* capturer, Encoder* encoder,
                    TCPClient* client, TouchInjector* touch,
-                   MouseInjector* mouse)
+                   MouseInjector* mouse, DeckManager* deck)
     : capturer_(capturer)
     , encoder_(encoder)
     , client_(client)
     , touch_(touch)
     , mouse_(mouse)
+    , deck_(deck)
 {
 }
 
@@ -188,6 +190,11 @@ bool Pipeline::start(uint32_t width, uint32_t height,
     send_thread_   = std::thread(&Pipeline::send_loop, this);
     recv_thread_   = std::thread(&Pipeline::recv_loop, this);
     ping_thread_   = std::thread(&Pipeline::ping_loop, this);
+
+    // Send initial deck configuration to Android if a DeckManager is set.
+    if (deck_) {
+        send_deck_config();
+    }
 
     fprintf(stderr, "[pipeline] started (4 threads: encode, send, recv, ping)\n");
     return true;
@@ -459,6 +466,20 @@ void Pipeline::recv_loop() {
                 break;
             }
 
+            case DS_MSG_DECK_ACTION: {
+                if (deck_ && hdr.length >= DS_DECK_ACTION_SIZE) {
+                    deck_->handle_deck_action(payload.data(), payload.size());
+                }
+                break;
+            }
+
+            case DS_MSG_VOLUME_CHANGE: {
+                if (deck_ && hdr.length >= DS_VOLUME_STATE_SIZE) {
+                    deck_->handle_volume_change(payload.data(), payload.size());
+                }
+                break;
+            }
+
             case DS_MSG_CONTROL: {
                 if (hdr.length > 0) {
                     handle_control(payload.data(), payload.size());
@@ -553,6 +574,53 @@ size_t Pipeline::send_queue_depth() const {
     std::lock_guard<std::mutex> lock(
         const_cast<std::mutex&>(send_mutex_));
     return send_queue_.size();
+}
+
+// --------------------------------------------------------------------------
+// Deck: send configuration, volume state, media state
+// --------------------------------------------------------------------------
+
+void Pipeline::send_deck_config() {
+    if (!deck_ || !client_) return;
+
+    std::string json = deck_->serialize_config();
+    if (!client_->send_message(DS_MSG_DECK_CONFIG, 0,
+                               reinterpret_cast<const uint8_t*>(json.data()),
+                               json.size())) {
+        fprintf(stderr, "[pipeline] failed to send deck config\n");
+    } else {
+        fprintf(stderr, "[pipeline] sent deck config (%zu bytes)\n", json.size());
+    }
+}
+
+void Pipeline::send_volume_state(uint16_t level, bool muted) {
+    if (!client_) return;
+
+    ds_volume_state_t state{};
+    state.level  = level;
+    state.muted  = muted ? 1 : 0;
+
+    uint8_t buf[DS_VOLUME_STATE_SIZE];
+    ds_volume_state_serialize(buf, &state);
+
+    if (!client_->send_message(DS_MSG_VOLUME_STATE, 0,
+                               buf, DS_VOLUME_STATE_SIZE)) {
+        fprintf(stderr, "[pipeline] failed to send volume state\n");
+    } else {
+        fprintf(stderr, "[pipeline] sent volume state: level=%u muted=%d\n", level, muted);
+    }
+}
+
+void Pipeline::send_media_state(const std::string& json) {
+    if (!client_) return;
+
+    if (!client_->send_message(DS_MSG_MEDIA_STATE, 0,
+                               reinterpret_cast<const uint8_t*>(json.data()),
+                               json.size())) {
+        fprintf(stderr, "[pipeline] failed to send media state\n");
+    } else {
+        fprintf(stderr, "[pipeline] sent media state (%zu bytes)\n", json.size());
+    }
 }
 
 } // namespace droidscreen

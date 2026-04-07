@@ -25,6 +25,7 @@
 #include "mouse_sender.h"
 #include "pen_sender.h"
 #include "touch_sender.h"
+#include "deck_sender.h"
 #include "sps_patch.h"
 
 extern "C" {
@@ -34,6 +35,7 @@ extern "C" {
 #include "droidscreen/mouse.h"
 #include "droidscreen/pen.h"
 #include "droidscreen/touch.h"
+#include "droidscreen/deck.h"
 }
 
 #define TAG "DroidScreen"
@@ -82,6 +84,9 @@ static std::atomic<int64_t>  g_stats_frame_jitter_us{0};
 static JavaVM*           g_jvm      = nullptr;
 static jobject           g_activity = nullptr;   /* global ref */
 static jmethodID         g_onStatusChanged = nullptr;
+static jmethodID         g_onDeckConfigReceived = nullptr;
+static jmethodID         g_onMediaStateReceived = nullptr;
+static jmethodID         g_onVolumeStateReceived = nullptr;
 
 /**
  * Notify Java about native connection status change.
@@ -106,6 +111,86 @@ static void notify_status(int status) {
     }
 
     env->CallVoidMethod(g_activity, g_onStatusChanged, (jint)status);
+
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+
+    if (did_attach) {
+        g_jvm->DetachCurrentThread();
+    }
+}
+
+/**
+ * Notify Java with a string callback.
+ * Safe to call from any thread — attaches/detaches JNI as needed.
+ */
+static void notify_string_callback(jmethodID method, const char* data, size_t len) {
+    if (!g_jvm || !g_activity || !method) return;
+
+    JNIEnv* env = nullptr;
+    bool did_attach = false;
+
+    jint result = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (result == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("notify_string_callback: AttachCurrentThread failed");
+            return;
+        }
+        did_attach = true;
+    } else if (result != JNI_OK) {
+        LOGE("notify_string_callback: GetEnv failed: %d", result);
+        return;
+    }
+
+    /* Create a jstring from the raw bytes (treated as modified UTF-8) */
+    char* tmp = static_cast<char*>(malloc(len + 1));
+    if (tmp) {
+        memcpy(tmp, data, len);
+        tmp[len] = '\0';
+        jstring jstr = env->NewStringUTF(tmp);
+        if (jstr) {
+            env->CallVoidMethod(g_activity, method, jstr);
+            env->DeleteLocalRef(jstr);
+        }
+        free(tmp);
+    }
+
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+
+    if (did_attach) {
+        g_jvm->DetachCurrentThread();
+    }
+}
+
+/**
+ * Notify Java about volume state changes.
+ * Safe to call from any thread — attaches/detaches JNI as needed.
+ */
+static void notify_volume_state(int volume, bool muted) {
+    if (!g_jvm || !g_activity || !g_onVolumeStateReceived) return;
+
+    JNIEnv* env = nullptr;
+    bool did_attach = false;
+
+    jint result = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (result == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("notify_volume_state: AttachCurrentThread failed");
+            return;
+        }
+        did_attach = true;
+    } else if (result != JNI_OK) {
+        LOGE("notify_volume_state: GetEnv failed: %d", result);
+        return;
+    }
+
+    env->CallVoidMethod(g_activity, g_onVolumeStateReceived,
+                        (jint)volume, (jboolean)(muted ? JNI_TRUE : JNI_FALSE));
 
     if (env->ExceptionCheck()) {
         env->ExceptionDescribe();
@@ -311,6 +396,33 @@ static void* recv_thread_func(void* /*arg*/) {
                     if (hdr.length > 0 && payload_buf[0] == DS_CTRL_DISCONNECT) {
                         LOGI("recv_thread: received disconnect control");
                         goto end_message_loop;
+                    }
+                    break;
+                }
+
+                case DS_MSG_DECK_CONFIG: {
+                    LOGD("recv_thread: received deck config (%u bytes)", hdr.length);
+                    notify_string_callback(g_onDeckConfigReceived,
+                                           reinterpret_cast<const char*>(payload_buf),
+                                           hdr.length);
+                    break;
+                }
+
+                case DS_MSG_MEDIA_STATE: {
+                    LOGD("recv_thread: received media state (%u bytes)", hdr.length);
+                    notify_string_callback(g_onMediaStateReceived,
+                                           reinterpret_cast<const char*>(payload_buf),
+                                           hdr.length);
+                    break;
+                }
+
+                case DS_MSG_VOLUME_STATE: {
+                    if (hdr.length >= DS_VOLUME_STATE_SIZE) {
+                        ds_volume_state_t vol;
+                        ds_volume_state_deserialize(payload_buf, &vol);
+                        LOGD("recv_thread: received volume state level=%u muted=%u",
+                             vol.level, vol.muted);
+                        notify_volume_state(vol.level, vol.muted != 0);
                     }
                     break;
                 }
@@ -530,6 +642,15 @@ Java_com_droidscreen_app_MainActivity_nativeInit(
         return;
     }
 
+    /* Cache deck callback method IDs (optional — deck feature may not be present) */
+    g_onDeckConfigReceived = env->GetMethodID(clazz, "onDeckConfigReceived", "(Ljava/lang/String;)V");
+    g_onMediaStateReceived = env->GetMethodID(clazz, "onMediaStateReceived", "(Ljava/lang/String;)V");
+    g_onVolumeStateReceived = env->GetMethodID(clazz, "onVolumeStateReceived", "(IZ)V");
+    if (!g_onDeckConfigReceived) {
+        LOGW("nativeInit: deck callbacks not found (deck feature unavailable)");
+        env->ExceptionClear();
+    }
+
     /* Get native window from Surface */
     g_window = ANativeWindow_fromSurface(env, surface);
     if (!g_window) {
@@ -644,6 +765,9 @@ Java_com_droidscreen_app_MainActivity_nativeStop(
         g_activity = nullptr;
     }
     g_onStatusChanged = nullptr;
+    g_onDeckConfigReceived = nullptr;
+    g_onMediaStateReceived = nullptr;
+    g_onVolumeStateReceived = nullptr;
     g_jvm = nullptr;
 
     LOGI("nativeStop: stopped");
@@ -705,6 +829,35 @@ Java_com_droidscreen_app_MainActivity_nativeGetStats(
     jlongArray result = env->NewLongArray(6);
     env->SetLongArrayRegion(result, 0, 6, stats);
     return result;
+}
+
+JNIEXPORT void JNICALL
+Java_com_droidscreen_app_MainActivity_nativeSendDeckAction(
+        JNIEnv* env, jobject /*thiz*/,
+        jint actionType, jstring tileId) {
+
+    if (g_client_fd < 0) {
+        return;
+    }
+
+    const char* tile_str = env->GetStringUTFChars(tileId, nullptr);
+    if (!tile_str) return;
+
+    deck_action_send(g_client_fd, actionType, tile_str);
+
+    env->ReleaseStringUTFChars(tileId, tile_str);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droidscreen_app_MainActivity_nativeSendVolumeChange(
+        JNIEnv* /*env*/, jobject /*thiz*/,
+        jint volume, jint muted) {
+
+    if (g_client_fd < 0) {
+        return;
+    }
+
+    volume_change_send(g_client_fd, volume, muted);
 }
 
 } /* extern "C" */
