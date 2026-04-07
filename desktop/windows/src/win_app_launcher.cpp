@@ -229,7 +229,7 @@ std::wstring resolve_protocol_icon_source(const std::wstring &protocol_target) {
 }
 
 std::string fallback_app_icon_base64() {
-  HICON icon = LoadIconW(nullptr, IDI_APPLICATION);
+  HICON icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512) /*IDI_APPLICATION*/);
   return hicon_to_png_base64(icon);
 }
 
