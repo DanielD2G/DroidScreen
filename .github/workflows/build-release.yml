@@ -149,16 +149,18 @@ jobs:
     env:
       VERSION: ${{ needs.detect-changes.outputs.version_macos }}
       DROIDSCREEN_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' }}
+      MACOS_KEYCHAIN_PW: ${{ secrets.MACOS_KEYCHAIN_PASSWORD || github.run_id }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Import signing certificate
-        if: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' }}
+        if: env.HAS_SIGNING_CERT == 'true'
         run: |
           echo "${{ secrets.MACOS_CERTIFICATE_P12 }}" | base64 --decode > macos-signing.p12
-          security create-keychain -p "${{ secrets.MACOS_KEYCHAIN_PASSWORD || github.run_id }}" build.keychain
+          security create-keychain -p "$MACOS_KEYCHAIN_PW" build.keychain
           security set-keychain-settings -lut 21600 build.keychain
-          security unlock-keychain -p "${{ secrets.MACOS_KEYCHAIN_PASSWORD || github.run_id }}" build.keychain
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PW" build.keychain
           security import macos-signing.p12 \
             -k build.keychain \
             -P "${{ secrets.MACOS_CERTIFICATE_PASSWORD }}" \
@@ -166,7 +168,7 @@ jobs:
             -T /usr/bin/security
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
-            -s -k "${{ secrets.MACOS_KEYCHAIN_PASSWORD || github.run_id }}" \
+            -s -k "$MACOS_KEYCHAIN_PW" \
             build.keychain
           security list-keychains -d user -s build.keychain login.keychain-db
           security find-identity -v -p codesigning build.keychain
