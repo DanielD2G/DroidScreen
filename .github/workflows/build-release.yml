@@ -1,0 +1,461 @@
+# ─────────────────────────────────────────────────────────────
+# DroidScreen – Selective Build & Release
+#
+# Builds ONLY the platforms whose source changed since the last
+# release tag.  Unchanged platform artefacts are carried forward
+# from the previous release so every release ships all three.
+#
+# Platforms:
+#   macOS ARM   (Apple Silicon)  →  .zip
+#   Windows x64                  →  .exe (NSIS installer)
+#   Android APK (arm64 + x86_64)→  .apk
+# ─────────────────────────────────────────────────────────────
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
+      - ".gitignore"
+      - "version.json"
+  workflow_dispatch:
+    inputs:
+      force_all:
+        description: "Force build all platforms"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+# ═══════════════════════════════════════════════════════════════
+jobs:
+  # ── 1. Detect what changed & compute next versions ─────────
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      build_macos:   ${{ steps.changes.outputs.macos }}
+      build_windows: ${{ steps.changes.outputs.windows }}
+      build_android: ${{ steps.changes.outputs.android }}
+      any_changed:   ${{ steps.changes.outputs.any_changed }}
+      version_macos:   ${{ steps.versions.outputs.macos }}
+      version_windows: ${{ steps.versions.outputs.windows }}
+      version_android: ${{ steps.versions.outputs.android }}
+      release_tag:     ${{ steps.versions.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Change detection ───────────────────────────────────
+      - name: Detect changes since last release
+        id: changes
+        run: |
+          # Manual trigger with force → build everything
+          if [ "${{ github.event.inputs.force_all }}" = "true" ]; then
+            echo "Force-building all platforms (workflow_dispatch)"
+            for p in macos windows android any_changed; do echo "$p=true" >> "$GITHUB_OUTPUT"; done
+            exit 0
+          fi
+
+          LAST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+
+          if [ -z "$LAST_TAG" ]; then
+            echo "No previous release tag found — building all platforms"
+            for p in macos windows android any_changed; do echo "$p=true" >> "$GITHUB_OUTPUT"; done
+            exit 0
+          fi
+
+          echo "Last release: $LAST_TAG"
+          CHANGED=$(git diff --name-only "$LAST_TAG"..HEAD)
+          echo "--- changed files ---"
+          echo "$CHANGED"
+          echo "---------------------"
+
+          count() { echo "$CHANGED" | grep -c "$1" || true; }
+
+          PROTO=$(count   '^protocol/')
+          COMMON=$(count  '^desktop/common/')
+          ROOT_CM=$(count '^CMakeLists\.txt$')
+          MAC=$(count     '^desktop/macos/')
+          WIN=$(count     '^desktop/windows/')
+          SHADER=$(count  '^desktop/shaders/')
+          DROID=$(count   '^android/')
+          CI_F=$(count    '^\.github/workflows/')
+
+          MACOS=false; WINDOWS=false; ANDROID=false
+
+          # Protocol or CI changes → all platforms
+          [ "$PROTO" -gt 0 ] || [ "$CI_F" -gt 0 ] && { MACOS=true; WINDOWS=true; ANDROID=true; }
+          # Desktop shared → both desktop platforms
+          [ "$COMMON" -gt 0 ] || [ "$ROOT_CM" -gt 0 ] && { MACOS=true; WINDOWS=true; }
+          # Platform-specific
+          [ "$MAC"    -gt 0 ] && MACOS=true
+          [ "$WIN"    -gt 0 ] && WINDOWS=true
+          [ "$SHADER" -gt 0 ] && WINDOWS=true
+          [ "$DROID"  -gt 0 ] && ANDROID=true
+
+          echo "macos=$MACOS"     >> "$GITHUB_OUTPUT"
+          echo "windows=$WINDOWS" >> "$GITHUB_OUTPUT"
+          echo "android=$ANDROID" >> "$GITHUB_OUTPUT"
+          ($MACOS || $WINDOWS || $ANDROID) \
+            && echo "any_changed=true" >> "$GITHUB_OUTPUT" \
+            || echo "any_changed=false" >> "$GITHUB_OUTPUT"
+
+      # ── Version bump ───────────────────────────────────────
+      - name: Compute next versions
+        id: versions
+        run: |
+          bump_patch() {
+            IFS='.' read -r major minor patch <<< "$1"
+            echo "$major.$minor.$((patch + 1))"
+          }
+
+          if [ -f version.json ]; then
+            MV=$(jq -r '.macos'   version.json)
+            WV=$(jq -r '.windows' version.json)
+            AV=$(jq -r '.android' version.json)
+          else
+            MV="0.0.0"; WV="0.0.0"; AV="0.0.0"
+          fi
+
+          [ "${{ steps.changes.outputs.macos }}"   = "true" ] && MV=$(bump_patch "$MV")
+          [ "${{ steps.changes.outputs.windows }}" = "true" ] && WV=$(bump_patch "$WV")
+          [ "${{ steps.changes.outputs.android }}" = "true" ] && AV=$(bump_patch "$AV")
+
+          echo "macos=$MV"   >> "$GITHUB_OUTPUT"
+          echo "windows=$WV" >> "$GITHUB_OUTPUT"
+          echo "android=$AV" >> "$GITHUB_OUTPUT"
+          echo "release_tag=v$(date -u +%Y.%m.%d)-build.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+          echo "### Version plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Platform | Version | Build? |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|---------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| macOS arm64 | $MV | ${{ steps.changes.outputs.macos }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Windows x64 | $WV | ${{ steps.changes.outputs.windows }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Android APK | $AV | ${{ steps.changes.outputs.android }} |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 2a. macOS ARM ──────────────────────────────────────────
+  build-macos:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.build_macos == 'true'
+    runs-on: macos-14                         # Apple Silicon (M-series)
+    env:
+      VERSION: ${{ needs.detect-changes.outputs.version_macos }}
+      DROIDSCREEN_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' }}
+      MACOS_KEYCHAIN_PW: ${{ secrets.MACOS_KEYCHAIN_PASSWORD || github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Import signing certificate
+        if: env.HAS_SIGNING_CERT == 'true'
+        run: |
+          echo "${{ secrets.MACOS_CERTIFICATE_P12 }}" | base64 --decode > macos-signing.p12
+          security create-keychain -p "$MACOS_KEYCHAIN_PW" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PW" build.keychain
+          security import macos-signing.p12 \
+            -k build.keychain \
+            -P "${{ secrets.MACOS_CERTIFICATE_PASSWORD }}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_KEYCHAIN_PW" \
+            build.keychain
+          security list-keychains -d user -s build.keychain login.keychain-db
+          security find-identity -v -p codesigning build.keychain
+
+      - name: Build signed app bundle
+        run: ./scripts/build_macos.sh
+
+      - name: Package
+        run: |
+          mkdir dist && cd build-macos/desktop/macos
+          if [ -d droidscreen_desktop.app ]; then
+            ditto -c -k --keepParent droidscreen_desktop.app ../../../dist/DroidScreen-macOS-arm64-v${VERSION}.zip
+          else
+            ditto -c -k droidscreen_desktop ../../../dist/DroidScreen-macOS-arm64-v${VERSION}.zip
+          fi
+
+      - name: Verify code signature
+        if: always()
+        run: |
+          codesign -dv --verbose=4 build-macos/desktop/macos/droidscreen_desktop.app 2>&1 | tee codesign.txt
+          echo "### macOS signing" >> "$GITHUB_STEP_SUMMARY"
+          sed -n '1,40p' codesign.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: dist/*
+
+  # ── 2b. Windows x64 ───────────────────────────────────────
+  build-windows:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.build_windows == 'true'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.detect-changes.outputs.version_windows }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg (prebuilt)
+        shell: pwsh
+        run: |
+          # Download prebuilt FFmpeg shared+dev from BtbN (GPL, includes x264/nvenc/qsv)
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
+          Write-Host "Downloading FFmpeg from BtbN..."
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extract
+
+          # Find the extracted directory (name varies with version)
+          $ffDir = Get-ChildItem ffmpeg-extract | Select-Object -First 1
+          Write-Host "FFmpeg dir: $($ffDir.FullName)"
+
+          # Set env vars for CMake to find the headers and libs
+          $ffPath = $ffDir.FullName
+          echo "FFMPEG_DIR=$ffPath" >> $env:GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$ffPath" >> $env:GITHUB_ENV
+
+      - name: Configure & build (x64 Release)
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCMAKE_SYSTEM_VERSION=10.0 `
+            -DFFMPEG_ROOT="$env:FFMPEG_DIR"
+          cmake --build build --config Release --parallel
+
+      - name: Download ADB platform-tools
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "platform-tools.zip"
+          Expand-Archive -Path "platform-tools.zip" -DestinationPath "adb-extract"
+          # The zip contains a platform-tools/ subdirectory
+          Write-Host "ADB extracted contents:"
+          Get-ChildItem -Recurse adb-extract | Select-Object FullName
+
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Stage files
+          New-Item -ItemType Directory -Force -Path "staging\app" | Out-Null
+          New-Item -ItemType Directory -Force -Path "staging\adb" | Out-Null
+
+          # Copy the built exe
+          $exe = "build\desktop\windows\Release\droidscreen_desktop.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "EXE not found at $exe"
+            exit 1
+          }
+          Copy-Item $exe "staging\app\"
+
+          # Copy FFmpeg DLLs (needed at runtime for shared builds)
+          $ffBin = "$env:FFMPEG_DIR\bin"
+          if (Test-Path $ffBin) {
+            Copy-Item "$ffBin\avcodec*.dll"  "staging\app\" -ErrorAction SilentlyContinue
+            Copy-Item "$ffBin\avutil*.dll"   "staging\app\" -ErrorAction SilentlyContinue
+            Copy-Item "$ffBin\swscale*.dll"  "staging\app\" -ErrorAction SilentlyContinue
+            Copy-Item "$ffBin\swresample*.dll" "staging\app\" -ErrorAction SilentlyContinue
+            Copy-Item "$ffBin\avformat*.dll" "staging\app\" -ErrorAction SilentlyContinue
+            Write-Host "FFmpeg DLLs staged from $ffBin"
+          }
+
+          # Copy icon
+          Copy-Item "installer\windows\icon.ico" "staging\"
+
+          # Copy ADB files (zip extracts to adb-extract\platform-tools\)
+          $adbDir = "adb-extract\platform-tools"
+          Copy-Item "$adbDir\adb.exe"          "staging\adb\"
+          Copy-Item "$adbDir\AdbWinApi.dll"    "staging\adb\"
+          Copy-Item "$adbDir\AdbWinUsbApi.dll" "staging\adb\"
+
+          Write-Host "Staged files:"
+          Get-ChildItem -Recurse staging
+
+          # Build installer (NSIS resolves File paths relative to .nsi location,
+          # so we pass the absolute path to the staging directory)
+          $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          $absStaging = (Resolve-Path "staging").Path
+          Write-Host "NSIS staging dir: $absStaging"
+          & $nsis /DVERSION=$env:VERSION /DSTAGING_DIR=$absStaging "installer\windows\DroidScreen.nsi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Copy to dist
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "installer\windows\DroidScreen-Setup.exe" "dist\DroidScreen-Windows-x64-v$env:VERSION-Setup.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+
+  # ── 2c. Android APK ───────────────────────────────────────
+  build-android:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.build_android == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.detect-changes.outputs.version_android }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Accept Android SDK licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+      # To produce signed release APKs, add these repository secrets:
+      #   KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+      # and uncomment the signing step below. Until then, debug builds are used.
+      #
+      # - name: Decode keystore
+      #   if: env.KEYSTORE_BASE64 != ''
+      #   run: echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+      #   env:
+      #     KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Package
+        run: |
+          mkdir dist
+          APK=$(find android/app/build/outputs/apk -name '*.apk' | head -1)
+          cp "$APK" "dist/DroidScreen-Android-v${VERSION}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*
+
+  # ── 3. Aggregate artefacts & create GitHub release ─────────
+  release:
+    needs: [detect-changes, build-macos, build-windows, build-android]
+    if: >-
+      always()
+      && needs.detect-changes.result == 'success'
+      && needs.detect-changes.outputs.any_changed == 'true'
+      && (needs.build-macos.result   == 'success' || needs.build-macos.result   == 'skipped')
+      && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+      && (needs.build-android.result == 'success' || needs.build-android.result == 'skipped')
+    runs-on: ubuntu-latest
+    env:
+      TAG:  ${{ needs.detect-changes.outputs.release_tag }}
+      MV:   ${{ needs.detect-changes.outputs.version_macos }}
+      WV:   ${{ needs.detect-changes.outputs.version_windows }}
+      AV:   ${{ needs.detect-changes.outputs.version_android }}
+      BM:   ${{ needs.detect-changes.outputs.build_macos }}
+      BW:   ${{ needs.detect-changes.outputs.build_windows }}
+      BA:   ${{ needs.detect-changes.outputs.build_android }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Download artefacts built in this run
+      - name: Download built artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+        continue-on-error: true
+
+      # For platforms that weren't rebuilt, grab their last artefact
+      - name: Carry forward unchanged platform artefacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-assets
+          LAST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          [ -z "$LAST_TAG" ] && { echo "No previous release"; exit 0; }
+
+          carry() {          # $1 = flag, $2 = pattern, $3 = label
+            if [ "$1" != "true" ]; then
+              echo "Carrying forward $3 from $LAST_TAG"
+              gh release download "$LAST_TAG" --pattern "$2" --dir release-assets 2>/dev/null \
+                || echo "  (no $3 artefact in previous release)"
+            fi
+          }
+          carry "$BM" "*macOS*"   "macOS"
+          carry "$BW" "*Windows*" "Windows"
+          carry "$BA" "*Android*" "Android"
+
+          echo "=== Release assets ==="
+          ls -lh release-assets/ 2>/dev/null || echo "(empty)"
+
+      # Persist bumped version.json so the next run reads correct values
+      - name: Commit version.json
+        run: |
+          jq -n --arg m "$MV" --arg w "$WV" --arg a "$AV" \
+            '{macos: $m, windows: $w, android: $a}' > version.json
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          git diff --cached --quiet && { echo "version.json unchanged"; exit 0; }
+          git commit -m "chore: bump versions → mac $MV / win $WV / apk $AV [skip ci]"
+          git pull --rebase origin main
+          git push
+
+      # Create the release with all platform artefacts
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status() { [ "$1" = "true" ] && echo "Updated" || echo "Carried forward"; }
+
+          cat > notes.md <<EOF
+          ## DroidScreen $TAG
+
+          ### Component Versions
+          | Platform | Version | Status |
+          |----------|---------|--------|
+          | macOS ARM    | \`v${MV}\` | $(status "$BM") |
+          | Windows x64  | \`v${WV}\` | $(status "$BW") |
+          | Android APK  | \`v${AV}\` | $(status "$BA") |
+
+          ---
+          _Commit \`${GITHUB_SHA::8}\` · [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_
+          EOF
+
+          COMMIT=$(git rev-parse HEAD)
+
+          if ls release-assets/* 1>/dev/null 2>&1; then
+            gh release create "$TAG" release-assets/* \
+              --target "$COMMIT" \
+              --title "DroidScreen $TAG" \
+              --notes-file notes.md
+          else
+            gh release create "$TAG" \
+              --target "$COMMIT" \
+              --title "DroidScreen $TAG" \
+              --notes-file notes.md
+          fi
+
+          echo "### Release created: $TAG" >> "$GITHUB_STEP_SUMMARY"
