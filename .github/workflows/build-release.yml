@@ -438,15 +438,20 @@ jobs:
           ls -lh release-assets/ 2>/dev/null || echo "(empty)"
 
       # Persist bumped version.json so the next run reads correct values
-      - name: Commit version.json
+      - name: Commit version.json and update README
         run: |
           jq -n --arg m "$MV" --arg w "$WV" --arg a "$AV" \
             '{macos: $m, windows: $w, android: $a}' > version.json
 
+          # Update version table in README.md
+          sed -i'' -e "s/| macOS desktop | \`[^']*\` |/| macOS desktop | \`$MV\` |/" README.md
+          sed -i'' -e "s/| Windows desktop | \`[^']*\` |/| Windows desktop | \`$WV\` |/" README.md
+          sed -i'' -e "s/| Android app | \`[^']*\` |/| Android app | \`$AV\` |/" README.md
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add version.json
-          git diff --cached --quiet && { echo "version.json unchanged"; exit 0; }
+          git add version.json README.md
+          git diff --cached --quiet && { echo "versions unchanged"; exit 0; }
           git commit -m "chore: bump versions → mac $MV / win $WV / apk $AV [skip ci]"
           git pull --rebase origin main
           git push
