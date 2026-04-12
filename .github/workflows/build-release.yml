@@ -66,18 +66,20 @@ jobs:
           # Multiple tags can be combined: "[windows] [norelease]"
           # When any platform tag is present, ONLY those platforms build
           # (overrides file-based detection entirely).
-          MSG=$(git log -1 --pretty=%B)
-          echo "--- commit message ---"
-          echo "$MSG"
+          # Only scan the FIRST LINE (subject) of the commit message
+          # to avoid false positives from body text mentioning tags.
+          SUBJECT=$(git log -1 --pretty=%s)
+          echo "--- commit subject ---"
+          echo "$SUBJECT"
           echo "----------------------"
 
           HAS_WIN=false; HAS_MAC=false; HAS_DROID=false
           HAS_PLATFORM_TAG=false; SKIP_RELEASE=false
 
-          echo "$MSG" | grep -qi '\[windows\]\|\[win\]'  && { HAS_WIN=true;   HAS_PLATFORM_TAG=true; }
-          echo "$MSG" | grep -qi '\[macos\]\|\[mac\]'    && { HAS_MAC=true;   HAS_PLATFORM_TAG=true; }
-          echo "$MSG" | grep -qi '\[android\]'           && { HAS_DROID=true; HAS_PLATFORM_TAG=true; }
-          echo "$MSG" | grep -qi '\[norelease\]'         && SKIP_RELEASE=true
+          if echo "$SUBJECT" | grep -qi '\[windows\]\|\[win\]';  then HAS_WIN=true;   HAS_PLATFORM_TAG=true; fi
+          if echo "$SUBJECT" | grep -qi '\[macos\]\|\[mac\]';    then HAS_MAC=true;   HAS_PLATFORM_TAG=true; fi
+          if echo "$SUBJECT" | grep -qi '\[android\]';           then HAS_DROID=true; HAS_PLATFORM_TAG=true; fi
+          if echo "$SUBJECT" | grep -qi '\[norelease\]';         then SKIP_RELEASE=true; fi
 
           echo "skip_release=$SKIP_RELEASE" >> "$GITHUB_OUTPUT"
 

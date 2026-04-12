@@ -17,6 +17,7 @@
 #include "gpu_color_converter.h"
 
 #include <cstdio>
+#include <string>
 #include <d3dcompiler.h>
 
 using Microsoft::WRL::ComPtr;
