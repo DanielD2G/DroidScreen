@@ -626,6 +626,7 @@ static std::vector<DisplayInfo> enumerate_displays() {
 // ============================================================================
 
 static std::string g_adb_path;
+static HANDLE g_singleInstanceMutex = nullptr;
 
 /// Run a process and capture stdout. Returns exit code, -1 on failure.
 static int run_process(const std::string &cmd, std::string *output = nullptr) {
@@ -690,6 +691,32 @@ static int run_process(const std::string &cmd, std::string *output = nullptr) {
 static const std::string &adb_find_path() {
   if (!g_adb_path.empty())
     return g_adb_path;
+
+  // 1. Bundled ADB in the NSIS install dir (reads InstallDir from registry).
+  //    The NSIS installer writes: HKCU\Software\DroidScreen "InstallDir"
+  //    and installs adb to: <InstallDir>\adb\adb.exe
+  {
+    HKEY hk = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegistryKey, 0, KEY_READ, &hk) ==
+        ERROR_SUCCESS) {
+      wchar_t installDir[MAX_PATH] = {};
+      DWORD sz = sizeof(installDir);
+      if (RegQueryValueExW(hk, L"InstallDir", nullptr, nullptr,
+                           reinterpret_cast<BYTE *>(installDir), &sz) ==
+          ERROR_SUCCESS) {
+        char narrow[MAX_PATH] = {};
+        WideCharToMultiByte(CP_ACP, 0, installDir, -1, narrow, MAX_PATH,
+                            nullptr, nullptr);
+        std::string bundledAdb = std::string(narrow) + "\\adb\\adb.exe";
+        if (GetFileAttributesA(bundledAdb.c_str()) != INVALID_FILE_ATTRIBUTES) {
+          g_adb_path = bundledAdb;
+          RegCloseKey(hk);
+          return g_adb_path;
+        }
+      }
+      RegCloseKey(hk);
+    }
+  }
 
   // Check candidates.
   const char *candidates[] = {
@@ -2251,6 +2278,50 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam,
 // ============================================================================
 
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+  // ── Single-instance guard ────────────────────────────────────────────────
+  // Si ya hay una instancia corriendo, la nueva la mata antes de continuar.
+  // La nueva instancia "gana": envía WM_CLOSE gracioso, espera 800ms,
+  // luego force-kill si sigue vivo, y re-adquiere el mutex.
+  {
+    static const wchar_t *kMutexName = L"Global\\DroidScreenSingleInstance";
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+      if (hMutex) {
+        CloseHandle(hMutex);
+        hMutex = nullptr;
+      }
+      // kWindowClass = L"DroidScreenHiddenWnd" (defined at line 73).
+      // FindWindowW busca entre ventanas existentes — la nuestra aún no está
+      // registrada, así que solo encuentra la instancia anterior.
+      HWND hExisting = FindWindowW(kWindowClass, nullptr);
+      if (hExisting) {
+        DWORD existingPid = 0;
+        GetWindowThreadProcessId(hExisting, &existingPid);
+        PostMessageW(hExisting, WM_CLOSE, 0, 0); // shutdown gracioso
+        Sleep(800);
+        if (existingPid) {
+          HANDLE hProc =
+              OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, existingPid);
+          if (hProc) {
+            if (WaitForSingleObject(hProc, 0) != WAIT_OBJECT_0) {
+              // Sigue vivo — force-kill.
+              TerminateProcess(hProc, 0);
+              WaitForSingleObject(hProc, 2000);
+            }
+            CloseHandle(hProc);
+          }
+        }
+      } else {
+        // Sin ventana (carrera): esperar a que el proceso anterior cierre.
+        Sleep(800);
+      }
+      // Re-adquirir el mutex como único dueño.
+      hMutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    }
+    g_singleInstanceMutex = hMutex;
+  }
+  // ── End single-instance guard ────────────────────────────────────────────
+
   // Make the process DPI-aware so that all Win32 APIs (GetMonitorInfoW,
   // DXGI output descs, etc.) return physical pixel coordinates instead of
   // DPI-scaled logical coordinates.  Without this, a 2560x1600 monitor at
@@ -2338,6 +2409,11 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
   }
 
   winrt::uninit_apartment();
+
+  if (g_singleInstanceMutex) {
+    CloseHandle(g_singleInstanceMutex);
+    g_singleInstanceMutex = nullptr;
+  }
 
   return 0;
 }
