@@ -340,6 +340,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.detect-changes.outputs.version_android }}
+      HAS_SIGNING_KEY: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.KEYSTORE_PASSWORD != '' && secrets.KEY_ALIAS != '' && secrets.KEY_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -356,12 +357,14 @@ jobs:
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
       - name: Decode release keystore
+        if: env.HAS_SIGNING_KEY == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
 
       - name: Build signed APK
+        if: env.HAS_SIGNING_KEY == 'true'
         working-directory: android
         env:
           DROIDSCREEN_RELEASE_STORE_FILE: ${{ github.workspace }}/android/app/release.keystore
@@ -369,6 +372,14 @@ jobs:
           DROIDSCREEN_RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           DROIDSCREEN_RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Build unsigned APK
+        if: env.HAS_SIGNING_KEY != 'true'
+        working-directory: android
+        run: |
+          echo "::warning::No signing secrets configured — building unsigned APK"
           chmod +x gradlew
           ./gradlew assembleRelease
 
