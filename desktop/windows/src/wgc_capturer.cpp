@@ -140,7 +140,7 @@ WGCCapturer::FrameSlot* WGCCapturer::acquire_frame_slot(
             desc.Format           = format;
             desc.SampleDesc.Count = 1;
             desc.Usage            = D3D11_USAGE_DEFAULT;
-            desc.BindFlags        = 0;
+            desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
 
             Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
             HRESULT hr = device_->CreateTexture2D(

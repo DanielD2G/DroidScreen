@@ -1,15 +1,21 @@
 /*
- * DroidScreen Windows - FFmpeg-based H.264 encoder
+ * DroidScreen Windows - FFmpeg-based H.264 encoder (zero-copy GPU path)
  *
- * Uses libavcodec for H.264 encoding with automatic hardware detection
- * and software fallback. Tries encoders in order:
+ * Uses libavcodec for H.264 encoding with automatic hardware detection.
+ * Tries encoders in order:
  *   1. h264_nvenc  (NVIDIA)
  *   2. h264_qsv    (Intel Quick Sync)
  *   3. h264_amf    (AMD AMF)
- *   4. libx264     (software fallback)
  *
- * Input: ID3D11Texture2D* (BGRA) from WGC capturer.
- * Conversion: BGRA -> NV12 via libswscale (replaces the HLSL color converter).
+ * The encoding pipeline keeps all data on the GPU:
+ *   1. GpuColorConverter converts BGRA/FP16 -> NV12 via HLSL shaders (GPU).
+ *   2. NV12 texture is copied to the FFmpeg D3D11VA hardware frame pool (GPU).
+ *   3. avcodec_send_frame passes the D3D11 texture directly to the
+ *      hardware encoder (zero-copy for NVENC/QSV/AMF).
+ *
+ * This eliminates the CPU readback (Map/Unmap), CPU color conversion
+ * (sws_scale), and CPU->GPU DMA that caused 10%+ GPU overhead.
+ *
  * Output: H.264 Annex B NAL units via the on_packet callback.
  *
  * Configuration targets ultra-low-latency streaming:
@@ -21,21 +27,23 @@
 #pragma once
 
 #include "droidscreen/encoder.h"
+#include "gpu_color_converter.h"
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include <d3d11.h>
 #include <wrl/client.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
-#include <libswscale/swscale.h>
 }
 
 namespace droidscreen {
@@ -47,8 +55,8 @@ public:
 
     /// Set the D3D11 device to use (must be called before init).
     /// If d3d_mutex is non-null, the encoder will lock it around all
-    /// D3D11 context calls (CopyResource, Map, Unmap) to prevent races
-    /// with the WGC capturer's callback thread.
+    /// D3D11 context calls to prevent races with the WGC capturer's
+    /// callback thread.
     void set_d3d_device(ID3D11Device* device, ID3D11DeviceContext* context,
                         std::mutex* d3d_mutex = nullptr);
 
@@ -65,8 +73,11 @@ private:
     bool try_encoder(const char* encoder_name, uint32_t width, uint32_t height,
                      uint32_t fps, uint32_t bitrate_kbps);
 
-    /// Create the D3D11 staging texture for GPU->CPU readback.
-    bool create_staging_texture(uint32_t width, uint32_t height, DXGI_FORMAT format);
+    /// Create FFmpeg D3D11VA hardware device and frames contexts.
+    bool create_hw_contexts(uint32_t width, uint32_t height);
+
+    /// Copy the converter's NV12 texture to the FFmpeg pool texture.
+    bool copy_nv12_to_pool(ID3D11Texture2D* src_nv12);
 
     /// Emit SPS/PPS as a config packet via the user callback.
     void emit_config(const uint8_t* data, size_t size, int64_t timestamp_us,
@@ -79,17 +90,18 @@ private:
     // Optional shared mutex for D3D11 context thread safety.
     std::mutex* d3d_mutex_ = nullptr;
 
-    // Staging texture for GPU -> CPU copy.
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_texture_;
+    // GPU color converter (BGRA/FP16 -> NV12 via shaders).
+    std::unique_ptr<GpuColorConverter> gpu_converter_;
+
+    // FFmpeg hardware contexts for zero-copy D3D11 encoding.
+    AVBufferRef* hw_device_ctx_ = nullptr;
+    AVBufferRef* hw_frames_ctx_ = nullptr;
 
     // FFmpeg codec context.
     AVCodecContext* codec_ctx_ = nullptr;
 
-    // SwsContext for BGRA -> NV12 conversion.
-    SwsContext* sws_ctx_ = nullptr;
-
-    // AVFrame for NV12 data to send to encoder.
-    AVFrame* nv12_frame_ = nullptr;
+    // Reusable AVFrame for D3D11 hardware frames.
+    AVFrame* hw_frame_ = nullptr;
 
     // AVPacket for receiving encoded data.
     AVPacket* pkt_ = nullptr;
@@ -98,10 +110,8 @@ private:
     uint32_t height_  = 0;
     uint32_t fps_     = 0;
     uint32_t bitrate_kbps_ = 0;
-    DXGI_FORMAT source_format_ = DXGI_FORMAT_UNKNOWN;
 
     std::string encoder_name_;
-    std::vector<uint8_t> bgra_scratch_;
 
     std::atomic<bool> keyframe_pending_{false};
     bool config_sent_ = false;

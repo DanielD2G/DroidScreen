@@ -44,6 +44,7 @@ jobs:
       build_windows: ${{ steps.changes.outputs.windows }}
       build_android: ${{ steps.changes.outputs.android }}
       any_changed:   ${{ steps.changes.outputs.any_changed }}
+      skip_release:  ${{ steps.changes.outputs.skip_release }}
       version_macos:   ${{ steps.versions.outputs.macos }}
       version_windows: ${{ steps.versions.outputs.windows }}
       version_android: ${{ steps.versions.outputs.android }}
@@ -57,6 +58,42 @@ jobs:
       - name: Detect changes since last release
         id: changes
         run: |
+          # ── Commit-message overrides ──────────────────────
+          # [windows] / [win]     → build only Windows
+          # [macos]  / [mac]      → build only macOS
+          # [android]             → build only Android
+          # [norelease]           → skip release creation
+          # Multiple tags can be combined: "[windows] [norelease]"
+          # When any platform tag is present, ONLY those platforms build
+          # (overrides file-based detection entirely).
+          MSG=$(git log -1 --pretty=%B)
+          echo "--- commit message ---"
+          echo "$MSG"
+          echo "----------------------"
+
+          HAS_WIN=false; HAS_MAC=false; HAS_DROID=false
+          HAS_PLATFORM_TAG=false; SKIP_RELEASE=false
+
+          echo "$MSG" | grep -qi '\[windows\]\|\[win\]'  && { HAS_WIN=true;   HAS_PLATFORM_TAG=true; }
+          echo "$MSG" | grep -qi '\[macos\]\|\[mac\]'    && { HAS_MAC=true;   HAS_PLATFORM_TAG=true; }
+          echo "$MSG" | grep -qi '\[android\]'           && { HAS_DROID=true; HAS_PLATFORM_TAG=true; }
+          echo "$MSG" | grep -qi '\[norelease\]'         && SKIP_RELEASE=true
+
+          echo "skip_release=$SKIP_RELEASE" >> "$GITHUB_OUTPUT"
+
+          # If a platform tag is present, use it directly — skip file detection
+          if [ "$HAS_PLATFORM_TAG" = "true" ]; then
+            echo "Platform override from commit message"
+            echo "macos=$HAS_MAC"       >> "$GITHUB_OUTPUT"
+            echo "windows=$HAS_WIN"     >> "$GITHUB_OUTPUT"
+            echo "android=$HAS_DROID"   >> "$GITHUB_OUTPUT"
+            ($HAS_MAC || $HAS_WIN || $HAS_DROID) \
+              && echo "any_changed=true" >> "$GITHUB_OUTPUT" \
+              || echo "any_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ── Standard file-based detection ─────────────────
           # Manual trigger with force → build everything
           if [ "${{ github.event.inputs.force_all }}" = "true" ]; then
             echo "Force-building all platforms (workflow_dispatch)"
@@ -399,8 +436,10 @@ jobs:
     needs: [detect-changes, build-macos, build-windows, build-android]
     if: >-
       always()
+      && github.ref == 'refs/heads/main'
       && needs.detect-changes.result == 'success'
       && needs.detect-changes.outputs.any_changed == 'true'
+      && needs.detect-changes.outputs.skip_release != 'true'
       && (needs.build-macos.result   == 'success' || needs.build-macos.result   == 'skipped')
       && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
       && (needs.build-android.result == 'success' || needs.build-android.result == 'skipped')

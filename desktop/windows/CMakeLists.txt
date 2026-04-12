@@ -2,27 +2,26 @@ cmake_minimum_required(VERSION 3.14)
 
 # Find FFmpeg libraries.
 # Supports: vcpkg, prebuilt BtbN builds (via -DFFMPEG_ROOT=...), or system install.
+# Note: swscale is no longer needed — color conversion is done on GPU via HLSL shaders.
 if(DEFINED FFMPEG_ROOT)
     # Prebuilt FFmpeg from BtbN or custom location.
     set(AVCODEC_INCLUDE_DIR "${FFMPEG_ROOT}/include")
     find_library(AVCODEC_LIBRARY avcodec PATHS "${FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
     find_library(AVUTIL_LIBRARY  avutil  PATHS "${FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
-    find_library(SWSCALE_LIBRARY swscale PATHS "${FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
     message(STATUS "FFmpeg from FFMPEG_ROOT: ${FFMPEG_ROOT}")
     message(STATUS "  avcodec:  ${AVCODEC_LIBRARY}")
     message(STATUS "  avutil:   ${AVUTIL_LIBRARY}")
-    message(STATUS "  swscale:  ${SWSCALE_LIBRARY}")
 else()
     find_path(AVCODEC_INCLUDE_DIR libavcodec/avcodec.h)
     find_library(AVCODEC_LIBRARY avcodec)
     find_library(AVUTIL_LIBRARY avutil)
-    find_library(SWSCALE_LIBRARY swscale)
 endif()
 
 add_executable(droidscreen_desktop WIN32
     src/main.cpp
     src/wgc_capturer.cpp
     src/ffmpeg_encoder.cpp
+    src/gpu_color_converter.cpp
     src/mouse_injector_win.cpp
     src/touch_injector_win.cpp
     src/virtual_display_win.cpp
@@ -43,9 +42,9 @@ target_link_libraries(droidscreen_desktop
         droidscreen_protocol
         ${AVCODEC_LIBRARY}
         ${AVUTIL_LIBRARY}
-        ${SWSCALE_LIBRARY}
         d3d11
         dxgi
+        d3dcompiler
         ws2_32
         windowsapp    # WinRT / C++/WinRT support
         shell32       # Shell_NotifyIcon, SHGetFolderPath

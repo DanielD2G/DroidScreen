@@ -1840,8 +1840,8 @@ static void connect_sync() {
     // Read back any stderr output that the encoder wrote.
     log_msg("[Stream] Encoder init failed for %ux%u@%ufps %ukbps", cap_w, cap_h,
             settings.fps, settings.bitrate_kbps);
-    log_msg("[Stream] No suitable H.264 encoder found "
-            "(tried NVENC, QSV, AMF, libx264)");
+    log_msg("[Stream] No suitable hardware H.264 encoder found "
+            "(tried NVENC, QSV, AMF — D3D11VA zero-copy)");
     update_status(L"Encoder init failed");
     g_app.encoder.reset();
     g_app.capturer.reset();
