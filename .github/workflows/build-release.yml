@@ -373,7 +373,7 @@ jobs:
 
       - name: Package
         run: |
-          mkdir dist
+          mkdir -p dist
           APK=$(find android/app/build/outputs/apk -name '*.apk' | head -1)
           cp "$APK" "dist/DroidScreen-Android-v${VERSION}.apk"
 
