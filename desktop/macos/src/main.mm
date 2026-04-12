@@ -528,6 +528,16 @@ static NSString* adb_find_path() {
     static NSString* cached = nil;
     if (cached) return cached;
 
+    // 1. Bundled ADB inside the .app (injected by CI/installer).
+    //    Path: <App>.app/Contents/Resources/adb/adb
+    NSString* bundleAdb = [[[NSBundle mainBundle] resourcePath]
+                            stringByAppendingPathComponent:@"adb/adb"];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:bundleAdb]) {
+        cached = bundleAdb;
+        NSLog(@"[ADB] Found adb in bundle: %@", cached);
+        return cached;
+    }
+
     // Common locations to check.
     NSArray<NSString*>* candidates = @[
         @"/opt/homebrew/bin/adb",
@@ -2284,6 +2294,36 @@ struct StreamSettings {
 
 int main(int argc, const char* argv[]) {
     @autoreleasepool {
+        // ── Single-instance guard ──────────────────────────────────────────────
+        // Si hay otra instancia corriendo, terminarla antes de continuar.
+        // La nueva instancia "gana" y la vieja es terminada.
+        {
+            NSString* const kBundleID = @"com.droidscreen.desktop";
+            NSArray<NSRunningApplication*>* others =
+                [NSRunningApplication runningApplicationsWithBundleIdentifier:kBundleID];
+            BOOL foundOther = NO;
+            for (NSRunningApplication* other in others) {
+                if (other.processIdentifier == getpid()) continue;
+                NSLog(@"[DroidScreen] Terminating existing instance PID %d",
+                      (int)other.processIdentifier);
+                [other terminate];
+                foundOther = YES;
+            }
+            if (foundOther) {
+                usleep(800000); // 800ms para shutdown limpio
+                for (NSRunningApplication* other in others) {
+                    if (other.processIdentifier == getpid()) continue;
+                    if (!other.terminated) {
+                        NSLog(@"[DroidScreen] Force-terminating PID %d",
+                              (int)other.processIdentifier);
+                        [other forceTerminate];
+                    }
+                }
+                usleep(200000); // 200ms post force-kill
+            }
+        }
+        // ── End single-instance guard ──────────────────────────────────────────
+
         // Debug logging: all output goes to ~/Library/Logs/DroidScreen/droidscreen.log
         setup_debug_logging();
         install_crash_handlers();

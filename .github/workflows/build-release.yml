@@ -83,7 +83,7 @@ jobs:
           PROTO=$(count   '^protocol/')
           COMMON=$(count  '^desktop/common/')
           ROOT_CM=$(count '^CMakeLists\.txt$')
-          MAC=$(count     '^desktop/macos/')
+          MAC=$(count     '^desktop/macos/\|^installer/macos/')
           WIN=$(count     '^desktop/windows/')
           SHADER=$(count  '^desktop/shaders/')
           DROID=$(count   '^android/')
@@ -176,21 +176,49 @@ jobs:
       - name: Build signed app bundle
         run: ./scripts/build_macos.sh
 
-      - name: Package
+      - name: Download and inject ADB into app bundle
         run: |
-          mkdir dist && cd build-macos/desktop/macos
-          if [ -d droidscreen_desktop.app ]; then
-            ditto -c -k --keepParent droidscreen_desktop.app ../../../dist/DroidScreen-macOS-arm64-v${VERSION}.zip
-          else
-            ditto -c -k droidscreen_desktop ../../../dist/DroidScreen-macOS-arm64-v${VERSION}.zip
-          fi
+          curl -fsSL \
+            "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip" \
+            -o platform-tools.zip
+          unzip -q platform-tools.zip -d adb-extract
+          APP="build-macos/desktop/macos/droidscreen_desktop.app"
+          ADB_DEST="$APP/Contents/Resources/adb"
+          mkdir -p "$ADB_DEST"
+          cp adb-extract/platform-tools/adb "$ADB_DEST/adb"
+          chmod +x "$ADB_DEST/adb"
+          echo "ADB inyectado: $(file $ADB_DEST/adb)"
+
+      - name: Re-sign app bundle after ADB injection
+        run: |
+          APP="build-macos/desktop/macos/droidscreen_desktop.app"
+          IDENTITY="${DROIDSCREEN_CODESIGN_IDENTITY:--}"
+          # Firmar el binario adb primero, luego re-firmar el bundle completo.
+          # Añadir un binario nuevo invalida la firma anterior.
+          codesign --force --sign "$IDENTITY" "$APP/Contents/Resources/adb/adb" || true
+          codesign --force --deep --sign "$IDENTITY" \
+            --entitlements desktop/macos/DroidScreen.entitlements \
+            "$APP"
+
+      - name: Build .dmg installer
+        run: |
+          mkdir -p dist
+          chmod +x installer/macos/build_dmg.sh
+          ./installer/macos/build_dmg.sh \
+            "${VERSION}" \
+            "build-macos/desktop/macos/droidscreen_desktop.app" \
+            "dist"
 
       - name: Verify code signature
         if: always()
         run: |
-          codesign -dv --verbose=4 build-macos/desktop/macos/droidscreen_desktop.app 2>&1 | tee codesign.txt
+          APP="build-macos/desktop/macos/droidscreen_desktop.app"
+          codesign -dv --verbose=4 "$APP" 2>&1 | tee codesign.txt
           echo "### macOS signing" >> "$GITHUB_STEP_SUMMARY"
           sed -n '1,40p' codesign.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "### ADB binary signature" >> "$GITHUB_STEP_SUMMARY"
+          codesign -dv "$APP/Contents/Resources/adb/adb" 2>&1 \
+            >> "$GITHUB_STEP_SUMMARY" || echo "(adb not signed)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
