@@ -107,11 +107,25 @@ WGCCapturer::~WGCCapturer() {
 void WGCCapturer::set_target_fps(uint32_t fps) {
     if (fps == 0) {
         min_frame_interval_us_.store(0, std::memory_order_relaxed);
-        return;
+    } else {
+        min_frame_interval_us_.store(
+            static_cast<int64_t>(1000000ull / fps), std::memory_order_relaxed);
     }
 
-    min_frame_interval_us_.store(
-        static_cast<int64_t>(1000000ull / fps), std::memory_order_relaxed);
+    // Also update WGC's MinimumFrameInterval so it delivers frames
+    // at the right rate (avoids unnecessary FrameArrived callbacks).
+    // TimeSpan is in 100ns ticks; 10,000,000 ticks = 1 second.
+    if (wrt_ && wrt_->session) {
+        try {
+            int64_t ticks = (fps == 0)
+                ? 0
+                : static_cast<int64_t>(10'000'000ull / fps);
+            wrt_->session.MinimumFrameInterval(
+                winrt::Windows::Foundation::TimeSpan{ ticks });
+        } catch (...) {
+            // MinimumFrameInterval not available on older Windows builds.
+        }
+    }
 }
 
 WGCCapturer::FrameSlot* WGCCapturer::acquire_frame_slot(
@@ -325,6 +339,19 @@ bool WGCCapturer::init(uint32_t display_index) {
         // Not available on older builds.
     }
 
+    // Request maximum frame rate from WGC. By default, WGC may cap
+    // frame delivery at 60fps regardless of the display refresh rate.
+    // Setting MinimumFrameInterval to zero tells WGC to deliver frames
+    // as fast as the display refreshes (e.g. 120Hz VDD → 120 fps).
+    // This API was added in Windows 11 22H2 (build 22621).
+    try {
+        session.MinimumFrameInterval(
+            winrt::Windows::Foundation::TimeSpan{ 0 });
+        fprintf(stderr, "[wgc] MinimumFrameInterval set to 0 (unlimited)\n");
+    } catch (...) {
+        fprintf(stderr, "[wgc] MinimumFrameInterval not supported on this build\n");
+    }
+
     // Store WinRT objects in the pimpl struct (no operator new issues).
     wrt_ = std::make_unique<WinRTState>();
     wrt_->item    = item;
@@ -437,6 +464,15 @@ bool WGCCapturer::init_with_monitor(HMONITOR monitor) {
     try {
         session.IsCursorCaptureEnabled(true);
     } catch (...) {
+    }
+
+    // Request maximum frame rate from WGC (see init() for details).
+    try {
+        session.MinimumFrameInterval(
+            winrt::Windows::Foundation::TimeSpan{ 0 });
+        fprintf(stderr, "[wgc] MinimumFrameInterval set to 0 (unlimited)\n");
+    } catch (...) {
+        fprintf(stderr, "[wgc] MinimumFrameInterval not supported on this build\n");
     }
 
     // Store WinRT objects.

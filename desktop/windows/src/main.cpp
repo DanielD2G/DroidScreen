@@ -1220,6 +1220,11 @@ static void apply_settings_from_dialog(HWND dlg) {
     log_msg("[Settings] Restarting pipeline with new settings...");
     std::thread([]() {
       disconnect_sync();
+      // Give Windows time to fully tear down the virtual display and
+      // release the WGC capture session before creating new ones.
+      // Without this delay, WGC may freeze after ~60 frames because
+      // the new display isn't fully registered with DWM yet.
+      Sleep(500);
       connect_sync();
     }).detach();
   }
