@@ -187,14 +187,14 @@ jobs:
           mkdir -p "$ADB_DEST"
           cp adb-extract/platform-tools/adb "$ADB_DEST/adb"
           chmod +x "$ADB_DEST/adb"
-          echo "ADB inyectado: $(file $ADB_DEST/adb)"
+          echo "ADB injected: $(file $ADB_DEST/adb)"
 
       - name: Re-sign app bundle after ADB injection
         run: |
           APP="build-macos/desktop/macos/droidscreen_desktop.app"
           IDENTITY="${DROIDSCREEN_CODESIGN_IDENTITY:--}"
-          # Firmar el binario adb primero, luego re-firmar el bundle completo.
-          # Añadir un binario nuevo invalida la firma anterior.
+          # Sign the adb binary first, then re-sign the full bundle.
+          # Adding a new binary invalidates the previous signature.
           codesign --force --sign "$IDENTITY" "$APP/Contents/Resources/adb/adb" || true
           codesign --force --deep --sign "$IDENTITY" \
             --entitlements desktop/macos/DroidScreen.entitlements \

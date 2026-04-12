@@ -13,10 +13,10 @@
 
 <br/>
 
-[![Status](https://img.shields.io/badge/status-beta-f59e0b?style=for-the-badge)](https://github.com)
+[![Status](https://img.shields.io/badge/status-beta-f59e0b?style=for-the-badge)](https://github.com/DanielD2G/DroidScreen)
 [![License](https://img.shields.io/badge/license-MIT-6366f1?style=for-the-badge)](LICENSE)
-[![Platform](https://img.shields.io/badge/macOS%20%7C%20Windows-0a0a0a?style=for-the-badge&logo=apple&logoColor=white)](https://github.com)
-[![Android](https://img.shields.io/badge/Android%208.0%2B-3ddc84?style=for-the-badge&logo=android&logoColor=white)](https://github.com)
+[![Platform](https://img.shields.io/badge/macOS%20%7C%20Windows-0a0a0a?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/DanielD2G/DroidScreen)
+[![Android](https://img.shields.io/badge/Android%208.0%2B-3ddc84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/DanielD2G/DroidScreen)
 
 <br/>
 
@@ -244,9 +244,9 @@ For detailed build instructions and prerequisites, check the build scripts insid
 
 | Component | Current version |
 |---|:---:|
-| macOS desktop | `0.0.16` |
-| Windows desktop | `0.0.31` |
-| Android app | `0.0.14` |
+| macOS desktop | `0.0.1` |
+| Windows desktop | `0.0.1` |
+| Android app | `0.0.1` |
 
 ---
 
