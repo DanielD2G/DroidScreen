@@ -2063,6 +2063,11 @@ static void disconnect_sync() {
   ScopedWinrtApartment apartment;
   if (!g_app.isStreaming.load())
     return;
+
+  // Mark not-streaming FIRST — prevents stats timer and device timer
+  // from accessing objects we're about to destroy (race condition fix).
+  g_app.isStreaming.store(false);
+
   log_msg("[Stream] Disconnecting...");
 
   // Stop stats timer on main thread.
@@ -2111,7 +2116,6 @@ static void disconnect_sync() {
 
   adb_forward_remove(settings.port);
 
-  g_app.isStreaming.store(false);
   update_status(L"Disconnected");
 
   log_msg("[Stream] Disconnected");
