@@ -3,9 +3,30 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val releaseStoreFile = System.getenv("DROIDSCREEN_RELEASE_STORE_FILE")
+val releaseStorePassword = System.getenv("DROIDSCREEN_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = System.getenv("DROIDSCREEN_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = System.getenv("DROIDSCREEN_RELEASE_KEY_PASSWORD")
+val hasReleaseSigning =
+    !releaseStoreFile.isNullOrBlank() &&
+    !releaseStorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank()
+
 android {
     namespace = "com.droidscreen.app"
     compileSdk = 34
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
 
     defaultConfig {
         applicationId = "com.droidscreen.app"
@@ -22,6 +43,9 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

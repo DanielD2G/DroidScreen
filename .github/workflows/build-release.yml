@@ -355,18 +355,19 @@ jobs:
       - name: Accept Android SDK licenses
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
 
-      # To produce signed release APKs, add these repository secrets:
-      #   KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
-      # and uncomment the signing step below. Until then, debug builds are used.
-      #
-      # - name: Decode keystore
-      #   if: env.KEYSTORE_BASE64 != ''
-      #   run: echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
-      #   env:
-      #     KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      - name: Decode release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/release.keystore
 
-      - name: Build APK
+      - name: Build signed APK
         working-directory: android
+        env:
+          DROIDSCREEN_RELEASE_STORE_FILE: ${{ github.workspace }}/android/app/release.keystore
+          DROIDSCREEN_RELEASE_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          DROIDSCREEN_RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          DROIDSCREEN_RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease
@@ -374,7 +375,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          APK=$(find android/app/build/outputs/apk -name '*.apk' | head -1)
+          APK="android/app/build/outputs/apk/release/app-release.apk"
           cp "$APK" "dist/DroidScreen-Android-v${VERSION}.apk"
 
       - uses: actions/upload-artifact@v4
