@@ -70,6 +70,8 @@ bool FFmpegEncoder::create_hw_contexts(uint32_t width, uint32_t height) {
         static_cast<AVD3D11VADeviceContext*>(device_ctx->hwctx);
 
     // Reuse the D3D11 device from the WGC capturer — no extra device.
+    // AddRef because FFmpeg takes ownership and will Release on uninit.
+    device_.Get()->AddRef();
     d3d11_device_ctx->device = device_.Get();
 
     // Provide lock/unlock so FFmpeg serialises its own D3D11 context calls
