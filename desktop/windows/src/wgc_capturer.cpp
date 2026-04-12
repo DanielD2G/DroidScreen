@@ -41,22 +41,23 @@ using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
 // ---------------------------------------------------------------------------
 // ABI interface for GraphicsCaptureSession.MinUpdateInterval.
 // Part of IGraphicsCaptureSession5 (Windows 11 24H2, SDK 10.0.26100+).
-// Defined manually so we compile against older SDKs but can use the
-// property at runtime on systems that support it.
+// Namespaced to avoid collision with SDK headers that may already define it.
 // ---------------------------------------------------------------------------
 
+namespace abi_compat {
 struct __declspec(uuid("67c0ea62-1f85-5061-925a-239be0ac09cb"))
-IGraphicsCaptureSession5 : ::IInspectable {
+ICaptureSession5 : ::IInspectable {
     virtual HRESULT __stdcall get_MinUpdateInterval(int64_t* value) = 0;
     virtual HRESULT __stdcall put_MinUpdateInterval(int64_t value) = 0;
 };
+} // namespace abi_compat
 
 /// Try to set the capture session's minimum update interval.
 /// Returns true if the property was set, false if not supported.
 /// @param ticks_100ns  Interval in 100ns ticks (0 = unlimited).
 static bool try_set_min_update_interval(
         const GraphicsCaptureSession& session, int64_t ticks_100ns) {
-    auto session5 = session.try_as<IGraphicsCaptureSession5>();
+    auto session5 = session.try_as<abi_compat::ICaptureSession5>();
     if (!session5) return false;
     return SUCCEEDED(session5->put_MinUpdateInterval(ticks_100ns));
 }
