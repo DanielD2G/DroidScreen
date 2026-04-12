@@ -1,6 +1,7 @@
-# Build outputs
+# Build outputs & release artifacts
 build-*/
 build/
+dist/
 *.o
 *.a
 *.so
