@@ -588,8 +588,8 @@ void FFmpegEncoder::shutdown() {
         hw_device_ctx_ = nullptr;
     }
 
-    context_.Reset();
-    device_.Reset();
+    // NOTE: do NOT reset device_ / context_ here — they are borrowed
+    // from the capturer via set_d3d_device() and must survive re-init.
 
     encoder_name_.clear();
     config_sent_ = false;
