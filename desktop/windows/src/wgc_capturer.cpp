@@ -38,6 +38,29 @@ using namespace winrt::Windows::Graphics::Capture;
 using namespace winrt::Windows::Graphics::DirectX;
 using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
 
+// ---------------------------------------------------------------------------
+// ABI interface for GraphicsCaptureSession.MinUpdateInterval.
+// Part of IGraphicsCaptureSession5 (Windows 11 24H2, SDK 10.0.26100+).
+// Defined manually so we compile against older SDKs but can use the
+// property at runtime on systems that support it.
+// ---------------------------------------------------------------------------
+
+struct __declspec(uuid("67c0ea62-1f85-5061-925a-239be0ac09cb"))
+IGraphicsCaptureSession5 : ::IInspectable {
+    virtual HRESULT __stdcall get_MinUpdateInterval(int64_t* value) = 0;
+    virtual HRESULT __stdcall put_MinUpdateInterval(int64_t value) = 0;
+};
+
+/// Try to set the capture session's minimum update interval.
+/// Returns true if the property was set, false if not supported.
+/// @param ticks_100ns  Interval in 100ns ticks (0 = unlimited).
+static bool try_set_min_update_interval(
+        const GraphicsCaptureSession& session, int64_t ticks_100ns) {
+    auto session5 = session.try_as<IGraphicsCaptureSession5>();
+    if (!session5) return false;
+    return SUCCEEDED(session5->put_MinUpdateInterval(ticks_100ns));
+}
+
 namespace droidscreen {
 
 // ---------------------------------------------------------------------------
@@ -112,19 +135,14 @@ void WGCCapturer::set_target_fps(uint32_t fps) {
             static_cast<int64_t>(1000000ull / fps), std::memory_order_relaxed);
     }
 
-    // Also update WGC's MinimumFrameInterval so it delivers frames
+    // Also update WGC's MinUpdateInterval so it delivers frames
     // at the right rate (avoids unnecessary FrameArrived callbacks).
     // TimeSpan is in 100ns ticks; 10,000,000 ticks = 1 second.
     if (wrt_ && wrt_->session) {
-        try {
-            int64_t ticks = (fps == 0)
-                ? 0
-                : static_cast<int64_t>(10'000'000ull / fps);
-            wrt_->session.MinimumFrameInterval(
-                winrt::Windows::Foundation::TimeSpan{ ticks });
-        } catch (...) {
-            // MinimumFrameInterval not available on older Windows builds.
-        }
+        int64_t ticks = (fps == 0)
+            ? 0
+            : static_cast<int64_t>(10'000'000ull / fps);
+        try_set_min_update_interval(wrt_->session, ticks);
     }
 }
 
@@ -341,15 +359,13 @@ bool WGCCapturer::init(uint32_t display_index) {
 
     // Request maximum frame rate from WGC. By default, WGC may cap
     // frame delivery at 60fps regardless of the display refresh rate.
-    // Setting MinimumFrameInterval to zero tells WGC to deliver frames
+    // Setting MinUpdateInterval to zero tells WGC to deliver frames
     // as fast as the display refreshes (e.g. 120Hz VDD → 120 fps).
-    // This API was added in Windows 11 22H2 (build 22621).
-    try {
-        session.MinimumFrameInterval(
-            winrt::Windows::Foundation::TimeSpan{ 0 });
-        fprintf(stderr, "[wgc] MinimumFrameInterval set to 0 (unlimited)\n");
-    } catch (...) {
-        fprintf(stderr, "[wgc] MinimumFrameInterval not supported on this build\n");
+    // This API is IGraphicsCaptureSession5 (Windows 11 24H2+).
+    if (try_set_min_update_interval(session, 0)) {
+        fprintf(stderr, "[wgc] MinUpdateInterval set to 0 (unlimited)\n");
+    } else {
+        fprintf(stderr, "[wgc] MinUpdateInterval not supported on this build\n");
     }
 
     // Store WinRT objects in the pimpl struct (no operator new issues).
@@ -467,12 +483,10 @@ bool WGCCapturer::init_with_monitor(HMONITOR monitor) {
     }
 
     // Request maximum frame rate from WGC (see init() for details).
-    try {
-        session.MinimumFrameInterval(
-            winrt::Windows::Foundation::TimeSpan{ 0 });
-        fprintf(stderr, "[wgc] MinimumFrameInterval set to 0 (unlimited)\n");
-    } catch (...) {
-        fprintf(stderr, "[wgc] MinimumFrameInterval not supported on this build\n");
+    if (try_set_min_update_interval(session, 0)) {
+        fprintf(stderr, "[wgc] MinUpdateInterval set to 0 (unlimited)\n");
+    } else {
+        fprintf(stderr, "[wgc] MinUpdateInterval not supported on this build\n");
     }
 
     // Store WinRT objects.
