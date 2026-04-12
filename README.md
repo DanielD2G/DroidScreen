@@ -244,9 +244,9 @@ For detailed build instructions and prerequisites, check the build scripts insid
 
 | Component | Current version |
 |---|:---:|
-| macOS desktop | `0.0.4` |
-| Windows desktop | `0.0.4` |
-| Android app | `0.0.4` |
+| macOS desktop | `0.0.5` |
+| Windows desktop | `0.0.5` |
+| Android app | `0.0.5` |
 
 ---
 
