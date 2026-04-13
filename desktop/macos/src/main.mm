@@ -1026,13 +1026,17 @@ static NSImage* CreateStatusBarIcon() {
     y -= rowHeight;
     [self addLabel:@"Frame Rate:" toView:contentView atX:leftMargin y:y width:labelWidth];
     self.fpsPopup = [self addPopUpButton:contentView atX:controlLeft y:y width:controlWidth];
+    [self.fpsPopup addItemWithTitle:@"10 fps"];
+    [self.fpsPopup addItemWithTitle:@"15 fps"];
     [self.fpsPopup addItemWithTitle:@"30 fps"];
     [self.fpsPopup addItemWithTitle:@"60 fps"];
     [self.fpsPopup addItemWithTitle:@"120 fps"];
     NSInteger savedFPS = [[NSUserDefaults standardUserDefaults] integerForKey:kSettingFPS];
-    NSInteger fpsIdx = 1; // default: 60
-    if (savedFPS == 30) fpsIdx = 0;
-    else if (savedFPS == 120) fpsIdx = 2;
+    NSInteger fpsIdx = 3; // default: 60
+    if (savedFPS == 10) fpsIdx = 0;
+    else if (savedFPS == 15) fpsIdx = 1;
+    else if (savedFPS == 30) fpsIdx = 2;
+    else if (savedFPS == 120) fpsIdx = 4;
     [self.fpsPopup selectItemAtIndex:fpsIdx];
 
     // --- Row 2: Bitrate ---
@@ -1411,8 +1415,10 @@ static NSImage* CreateStatusBarIcon() {
     NSInteger fpsIdx = self.fpsPopup.indexOfSelectedItem;
     NSInteger fps;
     switch (fpsIdx) {
-        case 0: fps = 30; break;
-        case 2: fps = 120; break;
+        case 0: fps = 10; break;
+        case 1: fps = 15; break;
+        case 2: fps = 30; break;
+        case 4: fps = 120; break;
         default: fps = 60; break;
     }
     [defaults setInteger:fps forKey:kSettingFPS];
