@@ -488,6 +488,7 @@ static void setSystemMuted(bool muted) {
 // =============================================================================
 
 static NSString* const kSettingFPS          = @"DroidScreenFPS";
+static NSString* const kSettingMinIdleFPS   = @"DroidScreenMinIdleFPS";
 static NSString* const kSettingBitrate      = @"DroidScreenBitrate";      // kbps
 static NSString* const kSettingResolution   = @"DroidScreenResolution";   // index
 static NSString* const kSettingScale        = @"DroidScreenScale";        // index
@@ -517,6 +518,32 @@ static const char* kBitrateLabels[] = {
     "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "25 Mbps", "30 Mbps"
 };
 static const int kBitrateCount = sizeof(kBitrates) / sizeof(kBitrates[0]);
+static const uint32_t kMinIdleFPSOptions[] = { 1, 10, 15, 30 };
+static NSString* const kMinIdleFPSLabels[] = {
+    @"1 fps", @"10 fps", @"15 fps", @"30 fps"
+};
+static const int kMinIdleFPSCount =
+    sizeof(kMinIdleFPSOptions) / sizeof(kMinIdleFPSOptions[0]);
+
+static uint32_t sanitize_min_idle_fps(uint32_t fps) {
+    switch (fps) {
+        case 1:
+        case 10:
+        case 15:
+        case 30:
+            return fps;
+        default:
+            return 30;
+    }
+}
+
+static NSInteger min_idle_fps_index(uint32_t fps) {
+    fps = sanitize_min_idle_fps(fps);
+    for (NSInteger i = 0; i < kMinIdleFPSCount; i++) {
+        if (kMinIdleFPSOptions[i] == fps) return i;
+    }
+    return kMinIdleFPSCount - 1;
+}
 
 // =============================================================================
 #pragma mark - ADB Helpers
@@ -771,6 +798,7 @@ static NSImage* CreateStatusBarIcon() {
 // Settings window.
 @property (nonatomic, strong) NSWindow* settingsWindow;
 @property (nonatomic, strong) NSPopUpButton* fpsPopup;
+@property (nonatomic, strong) NSPopUpButton* minFpsPopup;
 @property (nonatomic, strong) NSPopUpButton* bitratePopup;
 @property (nonatomic, strong) NSPopUpButton* resolutionPopup;
 @property (nonatomic, strong) NSPopUpButton* scalePopup;       // unused, kept for compat
@@ -839,6 +867,7 @@ static NSImage* CreateStatusBarIcon() {
     // Register default settings.
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         kSettingFPS:         @60,
+        kSettingMinIdleFPS:  @30,
         kSettingBitrate:     @15000,
         kSettingResolution:  @0,
         kSettingScale:       @0,
@@ -971,7 +1000,7 @@ static NSImage* CreateStatusBarIcon() {
     NSArray* savedDeckApps = [[NSUserDefaults standardUserDefaults] arrayForKey:kSettingDeckApps];
     self.deckApps = savedDeckApps ? [savedDeckApps mutableCopy] : [NSMutableArray new];
 
-    NSRect frame = NSMakeRect(0, 0, 500, 580);
+    NSRect frame = NSMakeRect(0, 0, 500, 620);
     NSWindowStyleMask style = NSWindowStyleMaskTitled
                             | NSWindowStyleMaskClosable;
 
@@ -1035,7 +1064,18 @@ static NSImage* CreateStatusBarIcon() {
     else if (savedFPS == 120) fpsIdx = 2;
     [self.fpsPopup selectItemAtIndex:fpsIdx];
 
-    // --- Row 2: Bitrate ---
+    // --- Row 2: Minimum idle FPS ---
+    y -= rowHeight + 4;
+    [self addLabel:@"Minimum FPS:" toView:contentView atX:leftMargin y:y width:labelWidth];
+    self.minFpsPopup = [self addPopUpButton:contentView atX:controlLeft y:y width:controlWidth];
+    for (int i = 0; i < kMinIdleFPSCount; i++) {
+        [self.minFpsPopup addItemWithTitle:kMinIdleFPSLabels[i]];
+    }
+    uint32_t savedMinIdleFPS = sanitize_min_idle_fps(
+        (uint32_t)[[NSUserDefaults standardUserDefaults] integerForKey:kSettingMinIdleFPS]);
+    [self.minFpsPopup selectItemAtIndex:min_idle_fps_index(savedMinIdleFPS)];
+
+    // --- Row 3: Bitrate ---
     y -= rowHeight + 4;
     [self addLabel:@"Bitrate:" toView:contentView atX:leftMargin y:y width:labelWidth];
     self.bitratePopup = [self addPopUpButton:contentView atX:controlLeft y:y width:230];
@@ -1067,7 +1107,7 @@ static NSImage* CreateStatusBarIcon() {
     self.speedTestSpinner.hidden = YES;
     [contentView addSubview:self.speedTestSpinner];
 
-    // --- Row 3: Resolution ---
+    // --- Row 4: Resolution ---
     y -= rowHeight + 4;
     [self addLabel:@"Resolution:" toView:contentView atX:leftMargin y:y width:labelWidth];
     self.resolutionPopup = [self addPopUpButton:contentView atX:controlLeft y:y width:controlWidth];
@@ -1079,7 +1119,7 @@ static NSImage* CreateStatusBarIcon() {
         [self.resolutionPopup selectItemAtIndex:savedRes];
     }
 
-    // --- Row 4: Retina (HiDPI) ---
+    // --- Row 5: Retina (HiDPI) ---
     y -= rowHeight + 4;
     self.scalePopup = nil; // Not used anymore — replaced by retinaCheckbox.
     self.retinaCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(controlLeft, y, controlWidth, 20)];
@@ -1091,7 +1131,7 @@ static NSImage* CreateStatusBarIcon() {
     [contentView addSubview:self.retinaCheckbox];
     [self addLabel:@"Quality:" toView:contentView atX:leftMargin y:y width:labelWidth];
 
-    // --- Row 5: Port ---
+    // --- Row 6: Port ---
     y -= rowHeight + 8;
     [self addLabel:@"Port:" toView:contentView atX:leftMargin y:y width:labelWidth];
     self.portField = [[NSTextField alloc] initWithFrame:NSMakeRect(controlLeft, y, 100, 24)];
@@ -1417,6 +1457,14 @@ static NSImage* CreateStatusBarIcon() {
     }
     [defaults setInteger:fps forKey:kSettingFPS];
 
+    // Minimum idle FPS.
+    NSInteger minFpsIdx = self.minFpsPopup.indexOfSelectedItem;
+    NSInteger minIdleFPS = 30;
+    if (minFpsIdx >= 0 && minFpsIdx < kMinIdleFPSCount) {
+        minIdleFPS = kMinIdleFPSOptions[minFpsIdx];
+    }
+    [defaults setInteger:minIdleFPS forKey:kSettingMinIdleFPS];
+
     // Bitrate.
     NSInteger brIdx = self.bitratePopup.indexOfSelectedItem;
     if (brIdx >= 0 && brIdx < kBitrateCount) {
@@ -1436,8 +1484,9 @@ static NSImage* CreateStatusBarIcon() {
 
     [defaults synchronize];
 
-    NSLog(@"[Settings] Saved: fps=%ld bitrate=%ld res=%ld retina=%d port=%ld",
+    NSLog(@"[Settings] Saved: fps=%ld min_idle_fps=%ld bitrate=%ld res=%ld retina=%d port=%ld",
           (long)fps,
+          (long)minIdleFPS,
           (long)[defaults integerForKey:kSettingBitrate],
           (long)[defaults integerForKey:kSettingResolution],
           (int)[defaults boolForKey:kSettingScale],
@@ -1610,6 +1659,7 @@ static bool speed_test_handshake(droidscreen::TCPClient* client) {
 struct StreamSettings {
     uint16_t port;
     uint32_t fps;
+    uint32_t min_idle_fps;
     uint32_t bitrate_kbps;
     uint32_t width;      // Logical (point) resolution
     uint32_t height;
@@ -1622,6 +1672,8 @@ struct StreamSettings {
     StreamSettings s;
     s.port = (uint16_t)[defaults integerForKey:kSettingPort];
     s.fps  = (uint32_t)[defaults integerForKey:kSettingFPS];
+    s.min_idle_fps = sanitize_min_idle_fps(
+        (uint32_t)[defaults integerForKey:kSettingMinIdleFPS]);
     s.bitrate_kbps = (uint32_t)[defaults integerForKey:kSettingBitrate];
 
     NSInteger resIdx = [defaults integerForKey:kSettingResolution];
@@ -1731,8 +1783,9 @@ struct StreamSettings {
 
         StreamSettings settings = [self currentSettings];
 
-        NSLog(@"[Stream] Connecting: %ux%u@%ufps, %u kbps, port %u, hidpi=%s",
+        NSLog(@"[Stream] Connecting: %ux%u@%ufps, min_idle=%ufps, %u kbps, port %u, hidpi=%s",
               settings.width, settings.height, settings.fps,
+              settings.min_idle_fps,
               settings.bitrate_kbps, settings.port,
               settings.hidpi ? "YES" : "NO");
 
@@ -1980,7 +2033,8 @@ struct StreamSettings {
             _deckManager.get());
 
         if (!_pipeline->start(_streamWidth, _streamHeight,
-                              settings.fps, settings.bitrate_kbps, accessibilityGranted)) {
+                              settings.fps, settings.bitrate_kbps,
+                              settings.min_idle_fps, accessibilityGranted)) {
             NSLog(@"[Stream] Pipeline start failed");
             [self updateStatusText:@"Status: Pipeline start failed"];
             [self updateConnectMenuTitle:@"Connect"];

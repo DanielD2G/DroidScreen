@@ -97,6 +97,7 @@ static constexpr UINT IDC_PORT_EDIT = 5004;
 static constexpr UINT IDC_TOUCH_CHECK = 5005;
 static constexpr UINT IDC_APPLY_BTN = 5006;
 static constexpr UINT IDC_AUTODETECT_BTN = 5007;
+static constexpr UINT IDC_MIN_IDLE_FPS_COMBO = 5008;
 static constexpr UINT IDC_DECK_LIST = 5100;
 static constexpr UINT IDC_DECK_ADD = 5101;
 static constexpr UINT IDC_DECK_EDIT = 5102;
@@ -116,6 +117,32 @@ static const int kBitrates[] = {5000, 10000, 15000, 20000, 25000, 30000};
 static const wchar_t *kBitrateLabels[] = {L"5 Mbps",  L"10 Mbps", L"15 Mbps",
                                           L"20 Mbps", L"25 Mbps", L"30 Mbps"};
 static constexpr int kBitrateCount = sizeof(kBitrates) / sizeof(kBitrates[0]);
+static const uint32_t kMinIdleFpsOptions[] = {1, 10, 15, 30};
+static const wchar_t *kMinIdleFpsLabels[] = {L"1 fps", L"10 fps", L"15 fps",
+                                             L"30 fps"};
+static constexpr int kMinIdleFpsCount =
+    sizeof(kMinIdleFpsOptions) / sizeof(kMinIdleFpsOptions[0]);
+
+static uint32_t sanitize_min_idle_fps(uint32_t fps) {
+  switch (fps) {
+  case 1:
+  case 10:
+  case 15:
+  case 30:
+    return fps;
+  default:
+    return 30;
+  }
+}
+
+static int min_idle_fps_index(uint32_t fps) {
+  fps = sanitize_min_idle_fps(fps);
+  for (int i = 0; i < kMinIdleFpsCount; ++i) {
+    if (kMinIdleFpsOptions[i] == fps)
+      return i;
+  }
+  return kMinIdleFpsCount - 1;
+}
 
 // ============================================================================
 // Settings (persisted in Windows Registry)
@@ -123,6 +150,7 @@ static constexpr int kBitrateCount = sizeof(kBitrates) / sizeof(kBitrates[0]);
 
 struct Settings {
   uint32_t fps = 30;
+  uint32_t min_idle_fps = 30;
   uint32_t bitrate_kbps = 15000;
   uint32_t display = 0;
   uint16_t port = 38271;
@@ -205,6 +233,11 @@ static Settings load_settings() {
       s.fps = val;
 
     sz = sizeof(val);
+    if (RegQueryValueExW(hkey, L"MinIdleFPS", nullptr, nullptr, (BYTE *)&val,
+                         &sz) == ERROR_SUCCESS)
+      s.min_idle_fps = sanitize_min_idle_fps(val);
+
+    sz = sizeof(val);
     if (RegQueryValueExW(hkey, L"Bitrate", nullptr, nullptr, (BYTE *)&val,
                          &sz) == ERROR_SUCCESS)
       s.bitrate_kbps = val;
@@ -238,6 +271,10 @@ static void save_settings(const Settings &s) {
 
     val = s.fps;
     RegSetValueExW(hkey, L"FPS", 0, REG_DWORD, (BYTE *)&val, sizeof(val));
+
+    val = sanitize_min_idle_fps(s.min_idle_fps);
+    RegSetValueExW(hkey, L"MinIdleFPS", 0, REG_DWORD, (BYTE *)&val,
+                   sizeof(val));
 
     val = s.bitrate_kbps;
     RegSetValueExW(hkey, L"Bitrate", 0, REG_DWORD, (BYTE *)&val, sizeof(val));
@@ -1041,7 +1078,7 @@ static void show_settings_dialog() {
   g_app.displays = enumerate_displays();
 
   const int dlgW = 420;
-  const int dlgH = 380;
+  const int dlgH = 420;
 
   // Center on screen.
   int screenW = GetSystemMetrics(SM_CXSCREEN);
@@ -1085,6 +1122,21 @@ static void show_settings_dialog() {
   SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"120 fps");
   int fpsSel = (s.fps == 30) ? 0 : (s.fps == 120) ? 2 : 1;
   SendMessageW(fpsCombo, CB_SETCURSEL, fpsSel, 0);
+  cy += rowHeight + 8;
+
+  // --- Minimum Idle FPS ---
+  makeLabel(L"Min FPS:", cy);
+  HWND minIdleFpsCombo = CreateWindowExW(
+      0, L"COMBOBOX", nullptr,
+      WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL, ctrlLeft, cy,
+      ctrlWidth, 200, hwnd, (HMENU)(UINT_PTR)IDC_MIN_IDLE_FPS_COMBO,
+      g_app.hinstance, nullptr);
+  for (int i = 0; i < kMinIdleFpsCount; ++i) {
+    SendMessageW(minIdleFpsCombo, CB_ADDSTRING, 0,
+                 (LPARAM)kMinIdleFpsLabels[i]);
+  }
+  SendMessageW(minIdleFpsCombo, CB_SETCURSEL,
+               min_idle_fps_index(s.min_idle_fps), 0);
   cy += rowHeight + 8;
 
   // --- Bitrate ---
@@ -1186,6 +1238,14 @@ static void apply_settings_from_dialog(HWND dlg) {
     break;
   }
 
+  // Minimum idle FPS.
+  HWND minIdleFpsCombo = GetDlgItem(dlg, IDC_MIN_IDLE_FPS_COMBO);
+  int minIdleFpsSel = (int)SendMessageW(minIdleFpsCombo, CB_GETCURSEL, 0, 0);
+  if (minIdleFpsSel >= 0 && minIdleFpsSel < kMinIdleFpsCount)
+    s.min_idle_fps = kMinIdleFpsOptions[minIdleFpsSel];
+  else
+    s.min_idle_fps = 30;
+
   // Bitrate.
   HWND brCombo = GetDlgItem(dlg, IDC_BITRATE_COMBO);
   int brSel = (int)SendMessageW(brCombo, CB_GETCURSEL, 0, 0);
@@ -1212,8 +1272,9 @@ static void apply_settings_from_dialog(HWND dlg) {
   s.touch = (SendMessageW(touchCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
   save_settings(s);
-  log_msg("[Settings] Saved: fps=%u bitrate=%u display=%u port=%u touch=%d",
-          s.fps, s.bitrate_kbps, s.display, s.port, s.touch);
+  log_msg("[Settings] Saved: fps=%u min_idle_fps=%u bitrate=%u display=%u "
+          "port=%u touch=%d",
+          s.fps, s.min_idle_fps, s.bitrate_kbps, s.display, s.port, s.touch);
 
   // If streaming, restart with new settings.
   if (g_app.isStreaming.load()) {
@@ -1754,9 +1815,10 @@ static void connect_sync() {
   g_app.isBusy.store(true);
 
   Settings settings = load_settings();
-  log_msg("[Stream] Connecting: display=%u %ufps %u kbps port=%u touch=%s",
-          settings.display, settings.fps, settings.bitrate_kbps, settings.port,
-          settings.touch ? "on" : "off");
+  log_msg("[Stream] Connecting: display=%u %ufps min_idle=%ufps %u kbps "
+          "port=%u touch=%s",
+          settings.display, settings.fps, settings.min_idle_fps,
+          settings.bitrate_kbps, settings.port, settings.touch ? "on" : "off");
 
   // 1. ADB forward.
   update_status(L"Setting up ADB...");
@@ -1985,7 +2047,7 @@ static void connect_sync() {
       g_app.touch.get(), g_app.mouse.get(), g_app.deckManager.get());
 
   if (!g_app.pipeline->start(cap_w, cap_h, settings.fps, settings.bitrate_kbps,
-                             settings.touch)) {
+                             settings.min_idle_fps, settings.touch)) {
     log_msg("[Stream] Pipeline start failed");
     update_status(L"Pipeline start failed");
     g_app.pipeline.reset();

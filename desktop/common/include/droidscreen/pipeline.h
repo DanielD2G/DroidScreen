@@ -42,10 +42,12 @@ public:
     /// @param height Capture/encode height.
     /// @param fps Target frame rate.
     /// @param bitrate_kbps Fixed bitrate (no ramping on USB).
+    /// @param min_idle_fps Minimum frame rate during idle periods.
     /// @param touch_enabled Whether to process touch events.
     /// @return true on success.
     bool start(uint32_t width, uint32_t height,
                uint32_t fps, uint32_t bitrate_kbps,
+               uint32_t min_idle_fps,
                bool touch_enabled);
 
     /// Stop all threads and clean up.
@@ -146,8 +148,8 @@ private:
 
     // Maximum interval between frames during idle periods (microseconds).
     // When no new capture arrives within this interval, the last frame is
-    // re-encoded to keep the decoder pipeline warm.  33 ms ≈ 30 fps min.
-    static constexpr int64_t kMaxIdleIntervalUs = 33333;
+    // re-encoded to keep the decoder pipeline warm. Default: 33 ms ≈ 30 fps.
+    int64_t max_idle_interval_us_ = 33333;
 
     // Timestamp of last ping sent, for RTT calculation.
     std::atomic<int64_t> ping_sent_us_{0};

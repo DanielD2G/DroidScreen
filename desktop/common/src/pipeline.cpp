@@ -40,6 +40,10 @@ static int64_t now_us() {
       .count();
 }
 
+static int64_t idle_interval_us_for_fps(uint32_t fps) {
+  return static_cast<int64_t>(1000000.0 / fps + 0.5);
+}
+
 static void release_captured_frame(CapturedFrame &frame) {
   if (frame.native_handle && frame.release_fn) {
     frame.release_fn(frame.release_ctx, frame.native_handle);
@@ -125,7 +129,8 @@ bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
 }
 
 bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
-                     uint32_t bitrate_kbps, bool touch_enabled) {
+                     uint32_t bitrate_kbps, uint32_t min_idle_fps,
+                     bool touch_enabled) {
   if (running_.load()) {
     fprintf(stderr, "[pipeline] already running\n");
     return false;
@@ -142,6 +147,7 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
     return false;
   }
 
+  max_idle_interval_us_ = idle_interval_us_for_fps(min_idle_fps);
   running_.store(true);
   frames_encoded_.store(0);
   frames_captured_.store(0);
@@ -271,7 +277,7 @@ void Pipeline::stop() {
 // The VT output callback fires asynchronously and pushes to send_queue_.
 // We NEVER do TCP I/O here.
 //
-// Idle frame re-sending: when no new frame arrives within kMaxIdleIntervalUs,
+// Idle frame re-sending: when no new frame arrives within max_idle_interval_us_,
 // the last captured frame is re-encoded to keep the decoder pipeline warm.
 // This prevents the "cold decoder" lag that occurs after idle periods
 // (e.g., when typing in a mostly-static text editor).
@@ -318,11 +324,12 @@ void Pipeline::encode_loop() {
     CapturedFrame frame;
     bool got_new_frame = false;
 
-    // Timed wait: wake on a new frame or after kMaxIdleIntervalUs.
+    // Timed wait: wake on a new frame or after max_idle_interval_us_.
     {
       std::unique_lock<std::mutex> lock(capture_mutex_);
+      const auto idle_interval = std::chrono::microseconds(max_idle_interval_us_);
       got_new_frame = capture_cv_.wait_for(
-          lock, std::chrono::microseconds(kMaxIdleIntervalUs),
+          lock, idle_interval,
           [this] { return !capture_queue_.empty() || !running_.load(); });
 
       if (!running_.load())
