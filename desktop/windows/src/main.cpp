@@ -1080,16 +1080,10 @@ static void show_settings_dialog() {
                       WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
                       ctrlLeft, cy, ctrlWidth, 200, hwnd,
                       (HMENU)(UINT_PTR)IDC_FPS_COMBO, g_app.hinstance, nullptr);
-  SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"10 fps");
-  SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"15 fps");
   SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"30 fps");
   SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"60 fps");
   SendMessageW(fpsCombo, CB_ADDSTRING, 0, (LPARAM)L"120 fps");
-  int fpsSel = 3; // default: 60
-  if (s.fps == 10) fpsSel = 0;
-  else if (s.fps == 15) fpsSel = 1;
-  else if (s.fps == 30) fpsSel = 2;
-  else if (s.fps == 120) fpsSel = 4;
+  int fpsSel = (s.fps == 30) ? 0 : (s.fps == 120) ? 2 : 1;
   SendMessageW(fpsCombo, CB_SETCURSEL, fpsSel, 0);
   cy += rowHeight + 8;
 
@@ -1182,15 +1176,9 @@ static void apply_settings_from_dialog(HWND dlg) {
   int fpsSel = (int)SendMessageW(fpsCombo, CB_GETCURSEL, 0, 0);
   switch (fpsSel) {
   case 0:
-    s.fps = 10;
-    break;
-  case 1:
-    s.fps = 15;
-    break;
-  case 2:
     s.fps = 30;
     break;
-  case 4:
+  case 2:
     s.fps = 120;
     break;
   default:
