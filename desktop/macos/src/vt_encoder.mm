@@ -95,7 +95,7 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
     // Main profile — good compression, no B-frames implicitly.
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_ProfileLevel,
-        kVTProfileLevel_H264_Baseline_AutoLevel);
+        kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel);
 
     // No B-frames — already implied by Baseline but be explicit.
     VTSessionSetProperty(session_,

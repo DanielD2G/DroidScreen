@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 /* Protocol version */
-#define DS_PROTOCOL_VERSION  6
+#define DS_PROTOCOL_VERSION  7
 
 /* Default TCP port */
 #define DS_DEFAULT_PORT      38271

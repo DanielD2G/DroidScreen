@@ -59,7 +59,7 @@ void decoder_set_render_mode(DecoderContext *ctx, DecoderRenderMode mode);
  * On API 28+, enables async callbacks if a wakeup function was set.
  * Returns 0 on success, -1 on error.
  */
-int decoder_configure(DecoderContext *ctx, int width, int height);
+int decoder_configure(DecoderContext *ctx, int width, int height, int fps);
 
 /*
  * Returns true if the decoder is operating in async callback mode.
@@ -98,7 +98,7 @@ int32_t decoder_pop_input(DecoderContext *ctx);
  * Render queue depth = 1 policy: drops every frame except the newest,
  * renders only that one.  Returns 0 or 1.
  */
-int decoder_drain(DecoderContext *ctx);
+int decoder_drain(DecoderContext *ctx, int64_t *rendered_pts_us);
 
 /*
  * Stop and destroy the decoder. Releases all resources.

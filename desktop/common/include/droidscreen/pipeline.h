@@ -76,6 +76,7 @@ public:
     int64_t last_rtt_us() const { return last_rtt_us_.load(); }
     int64_t last_encode_us() const { return last_encode_us_.load(); }
     int64_t last_send_us() const { return last_send_us_.load(); }
+    int64_t last_capture_to_send_us() const { return last_capture_to_send_us_.load(); }
     size_t capture_queue_depth() const;
     size_t send_queue_depth() const;
 
@@ -118,7 +119,11 @@ private:
     struct SendPacket {
         std::vector<uint8_t> data;
         uint8_t flags;
+        int64_t capture_ts_us;
+        int64_t capture_to_encode_us;
         int64_t encode_done_us;   // timestamp when VT callback fired
+        uint64_t sequence;
+        bool is_idle;
     };
     static constexpr size_t kMaxSendQueueSize = 4;
     std::deque<SendPacket> send_queue_;
@@ -145,6 +150,8 @@ private:
     std::atomic<int64_t>  last_rtt_us_{0};
     std::atomic<int64_t>  last_encode_us_{0};
     std::atomic<int64_t>  last_send_us_{0};
+    std::atomic<int64_t>  last_capture_to_send_us_{0};
+    std::atomic<uint64_t> next_video_sequence_{1};
 
     // Maximum interval between frames during idle periods (microseconds).
     // When no new capture arrives within this interval, the last frame is

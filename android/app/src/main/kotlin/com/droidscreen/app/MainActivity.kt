@@ -119,6 +119,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surfaceView.isFocusable = true
         surfaceView.isFocusableInTouchMode = true
         surfaceView.requestFocus()
+        requestSurfaceFrameRate(surfaceView.holder.surface)
         surfaceView.setOnTouchListener { v, event ->
             handleTouchEvent(v, event)
         }
@@ -208,6 +209,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    private fun requestSurfaceFrameRate(surface: Surface) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && surface.isValid) {
+            surface.setFrameRate(120.0f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            android.util.Log.i(TAG, "Requested Surface frame rate: 120Hz fixed source")
+        }
+    }
+
     override fun surfaceCreated(holder: SurfaceHolder) {
         if (nativeStarted) {
             // Surface was recreated (e.g., app went to background and came back).
@@ -218,9 +226,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         nativeInit(holder.surface, USBConnectionManager.PORT)
         nativeStarted = true
+        requestSurfaceFrameRate(holder.surface)
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        requestSurfaceFrameRate(holder.surface)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -418,12 +428,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             statsFps.text = String.format("FPS: %.1f", fps)
 
             val jitterUs = stats[4]
-            val expectedIntervalUs = stats[5]
             val jitterMs = jitterUs / 1000.0
-            val pacingQuality = if (expectedIntervalUs > 0) {
-                ((1.0 - (jitterUs.toDouble() / expectedIntervalUs)).coerceIn(0.0, 1.0) * 100).toInt()
-            } else 0
-            statsPacing.text = String.format("Pacing: %d%% (%.1fms)", pacingQuality, jitterMs)
+            val latencyReleaseMs = if (stats.size > 8) stats[8] / 1000.0 else 0.0
+            val desktopMs = if (stats.size > 9) stats[9] / 1000.0 else 0.0
+            val androidMs = if (stats.size > 11) stats[11] / 1000.0 else 0.0
+            val rttMs = if (stats.size > 12) stats[12] / 1000.0 else 0.0
+            statsPacing.text = String.format(
+                "Latency: %.1fms active (desk %.1f / and %.1f / rtt %.1f)",
+                latencyReleaseMs,
+                desktopMs,
+                androidMs,
+                rttMs
+            )
 
             val totalFed = stats[2]
             val errors = stats[3]
@@ -431,7 +447,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val stability = if (totalFed > 0) {
                 ((1.0 - (errors.toDouble() / totalFed)).coerceIn(0.0, 1.0) * 100).toInt()
             } else 100
-            statsStability.text = String.format("Stability: %d%% (skip: %d)", stability, skipped)
+            statsStability.text = String.format(
+                "Stability: %d%% (skip: %d, jitter %.1fms)",
+                stability,
+                skipped,
+                jitterMs
+            )
         }
 
         lastBytesReceived = stats[0]

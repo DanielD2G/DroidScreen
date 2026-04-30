@@ -95,13 +95,21 @@ static inline int ring_buffer_write_message(ring_buffer *rb,
     len_bytes[2] = (uint8_t)((le_len >> 16) & 0xFF);
     len_bytes[3] = (uint8_t)((le_len >> 24) & 0xFF);
 
-    for (size_t i = 0; i < 4; i++) {
-        rb->data[(w + i) & mask] = len_bytes[i];
+    size_t pos = w & mask;
+    size_t first = rb->capacity - pos;
+    if (first > 4) first = 4;
+    memcpy(rb->data + pos, len_bytes, first);
+    if (first < 4) {
+        memcpy(rb->data, len_bytes + first, 4 - first);
     }
     w += 4;
 
-    for (size_t i = 0; i < len; i++) {
-        rb->data[(w + i) & mask] = data[i];
+    pos = w & mask;
+    first = rb->capacity - pos;
+    if (first > len) first = len;
+    memcpy(rb->data + pos, data, first);
+    if (first < len) {
+        memcpy(rb->data, data + first, len - first);
     }
     w += len;
 
@@ -120,8 +128,12 @@ static inline size_t ring_buffer_read_message(ring_buffer *rb,
     size_t mask = rb->capacity - 1;
 
     uint8_t len_bytes[4];
-    for (size_t i = 0; i < 4; i++) {
-        len_bytes[i] = rb->data[(r + i) & mask];
+    size_t pos = r & mask;
+    size_t first = rb->capacity - pos;
+    if (first > 4) first = 4;
+    memcpy(len_bytes, rb->data + pos, first);
+    if (first < 4) {
+        memcpy(len_bytes + first, rb->data, 4 - first);
     }
 
     uint32_t msg_len = (uint32_t)len_bytes[0]
@@ -137,8 +149,12 @@ static inline size_t ring_buffer_read_message(ring_buffer *rb,
     r += 4;
 
     size_t copy_len = msg_len < max_len ? msg_len : max_len;
-    for (size_t i = 0; i < copy_len; i++) {
-        buf[i] = rb->data[(r + i) & mask];
+    pos = r & mask;
+    first = rb->capacity - pos;
+    if (first > copy_len) first = copy_len;
+    memcpy(buf, rb->data + pos, first);
+    if (first < copy_len) {
+        memcpy(buf + first, rb->data, copy_len - first);
     }
     r += msg_len;
 

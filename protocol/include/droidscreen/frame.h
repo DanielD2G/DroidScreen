@@ -42,6 +42,27 @@ size_t ds_frame_wrap(uint8_t *out_buf, size_t out_buf_size,
  */
 void ds_frame_parse_flags(uint8_t flags, int *is_keyframe, int *is_config);
 
+#define DS_VIDEO_TELEMETRY_MAGIC 0x544C5344u /* "DSLT" little-endian */
+#define DS_VIDEO_TELEMETRY_VERSION 2u
+#define DS_VIDEO_TELEMETRY_SIZE 56u
+#define DS_VIDEO_TELEMETRY_FLAG_IDLE 0x00000001u
+
+typedef struct {
+    uint64_t sequence;
+    int64_t capture_to_encode_us;
+    int64_t encode_to_send_us;
+    int64_t capture_to_send_us;
+    int64_t rtt_us;
+    uint32_t flags;
+} ds_video_telemetry_t;
+
+size_t ds_frame_write_telemetry(uint8_t *buf, size_t buf_size,
+                                const ds_video_telemetry_t *telemetry);
+
+int ds_frame_read_telemetry(const uint8_t *buf, size_t len,
+                            ds_video_telemetry_t *telemetry,
+                            size_t *header_size);
+
 #ifdef __cplusplus
 }
 #endif

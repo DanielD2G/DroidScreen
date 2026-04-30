@@ -21,6 +21,7 @@
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---- Runtime binding for API 28+ async callback ----
  * We dlsym() the function so we can compile against minSdk 26
@@ -31,6 +32,10 @@ typedef media_status_t (*PFN_setAsyncNotifyCallback)(
 static PFN_setAsyncNotifyCallback g_pfn_setAsync = nullptr;
 static bool g_async_resolved = false;
 
+typedef int32_t (*PFN_setFrameRate)(ANativeWindow*, float, int8_t);
+static PFN_setFrameRate g_pfn_setFrameRate = nullptr;
+static bool g_frame_rate_resolved = false;
+
 static PFN_setAsyncNotifyCallback resolve_async_callback() {
     if (!g_async_resolved) {
         g_async_resolved = true;
@@ -40,6 +45,17 @@ static PFN_setAsyncNotifyCallback resolve_async_callback() {
         }
     }
     return g_pfn_setAsync;
+}
+
+static PFN_setFrameRate resolve_set_frame_rate() {
+    if (!g_frame_rate_resolved) {
+        g_frame_rate_resolved = true;
+        if (android_get_device_api_level() >= 30) {
+            g_pfn_setFrameRate = (PFN_setFrameRate)
+                dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate");
+        }
+    }
+    return g_pfn_setFrameRate;
 }
 
 #define TAG "DroidScreen"
@@ -194,7 +210,7 @@ void decoder_set_render_mode(DecoderContext *ctx, DecoderRenderMode mode) {
     }
 }
 
-int decoder_configure(DecoderContext *ctx, int width, int height) {
+int decoder_configure(DecoderContext *ctx, int width, int height, int fps) {
     if (!ctx || !ctx->codec) {
         return -1;
     }
@@ -236,6 +252,15 @@ int decoder_configure(DecoderContext *ctx, int width, int height) {
     AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
+    if (fps > 0) {
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_FRAME_RATE, fps);
+        PFN_setFrameRate set_frame_rate = resolve_set_frame_rate();
+        if (set_frame_rate && ctx->window) {
+            int32_t fr_status = set_frame_rate(ctx->window, (float)fps, 1);
+            LOGI("decoder_configure: surface frame rate hint %d -> %d",
+                 fps, (int)fr_status);
+        }
+    }
 
     /* Standard Android 11+ low-latency keys */
     AMediaFormat_setInt32(format, "low-latency", 1);
@@ -273,8 +298,20 @@ int decoder_configure(DecoderContext *ctx, int width, int height) {
         return -1;
     }
 
+    if (android_get_device_api_level() >= 30) {
+        AMediaFormat *params = AMediaFormat_new();
+        if (params) {
+            AMediaFormat_setInt32(params, "low-latency", 1);
+            AMediaFormat_setInt32(params, "priority", 0);
+            AMediaFormat_setInt32(params, "operating-rate", 32767);
+            media_status_t ps = AMediaCodec_setParameters(ctx->codec, params);
+            LOGI("decoder_configure: set runtime low-latency parameters -> %d", (int)ps);
+            AMediaFormat_delete(params);
+        }
+    }
+
     ctx->configured = true;
-    LOGI("decoder_configure: configured %dx%d (mode=%s)", width, height,
+    LOGI("decoder_configure: configured %dx%d@%d (mode=%s)", width, height, fps,
          ctx->async_mode ? "ASYNC" : "SYNC");
     return 0;
 }
@@ -337,17 +374,23 @@ int32_t decoder_pop_input(DecoderContext *ctx) {
 
 static void render_frame(DecoderContext *ctx, size_t index) {
     if (ctx->render_mode == RENDER_MODE_LOWEST_LATENCY) {
-        /* Timestamp 0 = present at the earliest possible VSync. */
-        AMediaCodec_releaseOutputBufferAtTime(ctx->codec, index, 0);
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t now_ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        AMediaCodec_releaseOutputBufferAtTime(ctx->codec, index,
+                                              now_ns - 1000000LL);
     } else {
         /* RENDER_MODE_SMOOTH: present at next VSync via releaseOutputBuffer. */
         AMediaCodec_releaseOutputBuffer(ctx->codec, index, true);
     }
 }
 
-int decoder_drain(DecoderContext *ctx) {
+int decoder_drain(DecoderContext *ctx, int64_t *rendered_pts_us) {
     if (!ctx || !ctx->configured) {
         return 0;
+    }
+    if (rendered_pts_us) {
+        *rendered_pts_us = -1;
     }
 
     if (ctx->async_mode) {
@@ -360,6 +403,9 @@ int decoder_drain(DecoderContext *ctx) {
                 AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, false);
             }
             last_idx = entry.index;
+            if (rendered_pts_us) {
+                *rendered_pts_us = entry.info.presentationTimeUs;
+            }
         }
 
         if (last_idx >= 0) {
@@ -397,6 +443,9 @@ int decoder_drain(DecoderContext *ctx) {
     }
 
     if (last_idx >= 0) {
+        if (rendered_pts_us) {
+            *rendered_pts_us = info.presentationTimeUs;
+        }
         render_frame(ctx, (size_t)last_idx);
         return 1;
     }

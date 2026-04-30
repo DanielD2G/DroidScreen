@@ -24,6 +24,7 @@
 
 extern "C" {
 #include "droidscreen/deck.h"
+#include "droidscreen/frame.h"
 #include "droidscreen/handshake.h"
 #include "droidscreen/mouse.h"
 #include "droidscreen/pen.h"
@@ -157,6 +158,8 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   bytes_sent_.store(0);
   last_encode_us_.store(0);
   last_send_us_.store(0);
+  last_capture_to_send_us_.store(0);
+  next_video_sequence_.store(1);
 
   // Start capture -- frames get pushed into capture_queue_.
   // Newest-frame-wins: we keep at most 1 frame, always the latest.
@@ -291,7 +294,8 @@ void Pipeline::encode_loop() {
   last_frame.native_handle = nullptr;
   last_frame.release_fn = nullptr;
 
-  auto on_packet = [this](const EncodedPacket &pkt, int64_t t_enc_start) {
+  auto on_packet = [this](const EncodedPacket &pkt, int64_t t_enc_start,
+                          bool is_idle) {
     int64_t t_enc_end = now_us();
     last_encode_us_.store(t_enc_end - t_enc_start);
 
@@ -304,7 +308,11 @@ void Pipeline::encode_loop() {
     SendPacket sp;
     sp.data.assign(pkt.data, pkt.data + pkt.size);
     sp.flags = flags;
+    sp.capture_ts_us = pkt.timestamp_us;
+    sp.capture_to_encode_us = t_enc_end - pkt.timestamp_us;
     sp.encode_done_us = t_enc_end;
+    sp.sequence = next_video_sequence_.fetch_add(1);
+    sp.is_idle = is_idle;
 
     {
       std::unique_lock<std::mutex> lock(send_mutex_);
@@ -357,7 +365,7 @@ void Pipeline::encode_loop() {
       bool ok = encoder_->encode(
           frame.native_handle, frame.timestamp_us,
           [&on_packet, t_enc_start](const EncodedPacket &pkt) {
-            on_packet(pkt, t_enc_start);
+            on_packet(pkt, t_enc_start, false);
           });
       if (!ok) {
         fprintf(stderr, "[encode] encode submit failed\n");
@@ -375,7 +383,7 @@ void Pipeline::encode_loop() {
         bool ok = encoder_->encode(
             last_frame.native_handle, t_enc_start,
             [&on_packet, t_enc_start](const EncodedPacket &pkt) {
-              on_packet(pkt, t_enc_start);
+              on_packet(pkt, t_enc_start, true);
             });
         if (!ok) {
           fprintf(stderr, "[encode] idle re-encode failed\n");
@@ -419,14 +427,31 @@ void Pipeline::send_loop() {
     }
 
     int64_t t_send_start = now_us();
+    const int64_t encode_to_send_us = t_send_start - pkt.encode_done_us;
+    const int64_t capture_to_send_us = t_send_start - pkt.capture_ts_us;
+    last_capture_to_send_us_.store(capture_to_send_us);
+
+    ds_video_telemetry_t telemetry{};
+    telemetry.sequence = pkt.sequence;
+    telemetry.capture_to_encode_us = pkt.capture_to_encode_us;
+    telemetry.encode_to_send_us = encode_to_send_us;
+    telemetry.capture_to_send_us = capture_to_send_us;
+    telemetry.rtt_us = last_rtt_us_.load();
+    telemetry.flags = pkt.is_idle ? DS_VIDEO_TELEMETRY_FLAG_IDLE : 0;
+
+    std::vector<uint8_t> wire_payload;
+    wire_payload.resize(DS_VIDEO_TELEMETRY_SIZE + pkt.data.size());
+    ds_frame_write_telemetry(wire_payload.data(), wire_payload.size(), &telemetry);
+    memcpy(wire_payload.data() + DS_VIDEO_TELEMETRY_SIZE,
+           pkt.data.data(), pkt.data.size());
 
     {
       std::lock_guard<std::mutex> wlock(write_mutex_);
-      if (client_->send_message(DS_MSG_VIDEO_FRAME, pkt.flags, pkt.data.data(),
-                                pkt.data.size())) {
+      if (client_->send_message(DS_MSG_VIDEO_FRAME, pkt.flags,
+                                wire_payload.data(), wire_payload.size())) {
         int64_t t_send_end = now_us();
         last_send_us_.store(t_send_end - t_send_start);
-        bytes_sent_.fetch_add(DS_HEADER_SIZE + pkt.data.size());
+        bytes_sent_.fetch_add(DS_HEADER_SIZE + wire_payload.size());
       } else {
         fprintf(stderr, "[send] TCP send failed\n");
         running_.store(false);
