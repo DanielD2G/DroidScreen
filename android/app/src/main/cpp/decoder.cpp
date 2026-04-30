@@ -338,8 +338,8 @@ int32_t decoder_pop_input(DecoderContext *ctx) {
 
 static void render_frame(DecoderContext *ctx, size_t index) {
     if (ctx->render_mode == RENDER_MODE_LOWEST_LATENCY) {
-        /* Timestamp 0 = present at the earliest possible VSync. */
-        AMediaCodec_releaseOutputBufferAtTime(ctx->codec, index, 0);
+        /* Render immediately; do not let Surface schedule by presentation time. */
+        AMediaCodec_releaseOutputBuffer(ctx->codec, index, true);
     } else {
         /* RENDER_MODE_SMOOTH: present at next VSync via releaseOutputBuffer. */
         AMediaCodec_releaseOutputBuffer(ctx->codec, index, true);
