@@ -50,17 +50,24 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
             CFNumberGetValue(statusNum, kCFNumberSInt64Type, &status);
             // SCFrameStatus: 0=Complete, 1=Idle, 2=Blank, 3=Suspended, 4=Started
             if (status == 1 /* Idle */) {
-                // Notify with is_idle=true so the pipeline can skip encoding.
                 CVPixelBufferRef pixelBuf =
                     CMSampleBufferGetImageBuffer(sampleBuffer);
                 if (pixelBuf) {
+                    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+                    int64_t timestamp_us = 0;
+                    if (CMTIME_IS_VALID(pts)) {
+                        timestamp_us = (int64_t)(CMTimeGetSeconds(pts) * 1e6);
+                    }
+
+                    CVPixelBufferRetain(pixelBuf);
+
                     droidscreen::CapturedFrame frame;
-                    frame.native_handle = nullptr;
+                    frame.native_handle = pixelBuf;
                     frame.release_ctx = nullptr;
-                    frame.release_fn = nullptr;
+                    frame.release_fn = release_cv_pixel_buffer;
                     frame.width  = (uint32_t)CVPixelBufferGetWidth(pixelBuf);
                     frame.height = (uint32_t)CVPixelBufferGetHeight(pixelBuf);
-                    frame.timestamp_us = 0;
+                    frame.timestamp_us = timestamp_us;
                     frame.is_idle = true;
                     _owner->deliver_frame(frame);
                 }

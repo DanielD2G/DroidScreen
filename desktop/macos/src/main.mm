@@ -2279,12 +2279,21 @@ struct StreamSettings {
         }
 
         // Log stats.
-        uint64_t enc  = pl->frames_encoded();
-        uint64_t byt  = pl->bytes_sent();
-        int64_t  rtt  = pl->last_rtt_us();
+        uint64_t cap = pl->frames_captured();
+        uint64_t enc = pl->frames_encoded();
+        uint64_t drop = pl->frames_dropped();
+        uint64_t idle = pl->frames_idle();
+        uint64_t resent = pl->frames_idle_resent();
+        uint64_t byt = pl->bytes_sent();
+        int64_t rtt = pl->last_rtt_us();
 
-        NSLog(@"[Stats] encoded=%llu bytes=%llu rtt=%lld us",
-              (unsigned long long)enc, (unsigned long long)byt, (long long)rtt);
+        NSLog(@"[Stats] captured=%llu encoded=%llu dropped=%llu idle=%llu "
+              "idle_resent=%llu bytes=%llu rtt=%lld us cap_q=%zu send_q=%zu",
+              (unsigned long long)cap, (unsigned long long)enc,
+              (unsigned long long)drop, (unsigned long long)idle,
+              (unsigned long long)resent, (unsigned long long)byt,
+              (long long)rtt, pl->capture_queue_depth(),
+              pl->send_queue_depth());
     } @catch (NSException* e) {
         NSLog(@"[Stats] Exception in statsTimerFired: %@", e);
     }

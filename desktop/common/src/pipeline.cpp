@@ -157,6 +157,7 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   bytes_sent_.store(0);
   last_encode_us_.store(0);
   last_send_us_.store(0);
+  last_idle_enqueued_us_.store(0);
 
   // Start capture -- frames get pushed into capture_queue_.
   // Newest-frame-wins: we keep at most 1 frame, always the latest.
@@ -169,12 +170,18 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
 
     if (frame.is_idle) {
       frames_idle_.fetch_add(1);
-      CapturedFrame releasable = frame;
-      release_captured_frame(releasable);
-      return;
+      int64_t now = now_us();
+      int64_t last_idle = last_idle_enqueued_us_.load();
+      if (!frame.native_handle ||
+          (last_idle > 0 && now - last_idle < max_idle_interval_us_)) {
+        CapturedFrame releasable = frame;
+        release_captured_frame(releasable);
+        return;
+      }
+      last_idle_enqueued_us_.store(now);
+    } else {
+      frames_captured_.fetch_add(1);
     }
-
-    frames_captured_.fetch_add(1);
 
     std::lock_guard<std::mutex> lock(capture_mutex_);
 

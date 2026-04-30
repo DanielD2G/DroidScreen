@@ -145,6 +145,7 @@ private:
     std::atomic<int64_t>  last_rtt_us_{0};
     std::atomic<int64_t>  last_encode_us_{0};
     std::atomic<int64_t>  last_send_us_{0};
+    std::atomic<int64_t>  last_idle_enqueued_us_{0};
 
     // Maximum interval between frames during idle periods (microseconds).
     // When no new capture arrives within this interval, the last frame is
