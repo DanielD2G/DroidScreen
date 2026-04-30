@@ -224,9 +224,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        // Don't stop native here — surfaceCreated will handle restart.
-        // This avoids a race condition during rotation where surfaceDestroyed
-        // is called immediately followed by surfaceCreated.
+        android.util.Log.i(TAG, "Surface destroyed, stopping native layer")
+        if (nativeStarted) {
+            nativeStop()
+            nativeStarted = false
+        }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
