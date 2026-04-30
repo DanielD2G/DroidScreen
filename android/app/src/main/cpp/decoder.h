@@ -55,11 +55,11 @@ void decoder_set_wakeup(DecoderContext *ctx, decoder_wakeup_fn fn, void *userdat
 void decoder_set_render_mode(DecoderContext *ctx, DecoderRenderMode mode);
 
 /*
- * Configure the codec for the given resolution.
+ * Configure the codec for the given resolution and frame rate.
  * On API 28+, enables async callbacks if a wakeup function was set.
  * Returns 0 on success, -1 on error.
  */
-int decoder_configure(DecoderContext *ctx, int width, int height);
+int decoder_configure(DecoderContext *ctx, int width, int height, int fps);
 
 /*
  * Returns true if the decoder is operating in async callback mode.

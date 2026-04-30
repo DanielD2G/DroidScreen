@@ -301,7 +301,7 @@ static void* recv_thread_func(void* /*arg*/) {
          * Set wakeup callback first so async mode is enabled if API >= 28. */
         if (g_decoder) {
             decoder_set_wakeup(g_decoder, decoder_wakeup_cb, nullptr);
-            decoder_configure(g_decoder, req.width, req.height);
+            decoder_configure(g_decoder, req.width, req.height, req.fps);
             g_decoder_configured.store(true, std::memory_order_release);
         }
 
@@ -562,6 +562,7 @@ static void* decode_thread_func(void* /*arg*/) {
     uint32_t feed_errors = 0;
     uint32_t frames_skipped = 0;
     uint32_t last_logged_fed = 0;
+    int32_t pending_input_idx = -1;
     struct timespec ts_start, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
@@ -574,6 +575,7 @@ static void* decode_thread_func(void* /*arg*/) {
             feed_errors = 0;
             frames_skipped = 0;
             last_logged_fed = 0;
+            pending_input_idx = -1;
             pts_us = 0;
             clock_gettime(CLOCK_MONOTONIC, &ts_start);
             continue;
@@ -594,21 +596,20 @@ static void* decode_thread_func(void* /*arg*/) {
         if (is_async) {
             /* ASYNC: use pre-dequeued input indices from callbacks */
             while (g_running.load(std::memory_order_acquire)) {
-                int32_t input_idx = decoder_pop_input(g_decoder);
-                if (input_idx < 0) break;  /* no input buffer available */
+                int32_t input_idx = pending_input_idx;
+                if (input_idx < 0) {
+                    input_idx = decoder_pop_input(g_decoder);
+                    if (input_idx < 0) break;  /* no input buffer available */
+                }
 
                 size_t msg_len = ring_buffer_read_message(
                     g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
                 if (msg_len < 2) {
-                    /* No data — return the input index for next time.
-                     * We can't "un-pop", so we feed an empty buffer
-                     * which the codec will silently ignore, and the
-                     * index returns to the available pool via callback. */
-                    decoder_feed_index(g_decoder, input_idx,
-                                       nullptr, 0, 0, 0);
+                    pending_input_idx = input_idx;
                     break;
                 }
                 any_work = true;
+                pending_input_idx = -1;
 
                 uint8_t video_flags = nal_buf[0];
                 uint8_t* video_data = nal_buf + 1;

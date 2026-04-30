@@ -194,7 +194,7 @@ void decoder_set_render_mode(DecoderContext *ctx, DecoderRenderMode mode) {
     }
 }
 
-int decoder_configure(DecoderContext *ctx, int width, int height) {
+int decoder_configure(DecoderContext *ctx, int width, int height, int fps) {
     if (!ctx || !ctx->codec) {
         return -1;
     }
@@ -236,6 +236,7 @@ int decoder_configure(DecoderContext *ctx, int width, int height) {
     AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
     AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
+    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_FRAME_RATE, fps);
 
     /* Standard Android 11+ low-latency keys */
     AMediaFormat_setInt32(format, "low-latency", 1);
@@ -274,8 +275,8 @@ int decoder_configure(DecoderContext *ctx, int width, int height) {
     }
 
     ctx->configured = true;
-    LOGI("decoder_configure: configured %dx%d (mode=%s)", width, height,
-         ctx->async_mode ? "ASYNC" : "SYNC");
+    LOGI("decoder_configure: configured %dx%d@%d (mode=%s)", width, height,
+         fps, ctx->async_mode ? "ASYNC" : "SYNC");
     return 0;
 }
 
