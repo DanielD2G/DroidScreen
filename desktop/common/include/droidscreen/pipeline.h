@@ -48,7 +48,9 @@ public:
     bool start(uint32_t width, uint32_t height,
                uint32_t fps, uint32_t bitrate_kbps,
                uint32_t min_idle_fps,
-               bool touch_enabled);
+               bool touch_enabled,
+               ds_codec_t preferred_codec = DS_CODEC_H264,
+               uint8_t codec_caps = DS_CODEC_CAP_H264);
 
     /// Stop all threads and clean up.
     void stop();
@@ -84,7 +86,9 @@ private:
     // Perform the protocol handshake with the Android device.
     bool handshake(uint32_t width, uint32_t height,
                    uint32_t fps, uint32_t bitrate_kbps,
-                   bool touch_enabled);
+                   bool touch_enabled,
+                   ds_codec_t preferred_codec,
+                   uint8_t codec_caps);
 
     // Thread: pop frames from capture_queue and submit to encoder.
     // VT callback pushes results to send_queue (never blocks on TCP).
@@ -125,6 +129,7 @@ private:
         uint64_t sequence;
         bool is_idle;
     };
+
     static constexpr size_t kMaxSendQueueSize = 4;
     std::deque<SendPacket> send_queue_;
     std::mutex send_mutex_;
@@ -152,6 +157,7 @@ private:
     std::atomic<int64_t>  last_send_us_{0};
     std::atomic<int64_t>  last_capture_to_send_us_{0};
     std::atomic<uint64_t> next_video_sequence_{1};
+    ds_codec_t accepted_codec_ = DS_CODEC_H264;
 
     // Maximum interval between frames during idle periods (microseconds).
     // When no new capture arrives within this interval, the last frame is

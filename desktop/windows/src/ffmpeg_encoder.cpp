@@ -200,7 +200,13 @@ bool FFmpegEncoder::try_encoder(const char* encoder_name,
 // ---------------------------------------------------------------------------
 
 bool FFmpegEncoder::init(uint32_t width, uint32_t height,
-                          uint32_t fps, uint32_t bitrate_kbps) {
+                         uint32_t fps, uint32_t bitrate_kbps,
+                         ds_codec_t codec) {
+    if (codec != DS_CODEC_H264) {
+        fprintf(stderr, "[ffmpeg] unsupported codec requested on Windows: %u\n",
+                static_cast<unsigned>(codec));
+        return false;
+    }
     // Clean up any existing resources from a previous init() call.
     if (codec_ctx_) {
         fprintf(stderr, "[ffmpeg] re-init: closing previous encoder session\n");

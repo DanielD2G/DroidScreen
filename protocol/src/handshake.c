@@ -46,7 +46,7 @@ size_t ds_handshake_req_serialize(uint8_t *buf, const ds_handshake_req_t *req)
     write_le32(buf + 8, req->max_bitrate_kbps);
     buf[12] = req->touch_enabled;
     write_le32(buf + 13, req->frame_interval_us);
-    memset(buf + 17, 0, 3);
+    memcpy(buf + 17, req->reserved, 3);
     return DS_HANDSHAKE_REQ_SIZE;
 }
 
@@ -73,7 +73,7 @@ size_t ds_handshake_resp_serialize(uint8_t *buf, const ds_handshake_resp_t *resp
     buf[7] = resp->accepted_codec;
     write_le32(buf + 8, resp->decoder_max_bitrate);
     buf[12] = resp->touch_supported;
-    memset(buf + 13, 0, 3);
+    memcpy(buf + 13, resp->reserved, 3);
     return DS_HANDSHAKE_RESP_SIZE;
 }
 

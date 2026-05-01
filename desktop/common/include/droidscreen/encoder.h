@@ -10,6 +10,10 @@
 #include <cstdint>
 #include <functional>
 
+extern "C" {
+#include "droidscreen/handshake.h"
+}
+
 namespace droidscreen {
 
 struct EncodedPacket {
@@ -31,7 +35,8 @@ public:
     /// @param bitrate_kbps Target bitrate in kilobits per second.
     /// @return true on success.
     virtual bool init(uint32_t width, uint32_t height,
-                      uint32_t fps, uint32_t bitrate_kbps) = 0;
+                      uint32_t fps, uint32_t bitrate_kbps,
+                      ds_codec_t codec = DS_CODEC_H264) = 0;
 
     /// Encode a single frame.
     /// @param native_frame Platform-specific frame handle (CVPixelBufferRef on macOS).

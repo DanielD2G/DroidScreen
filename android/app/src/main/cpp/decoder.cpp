@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <mutex>
 
 /* ---- Runtime binding for API 28+ async callback ----
  * We dlsym() the function so we can compile against minSdk 26
@@ -67,7 +68,7 @@ static PFN_setFrameRate resolve_set_frame_rate() {
 /* Input buffer dequeue timeout (sync mode only).
  * A small wait dramatically reduces dropped NALs under load without
  * adding noticeable end-to-end latency. */
-#define INPUT_TIMEOUT_US  5000
+#define INPUT_TIMEOUT_US  1000
 /* Output buffer dequeue timeout (0 = non-blocking poll, sync mode only) */
 #define OUTPUT_TIMEOUT_US 0
 
@@ -85,6 +86,9 @@ typedef struct {
 struct DecoderContext {
     AMediaCodec  *codec;
     ANativeWindow *window;
+    char          mime[32];
+    char          codec_name[128];
+    DecoderVendorHints hints;
     bool          configured;
     bool          async_mode;
     DecoderRenderMode render_mode;
@@ -92,27 +96,36 @@ struct DecoderContext {
     /* Wakeup callback — invoked from MediaCodec's internal thread */
     decoder_wakeup_fn wakeup_fn;
     void             *wakeup_userdata;
+    decoder_rendered_fn rendered_fn;
+    void               *rendered_userdata;
+    bool                render_in_callback;
 
     /* Async mode: lock-free SPSC queues (producer = codec thread,
      * consumer = decode thread).  Atomic indices, fixed-size arrays. */
     volatile int32_t input_queue[ASYNC_QUEUE_CAP];
     volatile int     input_wr;
     volatile int     input_rd;
+    std::mutex        input_mutex;
 
     OutputEntry      output_queue[ASYNC_QUEUE_CAP];
     volatile int     output_wr;
     volatile int     output_rd;
+    std::mutex        output_mutex;
 };
+
+static void render_frame(DecoderContext *ctx, size_t index);
 
 /* ---- Async queue helpers (single-producer, single-consumer) ---- */
 
 static inline void input_queue_push(DecoderContext *ctx, int32_t index) {
+    std::lock_guard<std::mutex> lock(ctx->input_mutex);
     int wr = ctx->input_wr;
     ctx->input_queue[wr & ASYNC_QUEUE_MASK] = index;
     __atomic_store_n(&ctx->input_wr, wr + 1, __ATOMIC_RELEASE);
 }
 
 static inline int32_t input_queue_pop(DecoderContext *ctx) {
+    std::lock_guard<std::mutex> lock(ctx->input_mutex);
     int rd = ctx->input_rd;
     int wr = __atomic_load_n(&ctx->input_wr, __ATOMIC_ACQUIRE);
     if (rd == wr) return -1;
@@ -123,6 +136,7 @@ static inline int32_t input_queue_pop(DecoderContext *ctx) {
 
 static inline void output_queue_push(DecoderContext *ctx, int32_t index,
                                      const AMediaCodecBufferInfo *info) {
+    std::lock_guard<std::mutex> lock(ctx->output_mutex);
     int wr = ctx->output_wr;
     ctx->output_queue[wr & ASYNC_QUEUE_MASK].index = index;
     ctx->output_queue[wr & ASYNC_QUEUE_MASK].info  = *info;
@@ -130,6 +144,7 @@ static inline void output_queue_push(DecoderContext *ctx, int32_t index,
 }
 
 static inline bool output_queue_pop(DecoderContext *ctx, OutputEntry *out) {
+    std::lock_guard<std::mutex> lock(ctx->output_mutex);
     int rd = ctx->output_rd;
     int wr = __atomic_load_n(&ctx->output_wr, __ATOMIC_ACQUIRE);
     if (rd == wr) return false;
@@ -151,6 +166,15 @@ static void on_async_output(AMediaCodec *codec, void *userdata,
                             int32_t index, AMediaCodecBufferInfo *bufferInfo) {
     (void)codec;
     DecoderContext *ctx = static_cast<DecoderContext*>(userdata);
+    if (ctx->render_in_callback &&
+            ctx->render_mode == RENDER_MODE_LOWEST_LATENCY) {
+        render_frame(ctx, (size_t)index);
+        if (ctx->rendered_fn) {
+            ctx->rendered_fn(ctx->rendered_userdata,
+                             bufferInfo->presentationTimeUs);
+        }
+        return;
+    }
     output_queue_push(ctx, index, bufferInfo);
     if (ctx->wakeup_fn) ctx->wakeup_fn(ctx->wakeup_userdata);
 }
@@ -171,27 +195,106 @@ static void on_async_error(AMediaCodec *codec, void *userdata,
 
 /* ---- Public API ---- */
 
-DecoderContext* decoder_create(ANativeWindow *window) {
-    AMediaCodec *codec = AMediaCodec_createDecoderByType("video/avc");
-    if (!codec) {
-        LOGE("decoder_create: failed to create AMediaCodec for video/avc");
-        return nullptr;
+static AMediaCodec* create_codec_instance(const char *mime,
+                                          const char *codec_name) {
+    AMediaCodec *codec = nullptr;
+    if (codec_name && codec_name[0] != '\0') {
+        codec = AMediaCodec_createCodecByName(codec_name);
+        if (codec) {
+            LOGI("decoder_create: using codec by name: %s", codec_name);
+            return codec;
+        }
+        LOGW("decoder_create: createCodecByName(%s) failed, falling back to mime",
+             codec_name);
     }
 
-    auto *ctx = static_cast<DecoderContext*>(calloc(1, sizeof(DecoderContext)));
-    if (!ctx) {
-        AMediaCodec_delete(codec);
-        return nullptr;
+    codec = AMediaCodec_createDecoderByType(mime);
+    if (codec) {
+        LOGI("decoder_create: using decoder by mime: %s", mime);
+    }
+    return codec;
+}
+
+static bool recreate_codec(DecoderContext *ctx) {
+    if (!ctx) return false;
+    if (ctx->codec) {
+        AMediaCodec_delete(ctx->codec);
+        ctx->codec = nullptr;
+    }
+    ctx->codec = create_codec_instance(ctx->mime, ctx->codec_name);
+    return ctx->codec != nullptr;
+}
+
+static void reset_async_queues(DecoderContext *ctx) {
+    std::lock_guard<std::mutex> input_lock(ctx->input_mutex);
+    std::lock_guard<std::mutex> output_lock(ctx->output_mutex);
+    ctx->input_wr  = 0;
+    ctx->input_rd  = 0;
+    ctx->output_wr = 0;
+    ctx->output_rd = 0;
+}
+
+static bool enable_async_callbacks(DecoderContext *ctx) {
+    ctx->async_mode = false;
+    if (ctx->hints.is_qcom_c2 || ctx->hints.is_qcom_omx) {
+        LOGI("decoder_configure: using sync polling for Qualcomm decoder");
+        return false;
+    }
+    PFN_setAsyncNotifyCallback pfn = ctx->wakeup_fn ? resolve_async_callback()
+                                                     : nullptr;
+    if (!pfn) return false;
+
+    AMediaCodecOnAsyncNotifyCallback cb;
+    cb.onAsyncInputAvailable  = on_async_input;
+    cb.onAsyncOutputAvailable = on_async_output;
+    cb.onAsyncFormatChanged   = on_async_format;
+    cb.onAsyncError           = on_async_error;
+
+    media_status_t s = pfn(ctx->codec, cb, ctx);
+    if (s == AMEDIA_OK) {
+        ctx->async_mode = true;
+        LOGI("decoder_configure: async callbacks enabled (API %d)",
+             android_get_device_api_level());
+        return true;
     }
 
-    ctx->codec       = codec;
+    LOGW("decoder_configure: async callbacks failed (%d), using sync", (int)s);
+    return false;
+}
+
+DecoderContext* decoder_create(ANativeWindow *window,
+                               const char *mime,
+                               const char *codec_name,
+                               const DecoderVendorHints *hints) {
+    if (!mime || mime[0] == '\0') {
+        mime = "video/avc";
+    }
+
+    auto *ctx = new DecoderContext();
     ctx->window      = window;
     ctx->configured  = false;
     ctx->async_mode  = false;
     ctx->render_mode = RENDER_MODE_LOWEST_LATENCY;
     ctx->wakeup_fn   = nullptr;
+    ctx->rendered_fn = nullptr;
+    ctx->render_in_callback = false;
+    ctx->hints       = hints ? *hints : DecoderVendorHints{};
+    snprintf(ctx->mime, sizeof(ctx->mime), "%s", mime);
+    snprintf(ctx->codec_name, sizeof(ctx->codec_name), "%s",
+             codec_name ? codec_name : "");
 
-    LOGI("decoder_create: codec created successfully");
+    ctx->codec = create_codec_instance(ctx->mime, ctx->codec_name);
+    if (!ctx->codec) {
+        LOGE("decoder_create: failed to create AMediaCodec for %s (%s)",
+             ctx->mime, ctx->codec_name);
+        delete ctx;
+        return nullptr;
+    }
+
+    LOGI("decoder_create: codec ready mime=%s name=%s direct=%d ll=%d qcomC2=%d qcomOmx=%d",
+         ctx->mime, ctx->codec_name, ctx->hints.direct_submit ? 1 : 0,
+         ctx->hints.has_android_low_latency ? 1 : 0,
+         ctx->hints.is_qcom_c2 ? 1 : 0, ctx->hints.is_qcom_omx ? 1 : 0);
     return ctx;
 }
 
@@ -199,6 +302,19 @@ void decoder_set_wakeup(DecoderContext *ctx, decoder_wakeup_fn fn, void *userdat
     if (ctx) {
         ctx->wakeup_fn       = fn;
         ctx->wakeup_userdata = userdata;
+    }
+}
+
+void decoder_set_rendered_callback(DecoderContext *ctx,
+                                   decoder_rendered_fn fn,
+                                   void *userdata,
+                                   bool render_in_callback) {
+    if (ctx) {
+        ctx->rendered_fn = fn;
+        ctx->rendered_userdata = userdata;
+        ctx->render_in_callback = render_in_callback;
+        LOGI("decoder_set_rendered_callback: render_in_callback=%d",
+             render_in_callback ? 1 : 0);
     }
 }
 
@@ -215,105 +331,109 @@ int decoder_configure(DecoderContext *ctx, int width, int height, int fps) {
         return -1;
     }
 
-    /* Reset async queues */
-    ctx->input_wr  = 0;
-    ctx->input_rd  = 0;
-    ctx->output_wr = 0;
-    ctx->output_rd = 0;
-    ctx->async_mode = false;
-
-    /* Try to enable async callbacks on API 28+ (resolved via dlsym) */
-    PFN_setAsyncNotifyCallback pfn = ctx->wakeup_fn ? resolve_async_callback()
-                                                     : nullptr;
-    if (pfn) {
-        AMediaCodecOnAsyncNotifyCallback cb;
-        cb.onAsyncInputAvailable  = on_async_input;
-        cb.onAsyncOutputAvailable = on_async_output;
-        cb.onAsyncFormatChanged   = on_async_format;
-        cb.onAsyncError           = on_async_error;
-
-        media_status_t s = pfn(ctx->codec, cb, ctx);
-        if (s == AMEDIA_OK) {
-            ctx->async_mode = true;
-            LOGI("decoder_configure: async callbacks enabled (API %d)",
-                 android_get_device_api_level());
-        } else {
-            LOGW("decoder_configure: async callbacks failed (%d), using sync",
-                 (int)s);
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (attempt > 0 && !recreate_codec(ctx)) {
+            LOGE("decoder_configure: failed to recreate codec for retry %d",
+                 attempt);
+            return -1;
         }
-    }
 
-    AMediaFormat *format = AMediaFormat_new();
-    if (!format) {
-        LOGE("decoder_configure: failed to create AMediaFormat");
-        return -1;
-    }
+        reset_async_queues(ctx);
+        enable_async_callbacks(ctx);
 
-    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
-    if (fps > 0) {
-        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_FRAME_RATE, fps);
-        PFN_setFrameRate set_frame_rate = resolve_set_frame_rate();
-        if (set_frame_rate && ctx->window) {
-            int32_t fr_status = set_frame_rate(ctx->window, (float)fps, 1);
-            LOGI("decoder_configure: surface frame rate hint %d -> %d",
-                 fps, (int)fr_status);
+        AMediaFormat *format = AMediaFormat_new();
+        if (!format) {
+            LOGE("decoder_configure: failed to create AMediaFormat");
+            return -1;
         }
-    }
 
-    /* Standard Android 11+ low-latency keys */
-    AMediaFormat_setInt32(format, "low-latency", 1);
-    AMediaFormat_setInt32(format, "priority", 0); /* real-time priority (API 28+) */
-
-    /* Qualcomm vendor extensions */
-    AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1);
-    AMediaFormat_setInt32(format, "vendor.qti-ext-dec-picture-order.enable", 0);
-
-    /* Samsung Exynos */
-    AMediaFormat_setInt32(format, "vendor.rtc-ext-dec-low-latency.enable", 1);
-
-    /* MediaTek */
-    AMediaFormat_setInt32(format, "vdec-lowlatency", 1);
-
-    /* Amlogic (Fire TV etc.) */
-    AMediaFormat_setInt32(format, "vendor.low-latency.enable", 1);
-
-    /* Force maximum decode speed (Moonlight uses this) */
-    AMediaFormat_setInt32(format, "operating-rate", 32767); /* Short.MAX_VALUE */
-
-    media_status_t status = AMediaCodec_configure(
-        ctx->codec, format, ctx->window, nullptr /* crypto */, 0 /* flags */);
-
-    AMediaFormat_delete(format);
-
-    if (status != AMEDIA_OK) {
-        LOGE("decoder_configure: AMediaCodec_configure failed: %d", (int)status);
-        return -1;
-    }
-
-    status = AMediaCodec_start(ctx->codec);
-    if (status != AMEDIA_OK) {
-        LOGE("decoder_configure: AMediaCodec_start failed: %d", (int)status);
-        return -1;
-    }
-
-    if (android_get_device_api_level() >= 30) {
-        AMediaFormat *params = AMediaFormat_new();
-        if (params) {
-            AMediaFormat_setInt32(params, "low-latency", 1);
-            AMediaFormat_setInt32(params, "priority", 0);
-            AMediaFormat_setInt32(params, "operating-rate", 32767);
-            media_status_t ps = AMediaCodec_setParameters(ctx->codec, params);
-            LOGI("decoder_configure: set runtime low-latency parameters -> %d", (int)ps);
-            AMediaFormat_delete(params);
+        AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, ctx->mime);
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, width);
+        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
+        if (fps > 0) {
+            AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_FRAME_RATE, fps);
+            PFN_setFrameRate set_frame_rate = resolve_set_frame_rate();
+            if (set_frame_rate && ctx->window) {
+                int32_t fr_status = set_frame_rate(ctx->window, (float)fps, 1);
+                LOGI("decoder_configure: surface frame rate hint %d -> %d",
+                     fps, (int)fr_status);
+            }
         }
+
+        if (attempt <= 2) {
+            AMediaFormat_setInt32(format, "low-latency", 1);
+            AMediaFormat_setInt32(format, "priority", 0);
+            AMediaFormat_setInt32(format, "operating-rate", 32767);
+        }
+
+        if (attempt == 0) {
+            AMediaFormat_setInt32(format, "vdec-lowlatency", 1);
+            if (!(ctx->hints.is_qcom_c2 || ctx->hints.is_qcom_omx)) {
+                AMediaFormat_setInt32(format,
+                                      "vendor.rtc-ext-dec-low-latency.enable", 1);
+                AMediaFormat_setInt32(format, "vendor.low-latency.enable", 1);
+            }
+        }
+
+        if (attempt <= 1 && (ctx->hints.is_qcom_c2 || ctx->hints.is_qcom_omx)) {
+            int picture_order = ctx->hints.is_qcom_omx ? 0 : 1;
+            AMediaFormat_setInt32(format,
+                                  "vendor.qti-ext-dec-picture-order.enable",
+                                  picture_order);
+            AMediaFormat_setInt32(format,
+                                  "vendor.qti-ext-dec-low-latency.enable", 1);
+            LOGI("decoder_configure: qcom low-latency picture-order=%d attempt=%d",
+                 picture_order, attempt);
+        } else if (attempt == 2 &&
+                   (ctx->hints.is_qcom_c2 || ctx->hints.is_qcom_omx)) {
+            AMediaFormat_setInt32(format,
+                                  "vendor.qti-ext-dec-low-latency.enable", 1);
+        }
+
+        media_status_t status = AMediaCodec_configure(
+            ctx->codec, format, ctx->window, nullptr /* crypto */, 0 /* flags */);
+
+        AMediaFormat_delete(format);
+
+        if (status != AMEDIA_OK) {
+            LOGW("decoder_configure: configure failed attempt=%d status=%d",
+                 attempt, (int)status);
+            continue;
+        }
+
+        status = AMediaCodec_start(ctx->codec);
+        if (status != AMEDIA_OK) {
+            LOGW("decoder_configure: start failed attempt=%d status=%d",
+                 attempt, (int)status);
+            continue;
+        }
+
+        if (android_get_device_api_level() >= 30 && attempt <= 2) {
+            AMediaFormat *params = AMediaFormat_new();
+            if (params) {
+                AMediaFormat_setInt32(params, "low-latency", 1);
+                AMediaFormat_setInt32(params, "priority", 0);
+                AMediaFormat_setInt32(params, "operating-rate", 32767);
+                if (ctx->hints.is_qcom_c2 || ctx->hints.is_qcom_omx) {
+                    AMediaFormat_setInt32(
+                        params, "vendor.qti-ext-dec-low-latency.enable", 1);
+                }
+                media_status_t ps = AMediaCodec_setParameters(ctx->codec, params);
+                LOGI("decoder_configure: runtime low-latency params attempt=%d -> %d",
+                     attempt, (int)ps);
+                AMediaFormat_delete(params);
+            }
+        }
+
+        ctx->configured = true;
+        LOGI("decoder_configure: configured %dx%d@%d mime=%s name=%s attempt=%d mode=%s",
+             width, height, fps, ctx->mime, ctx->codec_name, attempt,
+             ctx->async_mode ? "ASYNC" : "SYNC");
+        return 0;
     }
 
-    ctx->configured = true;
-    LOGI("decoder_configure: configured %dx%d@%d (mode=%s)", width, height, fps,
-         ctx->async_mode ? "ASYNC" : "SYNC");
-    return 0;
+    LOGE("decoder_configure: all configuration attempts failed");
+    return -1;
 }
 
 bool decoder_is_async(DecoderContext *ctx) {
@@ -326,14 +446,28 @@ int decoder_feed(DecoderContext *ctx, const uint8_t *nal_data, size_t nal_len,
         return -1;
     }
 
-    ssize_t idx = AMediaCodec_dequeueInputBuffer(ctx->codec, INPUT_TIMEOUT_US);
+    int32_t idx = decoder_dequeue_input(ctx, INPUT_TIMEOUT_US);
     if (idx < 0) {
-        LOGW("decoder_feed: no input buffer available (idx=%zd)", idx);
         return -1;
     }
 
-    return decoder_feed_index(ctx, (int32_t)idx, nal_data, nal_len,
-                              timestamp_us, flags);
+    return decoder_feed_index(ctx, idx, nal_data, nal_len, timestamp_us, flags);
+}
+
+int32_t decoder_dequeue_input(DecoderContext *ctx, int64_t timeout_us) {
+    if (!ctx || !ctx->configured) {
+        return -1;
+    }
+
+    ssize_t idx = AMediaCodec_dequeueInputBuffer(ctx->codec, timeout_us);
+    if (idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+        return -1;
+    }
+    if (idx < 0) {
+        LOGW("decoder_dequeue_input: no input buffer available (idx=%zd)", idx);
+        return -1;
+    }
+    return (int32_t)idx;
 }
 
 int decoder_feed_index(DecoderContext *ctx, int32_t index,
@@ -374,11 +508,7 @@ int32_t decoder_pop_input(DecoderContext *ctx) {
 
 static void render_frame(DecoderContext *ctx, size_t index) {
     if (ctx->render_mode == RENDER_MODE_LOWEST_LATENCY) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        int64_t now_ns = ts.tv_sec * 1000000000LL + ts.tv_nsec;
-        AMediaCodec_releaseOutputBufferAtTime(ctx->codec, index,
-                                              now_ns - 1000000LL);
+        AMediaCodec_releaseOutputBuffer(ctx->codec, index, true);
     } else {
         /* RENDER_MODE_SMOOTH: present at next VSync via releaseOutputBuffer. */
         AMediaCodec_releaseOutputBuffer(ctx->codec, index, true);
@@ -465,6 +595,6 @@ void decoder_destroy(DecoderContext *ctx) {
         AMediaCodec_delete(ctx->codec);
     }
 
-    free(ctx);
+    delete ctx;
     LOGI("decoder_destroy: cleaned up");
 }

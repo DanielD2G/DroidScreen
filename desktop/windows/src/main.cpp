@@ -1305,6 +1305,7 @@ static bool speed_test_handshake(droidscreen::TCPClient *client) {
   req.max_bitrate_kbps = 15000;
   req.touch_enabled = 0;
   req.frame_interval_us = 16667; /* 60 fps */
+  req.reserved[0] = DS_CODEC_CAP_H264;
 
   uint8_t req_buf[DS_HANDSHAKE_REQ_SIZE];
   ds_handshake_req_serialize(req_buf, &req);

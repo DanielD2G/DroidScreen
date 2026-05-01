@@ -63,18 +63,21 @@ Pipeline::Pipeline(Capturer *capturer, Encoder *encoder, TCPClient *client,
 Pipeline::~Pipeline() { stop(); }
 
 bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
-                         uint32_t bitrate_kbps, bool touch_enabled) {
+                         uint32_t bitrate_kbps, bool touch_enabled,
+                         ds_codec_t preferred_codec, uint8_t codec_caps) {
   // Desktop sends HANDSHAKE_REQ to Android.
   ds_handshake_req_t req{};
   req.protocol_version = DS_PROTOCOL_VERSION;
   req.width = static_cast<uint16_t>(width);
   req.height = static_cast<uint16_t>(height);
   req.fps = static_cast<uint8_t>(fps);
-  req.codec = DS_CODEC_H264;
+  req.codec = static_cast<uint8_t>(preferred_codec);
   req.max_bitrate_kbps = bitrate_kbps;
   req.touch_enabled = touch_enabled ? 1 : 0;
   req.frame_interval_us =
       (fps > 0) ? static_cast<uint32_t>(1000000.0 / fps + 0.5) : 16667;
+  req.reserved[0] = codec_caps ? codec_caps
+                               : static_cast<uint8_t>(DS_CODEC_CAP_H264);
 
   uint8_t req_buf[DS_HANDSHAKE_REQ_SIZE];
   ds_handshake_req_serialize(req_buf, &req);
@@ -85,8 +88,9 @@ bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
     return false;
   }
 
-  fprintf(stderr, "[pipeline] handshake sent: %ux%u@%u fps, %u kbps (fixed)\n",
-          width, height, fps, bitrate_kbps);
+  fprintf(stderr,
+          "[pipeline] handshake sent: %ux%u@%u fps, %u kbps, preferred codec=%u caps=0x%02x\n",
+          width, height, fps, bitrate_kbps, req.codec, req.reserved[0]);
 
   // Wait for Android's HANDSHAKE_RESP.
   ds_header_t hdr;
@@ -126,24 +130,28 @@ bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
           resp.accepted_width, resp.accepted_height, resp.accepted_fps,
           resp.accepted_codec, resp.decoder_max_bitrate, resp.touch_supported);
 
+  accepted_codec_ = static_cast<ds_codec_t>(resp.accepted_codec);
+
   return true;
 }
 
 bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
                      uint32_t bitrate_kbps, uint32_t min_idle_fps,
-                     bool touch_enabled) {
+                     bool touch_enabled, ds_codec_t preferred_codec,
+                     uint8_t codec_caps) {
   if (running_.load()) {
     fprintf(stderr, "[pipeline] already running\n");
     return false;
   }
 
   // Perform protocol handshake.
-  if (!handshake(width, height, fps, bitrate_kbps, touch_enabled)) {
+  if (!handshake(width, height, fps, bitrate_kbps, touch_enabled,
+                 preferred_codec, codec_caps)) {
     return false;
   }
 
   // Initialize encoder with fixed bitrate (no ramping on USB).
-  if (!encoder_->init(width, height, fps, bitrate_kbps)) {
+  if (!encoder_->init(width, height, fps, bitrate_kbps, accepted_codec_)) {
     fprintf(stderr, "[pipeline] encoder init failed\n");
     return false;
   }

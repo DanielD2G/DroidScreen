@@ -21,6 +21,10 @@ typedef enum {
     DS_CODEC_HEVC = 1
 } ds_codec_t;
 
+#define DS_CODEC_CAP_H264  (1u << DS_CODEC_H264)
+#define DS_CODEC_CAP_HEVC  (1u << DS_CODEC_HEVC)
+#define DS_CODEC_CAP_ALL   (DS_CODEC_CAP_H264 | DS_CODEC_CAP_HEVC)
+
 #define DS_HANDSHAKE_REQ_SIZE   20
 #define DS_HANDSHAKE_RESP_SIZE  16
 
@@ -34,11 +38,11 @@ typedef struct {
     uint16_t width;
     uint16_t height;
     uint8_t  fps;
-    uint8_t  codec;
+    uint8_t  codec;            /* preferred codec */
     uint32_t max_bitrate_kbps;
     uint8_t  touch_enabled;
     uint32_t frame_interval_us;  /* 0 = derive from fps field; >0 = precise interval */
-    uint8_t  reserved[3];
+    uint8_t  reserved[3];      /* reserved[0] = offered codec bitmask */
 } ds_handshake_req_t;
 #pragma pack(pop)
 

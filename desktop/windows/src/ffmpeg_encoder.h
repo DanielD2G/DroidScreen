@@ -61,7 +61,8 @@ public:
                         std::mutex* d3d_mutex = nullptr);
 
     bool init(uint32_t width, uint32_t height,
-              uint32_t fps, uint32_t bitrate_kbps) override;
+              uint32_t fps, uint32_t bitrate_kbps,
+              ds_codec_t codec = DS_CODEC_H264) override;
     bool encode(void* native_frame, int64_t timestamp_us,
                 std::function<void(const EncodedPacket&)> on_packet) override;
     bool set_bitrate(uint32_t bitrate_kbps) override;

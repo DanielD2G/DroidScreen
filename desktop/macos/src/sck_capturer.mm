@@ -9,6 +9,8 @@
 #import <CoreVideo/CoreVideo.h>
 #import <dispatch/dispatch.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 
 static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) {
@@ -22,6 +24,7 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
 
 @interface SCKCapturerDelegate : NSObject <SCStreamOutput>
 @property (nonatomic, assign) droidscreen::SCKCapturer* owner;
+@property (nonatomic, assign) int sampleCount;
 @end
 
 @implementation SCKCapturerDelegate
@@ -74,6 +77,46 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
 
     CVPixelBufferRef pixelBuf = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!pixelBuf) return;
+
+    if (_sampleCount < 5) {
+        CVReturn lockStatus =
+            CVPixelBufferLockBaseAddress(pixelBuf, kCVPixelBufferLock_ReadOnly);
+        if (lockStatus == kCVReturnSuccess && CVPixelBufferGetPlaneCount(pixelBuf) > 0) {
+            const uint8_t* yPlane =
+                static_cast<const uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuf, 0));
+            size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuf, 0);
+            size_t yWidth = CVPixelBufferGetWidthOfPlane(pixelBuf, 0);
+            size_t yHeight = CVPixelBufferGetHeightOfPlane(pixelBuf, 0);
+            size_t stepX = std::max<size_t>(1, yWidth / 96);
+            size_t stepY = std::max<size_t>(1, yHeight / 54);
+            uint64_t total = 0;
+            uint64_t totalSq = 0;
+            uint64_t count = 0;
+            uint64_t nonBlack = 0;
+            for (size_t y = 0; y < yHeight; y += stepY) {
+                const uint8_t* row = yPlane + y * yStride;
+                for (size_t x = 0; x < yWidth; x += stepX) {
+                    uint8_t v = row[x];
+                    total += v;
+                    totalSq += (uint64_t)v * (uint64_t)v;
+                    nonBlack += v > 8 ? 1 : 0;
+                    count++;
+                }
+            }
+            double mean = count ? (double)total / (double)count : 0.0;
+            double variance = count
+                ? (double)totalSq / (double)count - mean * mean
+                : 0.0;
+            double nonBlackRatio = count ? (double)nonBlack / (double)count : 0.0;
+            fprintf(stderr,
+                    "[sck] frame sample %d mean=%.2f variance=%.2f non_black=%.4f size=%zux%zu\n",
+                    _sampleCount + 1, mean, variance, nonBlackRatio,
+                    yWidth, yHeight);
+            fflush(stderr);
+            CVPixelBufferUnlockBaseAddress(pixelBuf, kCVPixelBufferLock_ReadOnly);
+        }
+        _sampleCount++;
+    }
 
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
     int64_t timestamp_us = 0;
@@ -174,15 +217,22 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
     width_  = (capture_width > 0)  ? capture_width  : display_logical_w;
     height_ = (capture_height > 0) ? capture_height : display_logical_h;
 
-    SCContentFilter* filter =
-        [[SCContentFilter alloc] initWithDisplay:chosen_display
-                                excludingWindows:@[]];
+    SCContentFilter* filter = nil;
+    if (@available(macOS 13.0, *)) {
+        filter = [[SCContentFilter alloc] initWithDisplay:chosen_display
+                                    excludingApplications:@[]
+                                         exceptingWindows:@[]];
+    }
+    if (!filter) {
+        filter = [[SCContentFilter alloc] initWithDisplay:chosen_display
+                                         excludingWindows:@[]];
+    }
 
     SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
     config.width  = width_;
     config.height = height_;
     config.minimumFrameInterval = CMTimeMake(1, target_fps > 0 ? target_fps : 60);
-    config.queueDepth = 3;  /* reduced from 4 — less buffering, still reliable delivery */
+    config.queueDepth = 3;
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.showsCursor = YES;
 
@@ -262,16 +312,23 @@ bool SCKCapturer::init(uint32_t display_index) {
     height_ = cap_h;
 
     // Create the filter (capture just this display, no apps excluded).
-    SCContentFilter* filter =
-        [[SCContentFilter alloc] initWithDisplay:chosen_display
-                                excludingWindows:@[]];
+    SCContentFilter* filter = nil;
+    if (@available(macOS 13.0, *)) {
+        filter = [[SCContentFilter alloc] initWithDisplay:chosen_display
+                                    excludingApplications:@[]
+                                         exceptingWindows:@[]];
+    }
+    if (!filter) {
+        filter = [[SCContentFilter alloc] initWithDisplay:chosen_display
+                                         excludingWindows:@[]];
+    }
 
     // Configure the stream.
     SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
     config.width  = cap_w;
     config.height = cap_h;
     config.minimumFrameInterval = CMTimeMake(1, 60);  // 60 fps
-    config.queueDepth = 3;  /* reduced from 4 — less buffering, still reliable delivery */
+    config.queueDepth = 3;
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.showsCursor = YES;
 

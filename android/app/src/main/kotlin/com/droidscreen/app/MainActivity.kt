@@ -92,6 +92,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+        }
         setContentView(R.layout.activity_main)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -189,6 +192,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun setImmersiveMode() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
             window.insetsController?.let { controller ->
                 controller.hide(
                     WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars()
