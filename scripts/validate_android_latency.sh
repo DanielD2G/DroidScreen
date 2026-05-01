@@ -144,7 +144,42 @@ for row in rows:
 mean = total / count
 variance = max(0.0, total_sq / count - mean * mean)
 non_black_ratio = non_black / count
-print(f"mean={mean:.2f} variance={variance:.2f} non_black={non_black_ratio:.4f}")
+
+def luma(row, x):
+    i = x * bpp
+    return (54 * row[i] + 183 * row[i + 1] + 19 * row[i + 2]) >> 8
+
+boundary_sum = boundary_count = 0
+reference_sum = reference_count = 0
+for row in rows:
+    for x in range(16, width, 16):
+        boundary_sum += abs(luma(row, x) - luma(row, x - 1))
+        boundary_count += 1
+    for x in range(8, width, 16):
+        reference_sum += abs(luma(row, x) - luma(row, x - 1))
+        reference_count += 1
+
+for y in range(16, height, 16):
+    prev = rows[y - 1]
+    row = rows[y]
+    for x in range(0, width, 2):
+        boundary_sum += abs(luma(row, x) - luma(prev, x))
+        boundary_count += 1
+for y in range(8, height, 16):
+    prev = rows[y - 1]
+    row = rows[y]
+    for x in range(0, width, 2):
+        reference_sum += abs(luma(row, x) - luma(prev, x))
+        reference_count += 1
+
+boundary_avg = boundary_sum / boundary_count if boundary_count else 0.0
+reference_avg = reference_sum / reference_count if reference_count else 0.0
+blockiness = max(0.0, boundary_avg / max(0.001, reference_avg) - 1.0)
+
+print(
+    f"mean={mean:.2f} variance={variance:.2f} non_black={non_black_ratio:.4f} "
+    f"blockiness={blockiness:.3f}"
+)
 if mean < 5.0 or variance < 2.0 or non_black_ratio < 0.05:
     raise SystemExit("black_or_blank")
 PY
@@ -152,7 +187,8 @@ PY
 
 parse_metrics() {
   local log="$1"
-  python3 - "$log" <<'PY'
+  local desktop_log="${2:-}"
+  python3 - "$log" "$desktop_log" <<'PY'
 import re
 import statistics
 import sys
@@ -164,6 +200,11 @@ decode_pattern = re.compile(
     r"decode\[[^\]]+\]: fed=(\d+) rendered=(\d+) err=(\d+) \| "
     r"([0-9.]+) fed/s ([0-9.]+) render/s"
 )
+quality_pattern = re.compile(
+    r"\[quality\] fps=([0-9.]+) kbps=([0-9.]+) frame=([0-9.]+)kb "
+    r"delta=([0-9.]+)kb key=([0-9.]+)kb motion=([0-9.]+) "
+    r"bits_per_motion=([0-9.]+)"
+)
 feed = []
 release = []
 desk = []
@@ -174,6 +215,11 @@ encsend = []
 feed_fps = []
 render_fps = []
 feed_errors = []
+quality_fps = []
+quality_kbps = []
+quality_frame_kb = []
+quality_motion = []
+quality_bits_per_motion = []
 for line in open(sys.argv[1], errors="ignore"):
     m = lat_pattern.search(line)
     if m:
@@ -193,6 +239,20 @@ for line in open(sys.argv[1], errors="ignore"):
         feed_fps.append(float(d.group(4)))
         render_fps.append(float(d.group(5)))
 
+if len(sys.argv) > 2 and sys.argv[2]:
+    try:
+        quality_lines = open(sys.argv[2], errors="ignore")
+    except OSError:
+        quality_lines = []
+    for line in quality_lines:
+        q = quality_pattern.search(line)
+        if q:
+            quality_fps.append(float(q.group(1)))
+            quality_kbps.append(float(q.group(2)))
+            quality_frame_kb.append(float(q.group(3)))
+            quality_motion.append(float(q.group(6)))
+            quality_bits_per_motion.append(float(q.group(7)))
+
 if not release:
     print("metrics=none")
     raise SystemExit(2)
@@ -208,6 +268,13 @@ if feed_fps:
         f" fed_fps_p50={p50(feed_fps):.1f}"
         f" render_fps_p50={p50(render_fps):.1f}"
         f" feed_errors_max={max(feed_errors)}"
+    )
+if quality_kbps:
+    extra += (
+        f" quality_kbps_p50={p50(quality_kbps):.0f}"
+        f" motion_p50={p50(quality_motion):.2f}"
+        f" bits_per_motion_p50={p50(quality_bits_per_motion):.0f}"
+        f" qframe_kb_p50={p50(quality_frame_kb):.1f}"
     )
 print(
     f"samples={len(release)} "
@@ -302,7 +369,7 @@ for run in $(seq 1 "$RUNS"); do
   unset LOGCAT_PID
 
   set +e
-  parse_metrics "$RUN_DIR/logcat.txt" | tee "$RUN_DIR/metrics.txt"
+  parse_metrics "$RUN_DIR/logcat.txt" "$RUN_DIR/desktop-debug.log" | tee "$RUN_DIR/metrics.txt"
   metrics_status=${PIPESTATUS[0]}
   set -e
   if (( metrics_status != 0 )); then

@@ -128,6 +128,7 @@ private:
         int64_t encode_done_us;   // timestamp when VT callback fired
         uint64_t sequence;
         bool is_idle;
+        float motion_score;
     };
 
     static constexpr size_t kMaxSendQueueSize = 4;
@@ -158,6 +159,16 @@ private:
     std::atomic<int64_t>  last_capture_to_send_us_{0};
     std::atomic<uint64_t> next_video_sequence_{1};
     ds_codec_t accepted_codec_ = DS_CODEC_H264;
+    uint32_t target_fps_ = 60;
+    uint32_t target_bitrate_kbps_ = 0;
+
+    int64_t quality_window_start_us_ = 0;
+    uint64_t quality_window_bytes_ = 0;
+    uint64_t quality_window_delta_bytes_ = 0;
+    uint64_t quality_window_key_bytes_ = 0;
+    uint64_t quality_window_frames_ = 0;
+    uint64_t quality_window_keyframes_ = 0;
+    double quality_window_motion_sum_ = 0.0;
 
     // Maximum interval between frames during idle periods (microseconds).
     // When no new capture arrives within this interval, the last frame is

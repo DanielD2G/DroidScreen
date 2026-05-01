@@ -22,6 +22,7 @@ struct CapturedFrame {
     uint32_t height;
     int64_t timestamp_us;
     bool is_idle;          // true if the frame content hasn't changed
+    float motion_score = 0.0f;  // average luma delta vs previous frame (0..255)
 };
 
 class Capturer {

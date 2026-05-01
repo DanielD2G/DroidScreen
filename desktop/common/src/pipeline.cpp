@@ -156,6 +156,16 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
     return false;
   }
 
+  target_fps_ = fps;
+  target_bitrate_kbps_ = bitrate_kbps;
+  quality_window_start_us_ = 0;
+  quality_window_bytes_ = 0;
+  quality_window_delta_bytes_ = 0;
+  quality_window_key_bytes_ = 0;
+  quality_window_frames_ = 0;
+  quality_window_keyframes_ = 0;
+  quality_window_motion_sum_ = 0.0;
+
   max_idle_interval_us_ = idle_interval_us_for_fps(min_idle_fps);
   running_.store(true);
   frames_encoded_.store(0);
@@ -303,7 +313,7 @@ void Pipeline::encode_loop() {
   last_frame.release_fn = nullptr;
 
   auto on_packet = [this](const EncodedPacket &pkt, int64_t t_enc_start,
-                          bool is_idle) {
+                          bool is_idle, float motion_score) {
     int64_t t_enc_end = now_us();
     last_encode_us_.store(t_enc_end - t_enc_start);
 
@@ -321,6 +331,7 @@ void Pipeline::encode_loop() {
     sp.encode_done_us = t_enc_end;
     sp.sequence = next_video_sequence_.fetch_add(1);
     sp.is_idle = is_idle;
+    sp.motion_score = pkt.is_config ? 0.0f : motion_score;
 
     {
       std::unique_lock<std::mutex> lock(send_mutex_);
@@ -372,8 +383,9 @@ void Pipeline::encode_loop() {
       int64_t t_enc_start = now_us();
       bool ok = encoder_->encode(
           frame.native_handle, frame.timestamp_us,
-          [&on_packet, t_enc_start](const EncodedPacket &pkt) {
-            on_packet(pkt, t_enc_start, false);
+          [&on_packet, t_enc_start, motion_score = frame.motion_score](
+              const EncodedPacket &pkt) {
+            on_packet(pkt, t_enc_start, false, motion_score);
           });
       if (!ok) {
         fprintf(stderr, "[encode] encode submit failed\n");
@@ -391,7 +403,7 @@ void Pipeline::encode_loop() {
         bool ok = encoder_->encode(
             last_frame.native_handle, t_enc_start,
             [&on_packet, t_enc_start](const EncodedPacket &pkt) {
-              on_packet(pkt, t_enc_start, true);
+              on_packet(pkt, t_enc_start, true, 0.0f);
             });
         if (!ok) {
           fprintf(stderr, "[encode] idle re-encode failed\n");
@@ -460,6 +472,66 @@ void Pipeline::send_loop() {
         int64_t t_send_end = now_us();
         last_send_us_.store(t_send_end - t_send_start);
         bytes_sent_.fetch_add(DS_HEADER_SIZE + wire_payload.size());
+
+        if (!pkt.is_idle && (pkt.flags & DS_FLAG_CONFIG) == 0) {
+          if (quality_window_start_us_ == 0) {
+            quality_window_start_us_ = t_send_end;
+          }
+          quality_window_bytes_ += pkt.data.size();
+          quality_window_frames_++;
+          quality_window_motion_sum_ += pkt.motion_score;
+          if ((pkt.flags & DS_FLAG_KEYFRAME) != 0) {
+            quality_window_keyframes_++;
+            quality_window_key_bytes_ += pkt.data.size();
+          } else {
+            quality_window_delta_bytes_ += pkt.data.size();
+          }
+
+          int64_t elapsed_us = t_send_end - quality_window_start_us_;
+          if (elapsed_us >= 1000000 && quality_window_frames_ > 0) {
+            double elapsed_s = (double)elapsed_us / 1000000.0;
+            double fps = (double)quality_window_frames_ / elapsed_s;
+            double kbps = ((double)quality_window_bytes_ * 8.0 / 1000.0) / elapsed_s;
+            double frame_kbits =
+                ((double)quality_window_bytes_ * 8.0 / 1000.0) /
+                (double)quality_window_frames_;
+            uint64_t delta_frames =
+                quality_window_frames_ > quality_window_keyframes_
+                    ? quality_window_frames_ - quality_window_keyframes_
+                    : 0;
+            double delta_kbits = delta_frames
+                ? ((double)quality_window_delta_bytes_ * 8.0 / 1000.0) /
+                      (double)delta_frames
+                : 0.0;
+            double key_kbits = quality_window_keyframes_
+                ? ((double)quality_window_key_bytes_ * 8.0 / 1000.0) /
+                      (double)quality_window_keyframes_
+                : 0.0;
+            double motion_luma =
+                quality_window_motion_sum_ / (double)quality_window_frames_;
+            double bits_per_motion =
+                motion_luma > 0.25
+                    ? (frame_kbits * 1000.0) / motion_luma
+                    : 0.0;
+            double budget_kbits = target_fps_ > 0
+                ? (double)target_bitrate_kbps_ / (double)target_fps_
+                : 0.0;
+            fprintf(stderr,
+                    "[quality] fps=%.1f kbps=%.0f frame=%.1fkb "
+                    "delta=%.1fkb key=%.1fkb motion=%.2f bits_per_motion=%.0f "
+                    "budget=%.1fkb\n",
+                    fps, kbps, frame_kbits, delta_kbits, key_kbits,
+                    motion_luma, bits_per_motion, budget_kbits);
+
+            quality_window_start_us_ = t_send_end;
+            quality_window_bytes_ = 0;
+            quality_window_delta_bytes_ = 0;
+            quality_window_key_bytes_ = 0;
+            quality_window_frames_ = 0;
+            quality_window_keyframes_ = 0;
+            quality_window_motion_sum_ = 0.0;
+          }
+        }
       } else {
         fprintf(stderr, "[send] TCP send failed\n");
         running_.store(false);

@@ -3,6 +3,7 @@
 #import <QuartzCore/QuartzCore.h>
 
 #include <cstdlib>
+#include <math.h>
 #include <unistd.h>
 
 @interface ValidationSceneView : NSView
@@ -161,8 +162,57 @@
 
 @end
 
+@interface MovingWindowContentView : NSView
+@end
+
+@implementation MovingWindowContentView
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.wantsLayer = YES;
+        CALayer* root = [CALayer layer];
+        root.frame = self.bounds;
+        root.backgroundColor =
+            [NSColor colorWithCalibratedRed:0.11 green:0.12 blue:0.15 alpha:1.0].CGColor;
+        root.needsDisplayOnBoundsChange = YES;
+        self.layer = root;
+
+        NSArray<NSColor*>* colors = @[
+            [NSColor colorWithCalibratedRed:0.98 green:0.25 blue:0.20 alpha:1.0],
+            [NSColor colorWithCalibratedRed:0.08 green:0.69 blue:0.86 alpha:1.0],
+            [NSColor colorWithCalibratedRed:0.98 green:0.78 blue:0.18 alpha:1.0]
+        ];
+        for (int i = 0; i < 3; i++) {
+            CALayer* bar = [CALayer layer];
+            CGFloat y = 34.0 + i * 76.0;
+            bar.frame = CGRectMake(34.0, y, MAX(120.0, frame.size.width - 68.0), 44.0);
+            bar.backgroundColor = colors[i].CGColor;
+            bar.cornerRadius = 5.0;
+            [root addSublayer:bar];
+        }
+
+        CATextLayer* text = [CATextLayer layer];
+        text.frame = CGRectMake(34.0, frame.size.height - 96.0,
+                                MAX(120.0, frame.size.width - 68.0), 52.0);
+        text.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+        text.string = @"Moving window validation";
+        text.foregroundColor = NSColor.whiteColor.CGColor;
+        text.fontSize = 32.0;
+        text.alignmentMode = kCAAlignmentLeft;
+        [root addSublayer:text];
+    }
+    return self;
+}
+
+@end
+
 @interface HelperDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSWindow* window;
+@property(nonatomic, strong) NSWindow* movingWindow;
+@property(nonatomic) NSRect screenFrame;
+@property(nonatomic) CFTimeInterval moveStart;
+@property(nonatomic, strong) NSTimer* moveTimer;
 @property(nonatomic, assign) pid_t parentPid;
 @end
 
@@ -175,6 +225,14 @@
                                    selector:@selector(checkParent:)
                                    userInfo:nil
                                     repeats:YES];
+    self.moveStart = CACurrentMediaTime();
+    self.moveTimer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / 120.0)
+                                                      target:self
+                                                    selector:@selector(moveWindow:)
+                                                    userInfo:nil
+                                                     repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.moveTimer
+                              forMode:NSRunLoopCommonModes];
 }
 
 - (void)checkParent:(NSTimer*)timer {
@@ -182,6 +240,25 @@
     if (self.parentPid > 0 && kill(self.parentPid, 0) != 0) {
         [NSApp terminate:nil];
     }
+}
+
+- (void)moveWindow:(NSTimer*)timer {
+    (void)timer;
+    if (!self.movingWindow) return;
+
+    NSRect screen = self.screenFrame;
+    CGFloat w = MIN(640.0, MAX(360.0, screen.size.width * 0.34));
+    CGFloat h = MIN(420.0, MAX(260.0, screen.size.height * 0.30));
+    CGFloat spanX = MAX(1.0, screen.size.width - w - 96.0);
+    CGFloat spanY = MAX(1.0, screen.size.height - h - 116.0);
+    CFTimeInterval t = CACurrentMediaTime() - self.moveStart;
+    CGFloat phaseX = (CGFloat)((sin(t * 1.7) + 1.0) * 0.5);
+    CGFloat phaseY = (CGFloat)((sin(t * 1.1 + 1.4) + 1.0) * 0.5);
+
+    NSRect frame = NSMakeRect(screen.origin.x + 48.0 + phaseX * spanX,
+                              screen.origin.y + 58.0 + phaseY * spanY,
+                              w, h);
+    [self.movingWindow setFrame:frame display:YES];
 }
 
 @end
@@ -248,8 +325,42 @@ int main(int argc, const char* argv[]) {
         [app activateIgnoringOtherApps:YES];
         [CATransaction flush];
 
+        CGFloat movingW = MIN(640.0, MAX(360.0, frame.size.width * 0.34));
+        CGFloat movingH = MIN(420.0, MAX(260.0, frame.size.height * 0.30));
+        NSRect movingFrame = NSMakeRect(frame.origin.x + 48.0,
+                                        frame.origin.y + frame.size.height - movingH - 58.0,
+                                        movingW, movingH);
+        NSWindow* movingWindow =
+            [[NSWindow alloc] initWithContentRect:movingFrame
+                                        styleMask:NSWindowStyleMaskTitled
+                                          backing:NSBackingStoreBuffered
+                                            defer:NO
+                                           screen:targetScreen];
+        movingWindow.releasedWhenClosed = NO;
+        movingWindow.backgroundColor =
+            [NSColor colorWithCalibratedRed:0.11 green:0.12 blue:0.15 alpha:1.0];
+        movingWindow.opaque = YES;
+        movingWindow.ignoresMouseEvents = YES;
+        movingWindow.level = NSStatusWindowLevel + 1;
+        movingWindow.title = @"DroidScreen Motion";
+        movingWindow.collectionBehavior =
+            NSWindowCollectionBehaviorCanJoinAllSpaces |
+            NSWindowCollectionBehaviorFullScreenAuxiliary |
+            NSWindowCollectionBehaviorStationary;
+        movingWindow.contentView =
+            [[MovingWindowContentView alloc] initWithFrame:NSMakeRect(0, 0,
+                                                                      movingW,
+                                                                      movingH)];
+        [movingWindow setFrame:movingFrame display:YES];
+        [movingWindow.contentView displayIfNeeded];
+        [movingWindow makeKeyAndOrderFront:nil];
+        [movingWindow orderFrontRegardless];
+        [movingWindow displayIfNeeded];
+
         HelperDelegate* delegate = [[HelperDelegate alloc] init];
         delegate.window = window;
+        delegate.movingWindow = movingWindow;
+        delegate.screenFrame = frame;
         delegate.parentPid = parentPid;
         app.delegate = delegate;
 

@@ -211,6 +211,50 @@ static inline void sps_patch_constraints(uint8_t *nal, size_t len) {
     nal[offset + 2] |= 0x04;
 }
 
+static inline int sps_patch_h264_constraints_only(uint8_t *data, size_t len) {
+    if (!data || len == 0) return 0;
+
+    int patched = 0;
+    size_t start = 0;
+    size_t nal_start = 0;
+    size_t search = 0;
+
+    if (!sps_find_start_code(data, len, 0, &start, &nal_start)) {
+        size_t offset = 0;
+        if (len >= 5 && data[0] == 0 && data[1] == 0 &&
+                data[2] == 0 && data[3] == 1) {
+            offset = 4;
+        } else if (len >= 4 && data[0] == 0 && data[1] == 0 &&
+                data[2] == 1) {
+            offset = 3;
+        }
+        if (offset < len && (data[offset] & 0x1F) == 7) {
+            sps_patch_constraints(data, len);
+            return 1;
+        }
+        return 0;
+    }
+
+    search = start;
+    while (sps_find_start_code(data, len, search, &start, &nal_start)) {
+        size_t next_start = len;
+        size_t next_nal = 0;
+        if (sps_find_start_code(data, len, nal_start, &next_start, &next_nal)) {
+            (void)next_nal;
+        }
+
+        size_t nal_len = next_start > nal_start ? next_start - nal_start : 0;
+        if (nal_len > 0 && (data[nal_start] & 0x1F) == 7) {
+            sps_patch_constraints(data + nal_start, nal_len);
+            patched = 1;
+        }
+
+        search = next_start;
+    }
+
+    return patched;
+}
+
 static inline void sps_write_low_latency_vui(sps_bit_writer_t *bw) {
     sps_bw_write_bit(bw, 0);   /* aspect_ratio_info_present_flag */
     sps_bw_write_bit(bw, 0);   /* overscan_info_present_flag */

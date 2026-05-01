@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <vector>
 
 static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) {
     if (!native_handle) return;
@@ -22,12 +23,64 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
 // Objective-C delegate that bridges SCStreamOutput to the C++ callback
 // ---------------------------------------------------------------------------
 
-@interface SCKCapturerDelegate : NSObject <SCStreamOutput>
+@interface SCKCapturerDelegate : NSObject <SCStreamOutput> {
+    std::vector<uint8_t> _motionSample;
+    std::vector<uint8_t> _previousMotionSample;
+}
 @property (nonatomic, assign) droidscreen::SCKCapturer* owner;
 @property (nonatomic, assign) int sampleCount;
 @end
 
 @implementation SCKCapturerDelegate
+
+- (float)measureMotionScore:(CVPixelBufferRef)pixelBuf {
+    if (!pixelBuf || CVPixelBufferGetPlaneCount(pixelBuf) == 0) {
+        return 0.0f;
+    }
+
+    CVReturn lockStatus =
+        CVPixelBufferLockBaseAddress(pixelBuf, kCVPixelBufferLock_ReadOnly);
+    if (lockStatus != kCVReturnSuccess) {
+        return 0.0f;
+    }
+
+    const uint8_t* yPlane =
+        static_cast<const uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuf, 0));
+    size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuf, 0);
+    size_t yWidth = CVPixelBufferGetWidthOfPlane(pixelBuf, 0);
+    size_t yHeight = CVPixelBufferGetHeightOfPlane(pixelBuf, 0);
+    if (!yPlane || yWidth == 0 || yHeight == 0 || yStride == 0) {
+        CVPixelBufferUnlockBaseAddress(pixelBuf, kCVPixelBufferLock_ReadOnly);
+        return 0.0f;
+    }
+
+    constexpr size_t kGridW = 64;
+    constexpr size_t kGridH = 36;
+    _motionSample.resize(kGridW * kGridH);
+    for (size_t gy = 0; gy < kGridH; gy++) {
+        size_t y = std::min(yHeight - 1, (gy * yHeight) / kGridH);
+        const uint8_t* row = yPlane + y * yStride;
+        for (size_t gx = 0; gx < kGridW; gx++) {
+            size_t x = std::min(yWidth - 1, (gx * yWidth) / kGridW);
+            _motionSample[gy * kGridW + gx] = row[x];
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(pixelBuf, kCVPixelBufferLock_ReadOnly);
+
+    float score = 0.0f;
+    if (_previousMotionSample.size() == _motionSample.size()) {
+        uint64_t totalDiff = 0;
+        for (size_t i = 0; i < _motionSample.size(); i++) {
+            int diff = (int)_motionSample[i] - (int)_previousMotionSample[i];
+            totalDiff += (uint64_t)(diff < 0 ? -diff : diff);
+        }
+        score = (float)((double)totalDiff / (double)_motionSample.size());
+    }
+
+    _previousMotionSample = _motionSample;
+    return score;
+}
 
 - (void)stream:(SCStream *)stream
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
@@ -77,6 +130,7 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
 
     CVPixelBufferRef pixelBuf = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!pixelBuf) return;
+    float motionScore = [self measureMotionScore:pixelBuf];
 
     if (_sampleCount < 5) {
         CVReturn lockStatus =
@@ -136,6 +190,7 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
     frame.height = (uint32_t)CVPixelBufferGetHeight(pixelBuf);
     frame.timestamp_us = timestamp_us;
     frame.is_idle = false;
+    frame.motion_score = motionScore;
 
     _owner->deliver_frame(frame);
 }

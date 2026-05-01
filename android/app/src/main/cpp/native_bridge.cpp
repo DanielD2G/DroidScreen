@@ -72,6 +72,9 @@ typedef struct {
 #define STATUS_DISCONNECTED 2
 #define STATUS_ERROR        3
 
+#define MC_BUFFER_FLAG_KEY_FRAME    1u
+#define MC_BUFFER_FLAG_CODEC_CONFIG 2u
+
 /* ---- Decode thread condition variable ----
  * Signalled by: async MediaCodec callbacks, ring buffer writes (recv_thread).
  * Waited on by: decode_thread instead of polling with usleep. */
@@ -99,6 +102,7 @@ static std::atomic<uint32_t> g_stream_frame_interval_us{16667};
 static std::atomic<int64_t>  g_next_pts_us{0};
 static std::atomic<bool>     g_decoder_direct_submit{false};
 static std::atomic<int>      g_active_codec_id{DS_CODEC_H264};
+static std::atomic<bool>     g_h264_constraints_only_sps{false};
 
 /* ---- Stats tracking (read from JNI, written from recv/decode threads) ---- */
 static std::atomic<uint64_t> g_stats_bytes_received{0};
@@ -273,6 +277,39 @@ static int64_t ewma_us(int64_t prev, int64_t sample) {
     if (sample < 0) return prev;
     if (prev <= 0) return sample;
     return prev + (sample - prev) / 10;
+}
+
+static uint32_t media_codec_flags_from_video_flags(uint8_t video_flags,
+                                                   int* is_config) {
+    int keyframe = 0;
+    int config = 0;
+    ds_frame_parse_flags(video_flags, &keyframe, &config);
+
+    uint32_t mc_flags = 0;
+    if (keyframe) {
+        mc_flags |= MC_BUFFER_FLAG_KEY_FRAME;
+    }
+    if (config) {
+        mc_flags |= MC_BUFFER_FLAG_CODEC_CONFIG;
+    }
+    if (is_config) {
+        *is_config = config;
+    }
+    return mc_flags;
+}
+
+static void patch_h264_config_for_decoder(uint8_t* video_data,
+                                          size_t* nal_len) {
+    if (!video_data || !nal_len ||
+            g_active_codec_id.load(std::memory_order_relaxed) != DS_CODEC_H264) {
+        return;
+    }
+
+    if (g_h264_constraints_only_sps.load(std::memory_order_relaxed)) {
+        sps_patch_h264_constraints_only(video_data, *nal_len);
+    } else {
+        sps_patch_h264_low_latency(video_data, nal_len, MAX_FRAME_SIZE);
+    }
 }
 
 /**
@@ -560,6 +597,11 @@ static void* recv_thread_func(void* /*arg*/) {
             selection.hints.direct_submit && decoder_is_async(g_decoder),
             std::memory_order_release);
         g_active_codec_id.store(selection.codec_id, std::memory_order_release);
+        g_h264_constraints_only_sps.store(
+            selection.hints.has_android_low_latency ||
+                selection.hints.is_qcom_c2 ||
+                selection.hints.is_qcom_omx,
+            std::memory_order_release);
         g_decoder_configured.store(true, std::memory_order_release);
         LOGI("recv_thread: accepted codec=%d direct_submit=%d",
              selection.codec_id,
@@ -794,6 +836,7 @@ static void* recv_thread_func(void* /*arg*/) {
         g_next_pts_us.store(0, std::memory_order_relaxed);
         g_decoder_direct_submit.store(false, std::memory_order_relaxed);
         g_active_codec_id.store(DS_CODEC_H264, std::memory_order_relaxed);
+        g_h264_constraints_only_sps.store(false, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(g_pending_telemetry_mutex);
             memset(g_pending_telemetry, 0, sizeof(g_pending_telemetry));
@@ -936,15 +979,12 @@ static bool feed_video_message_direct(const uint8_t* msg, size_t msg_len,
     uint8_t* video_data = const_cast<uint8_t*>(msg + INTERNAL_VIDEO_HEADER_SIZE);
     size_t nal_len = msg_len - INTERNAL_VIDEO_HEADER_SIZE;
 
-    uint32_t mc_flags = 0;
     int is_config = 0;
-    ds_frame_parse_flags(video_flags, nullptr, &is_config);
+    uint32_t mc_flags =
+        media_codec_flags_from_video_flags(video_flags, &is_config);
 
     if (is_config) {
-        mc_flags = 2; /* BUFFER_FLAG_CODEC_CONFIG */
-        if (g_active_codec_id.load(std::memory_order_relaxed) == DS_CODEC_H264) {
-            sps_patch_h264_low_latency(video_data, &nal_len, MAX_FRAME_SIZE);
-        }
+        patch_h264_config_for_decoder(video_data, &nal_len);
     }
 
     int64_t pts_us = reserve_frame_pts_us(is_config != 0);
@@ -1090,16 +1130,12 @@ static void* decode_thread_func(void* /*arg*/) {
                 uint8_t* video_data = nal_buf + INTERNAL_VIDEO_HEADER_SIZE;
                 size_t nal_len = msg_len - INTERNAL_VIDEO_HEADER_SIZE;
 
-                uint32_t mc_flags = 0;
                 int is_config = 0;
-                ds_frame_parse_flags(video_flags, nullptr, &is_config);
+                uint32_t mc_flags =
+                    media_codec_flags_from_video_flags(video_flags, &is_config);
 
                 if (is_config) {
-                    mc_flags = 2; /* BUFFER_FLAG_CODEC_CONFIG */
-                    if (g_active_codec_id.load(std::memory_order_relaxed) == DS_CODEC_H264) {
-                        sps_patch_h264_low_latency(video_data, &nal_len,
-                                                   MAX_FRAME_SIZE);
-                    }
+                    patch_h264_config_for_decoder(video_data, &nal_len);
                 }
 
                 int64_t pts_us = reserve_frame_pts_us(is_config != 0);
@@ -1143,16 +1179,12 @@ static void* decode_thread_func(void* /*arg*/) {
                 uint8_t* video_data = nal_buf + INTERNAL_VIDEO_HEADER_SIZE;
                 size_t nal_len = msg_len - INTERNAL_VIDEO_HEADER_SIZE;
 
-                uint32_t mc_flags = 0;
                 int is_config = 0;
-                ds_frame_parse_flags(video_flags, nullptr, &is_config);
+                uint32_t mc_flags =
+                    media_codec_flags_from_video_flags(video_flags, &is_config);
 
                 if (is_config) {
-                    mc_flags = 2;
-                    if (g_active_codec_id.load(std::memory_order_relaxed) == DS_CODEC_H264) {
-                        sps_patch_h264_low_latency(video_data, &nal_len,
-                                                   MAX_FRAME_SIZE);
-                    }
+                    patch_h264_config_for_decoder(video_data, &nal_len);
                 }
 
                 int64_t pts_us = reserve_frame_pts_us(is_config != 0);

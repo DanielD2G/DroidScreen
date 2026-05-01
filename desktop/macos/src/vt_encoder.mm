@@ -31,6 +31,64 @@ struct VTEncodeContext {
     std::function<void(const EncodedPacket&)> on_packet;
 };
 
+static bool sample_contains_keyframe_nal(CMSampleBufferRef sample_buf,
+                                         ds_codec_t codec,
+                                         bool* parsed) {
+    if (parsed) *parsed = false;
+
+    CMBlockBufferRef block_buf = CMSampleBufferGetDataBuffer(sample_buf);
+    if (!block_buf) return false;
+
+    size_t total_len = 0;
+    char* data_ptr = nullptr;
+    if (CMBlockBufferGetDataPointer(block_buf, 0, nullptr, &total_len,
+                                     &data_ptr) != noErr ||
+            !data_ptr || total_len == 0) {
+        return false;
+    }
+
+    bool saw_video_nal = false;
+    size_t offset = 0;
+    while (offset + 4 <= total_len) {
+        uint32_t nal_len =
+            (static_cast<uint32_t>((uint8_t)data_ptr[offset])     << 24) |
+            (static_cast<uint32_t>((uint8_t)data_ptr[offset + 1]) << 16) |
+            (static_cast<uint32_t>((uint8_t)data_ptr[offset + 2]) <<  8) |
+            (static_cast<uint32_t>((uint8_t)data_ptr[offset + 3]));
+        if (nal_len == 0 || offset + 4 + nal_len > total_len) {
+            break;
+        }
+
+        const uint8_t* nal = (const uint8_t*)data_ptr + offset + 4;
+        if (codec == DS_CODEC_HEVC) {
+            if (nal_len >= 2) {
+                uint8_t nal_type = (uint8_t)((nal[0] >> 1) & 0x3F);
+                if (nal_type <= 31) {
+                    saw_video_nal = true;
+                }
+                if (nal_type == 19 || nal_type == 20 || nal_type == 21) {
+                    if (parsed) *parsed = true;
+                    return true;
+                }
+            }
+        } else {
+            uint8_t nal_type = (uint8_t)(nal[0] & 0x1F);
+            if (nal_type == 1 || nal_type == 5) {
+                saw_video_nal = true;
+            }
+            if (nal_type == 5) {
+                if (parsed) *parsed = true;
+                return true;
+            }
+        }
+
+        offset += 4 + nal_len;
+    }
+
+    if (parsed) *parsed = saw_video_nal;
+    return false;
+}
+
 VTEncoder::VTEncoder() = default;
 
 VTEncoder::~VTEncoder() {
@@ -131,15 +189,6 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_MaxFrameDelayCount, zero_num);
     CFRelease(zero_num);
-
-    if (@available(macOS 13.0, *)) {
-        int one_val = 1;
-        CFNumberRef one_num = CFNumberCreate(kCFAllocatorDefault,
-                                             kCFNumberIntType, &one_val);
-        VTSessionSetProperty(session_,
-            kVTCompressionPropertyKey_ReferenceBufferCount, one_num);
-        CFRelease(one_num);
-    }
 
     // Prioritize speed over quality (may not be supported on all devices).
     VTSessionSetProperty(session_,
@@ -265,35 +314,39 @@ void VTEncoder::output_callback(void* refcon,
 
     VTEncoder* self = static_cast<VTEncoder*>(refcon);
 
-    bool is_keyframe = false;
+    bool parsed_keyframe_nal = false;
+    bool is_keyframe =
+        sample_contains_keyframe_nal(sample_buf, self->codec_,
+                                     &parsed_keyframe_nal);
+
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(
         sample_buf, false);
-    if (attachments && CFArrayGetCount(attachments) > 0) {
+    if (!parsed_keyframe_nal && attachments && CFArrayGetCount(attachments) > 0) {
         CFDictionaryRef dict =
             (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
         CFBooleanRef not_sync = (CFBooleanRef)CFDictionaryGetValue(
             dict, kCMSampleAttachmentKey_NotSync);
-        is_keyframe = (!not_sync || !CFBooleanGetValue(not_sync));
+        if (not_sync) {
+            is_keyframe = !CFBooleanGetValue(not_sync);
+        }
     }
 
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buf);
     int64_t timestamp_us = (int64_t)(CMTimeGetSeconds(pts) * 1e6);
 
-    if (!self->config_sent_) {
-        bool emit_config = false;
-        {
-            std::lock_guard<std::mutex> lock(self->encode_mutex_);
-            if (!self->config_sent_) {
-                self->config_sent_ = true;
-                emit_config = true;
-            }
+    bool emit_config = is_keyframe;
+    {
+        std::lock_guard<std::mutex> lock(self->encode_mutex_);
+        if (!self->config_sent_) {
+            self->config_sent_ = true;
+            emit_config = true;
         }
-        if (emit_config) {
-            CMFormatDescriptionRef fmt =
-                CMSampleBufferGetFormatDescription(sample_buf);
-            if (fmt && ctx && ctx->on_packet) {
-                self->emit_config(fmt, timestamp_us, ctx->on_packet);
-            }
+    }
+    if (emit_config) {
+        CMFormatDescriptionRef fmt =
+            CMSampleBufferGetFormatDescription(sample_buf);
+        if (fmt && ctx && ctx->on_packet) {
+            self->emit_config(fmt, timestamp_us, ctx->on_packet);
         }
     }
 
