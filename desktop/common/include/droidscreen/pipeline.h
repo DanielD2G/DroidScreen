@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -106,6 +107,13 @@ private:
     // Handle an incoming control message.
     void handle_control(const uint8_t* data, size_t len);
 
+    // Try to recover a failed capturer stream without dropping the transport.
+    void handle_capturer_error(const char* reason);
+
+    // Mark the pipeline failed from a worker/capture callback. The owner will
+    // call stop(), close the socket, and reconnect.
+    void mark_failed(const char* reason);
+
     Capturer*      capturer_;
     Encoder*       encoder_;
     TCPClient*     client_;
@@ -118,6 +126,8 @@ private:
     std::deque<CapturedFrame> capture_queue_;
     std::mutex capture_mutex_;
     std::condition_variable capture_cv_;
+    std::function<void(const CapturedFrame&)> capture_callback_;
+    std::mutex capturer_mutex_;
 
     // --- Send queue: encoded packets waiting for TCP send ---
     struct SendPacket {
@@ -147,6 +157,7 @@ private:
     std::thread ping_thread_;
 
     std::atomic<bool> running_{false};
+    std::atomic<bool> capturer_restarting_{false};
     std::atomic<uint64_t> frames_encoded_{0};
     std::atomic<uint64_t> frames_captured_{0};
     std::atomic<uint64_t> frames_dropped_{0};
@@ -157,6 +168,7 @@ private:
     std::atomic<int64_t>  last_encode_us_{0};
     std::atomic<int64_t>  last_send_us_{0};
     std::atomic<int64_t>  last_capture_to_send_us_{0};
+    std::atomic<int64_t>  last_capture_callback_us_{0};
     std::atomic<uint64_t> next_video_sequence_{1};
     ds_codec_t accepted_codec_ = DS_CODEC_H264;
     uint32_t target_fps_ = 60;

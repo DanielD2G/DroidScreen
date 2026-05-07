@@ -10,9 +10,16 @@
 #import <dispatch/dispatch.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+
+static int64_t steady_now_us() {
+    auto tp = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        tp.time_since_epoch()).count();
+}
 
 static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) {
     if (!native_handle) return;
@@ -23,7 +30,7 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
 // Objective-C delegate that bridges SCStreamOutput to the C++ callback
 // ---------------------------------------------------------------------------
 
-@interface SCKCapturerDelegate : NSObject <SCStreamOutput> {
+@interface SCKCapturerDelegate : NSObject <SCStreamOutput, SCStreamDelegate> {
     std::vector<uint8_t> _motionSample;
     std::vector<uint8_t> _previousMotionSample;
 }
@@ -32,6 +39,13 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
 @end
 
 @implementation SCKCapturerDelegate
+
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    (void)stream;
+    if (!_owner) return;
+    NSString* message = error.localizedDescription ?: @"ScreenCaptureKit stream stopped";
+    _owner->handle_stream_error(message.UTF8String);
+}
 
 - (float)measureMotionScore:(CVPixelBufferRef)pixelBuf {
     if (!pixelBuf || CVPixelBufferGetPlaneCount(pixelBuf) == 0) {
@@ -172,12 +186,6 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
         _sampleCount++;
     }
 
-    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-    int64_t timestamp_us = 0;
-    if (CMTIME_IS_VALID(pts)) {
-        timestamp_us = (int64_t)(CMTimeGetSeconds(pts) * 1e6);
-    }
-
     // Retain the pixel buffer so it survives beyond this callback.
     // The pipeline must release it after encoding.
     CVPixelBufferRetain(pixelBuf);
@@ -188,7 +196,7 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
     frame.release_fn = release_cv_pixel_buffer;
     frame.width  = (uint32_t)CVPixelBufferGetWidth(pixelBuf);
     frame.height = (uint32_t)CVPixelBufferGetHeight(pixelBuf);
-    frame.timestamp_us = timestamp_us;
+    frame.timestamp_us = steady_now_us();
     frame.is_idle = false;
     frame.motion_score = motionScore;
 
@@ -204,8 +212,26 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
 namespace droidscreen {
 
 void SCKCapturer::deliver_frame(const CapturedFrame& frame) {
-    if (on_frame_) {
+    if (running_.load() && on_frame_) {
         on_frame_(frame);
+        return;
+    }
+
+    if (frame.native_handle && frame.release_fn) {
+        CapturedFrame releasable = frame;
+        frame.release_fn(releasable.release_ctx, releasable.native_handle);
+    }
+}
+
+void SCKCapturer::handle_stream_error(const char* message) {
+    if (!running_.exchange(false)) {
+        return;
+    }
+    fprintf(stderr, "[sck] stream stopped with error: %s\n",
+            message ? message : "unknown");
+    fflush(stderr);
+    if (on_error_) {
+        on_error_(message ? message : "ScreenCaptureKit stream stopped");
     }
 }
 
@@ -219,6 +245,13 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
                                        uint32_t capture_width,
                                        uint32_t capture_height,
                                        uint32_t target_fps) {
+    has_display_id_ = true;
+    display_id_ = cg_display_id;
+    configured_capture_width_ = capture_width;
+    configured_capture_height_ = capture_height;
+    configured_target_fps_ = target_fps;
+    has_display_index_ = false;
+
     __block bool success = false;
     __block SCDisplay* chosen_display = nil;
 
@@ -287,19 +320,21 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
     config.width  = width_;
     config.height = height_;
     config.minimumFrameInterval = CMTimeMake(1, target_fps > 0 ? target_fps : 60);
-    config.queueDepth = 3;
+    // The pipeline still keeps only the freshest frame. A deeper SCK queue gives
+    // macOS enough recyclable buffers when VT and idle resend briefly retain one.
+    config.queueDepth = 8;
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.showsCursor = YES;
 
     fprintf(stderr, "[sck] initialized for display ID %u (capture=%ux%u, fps=%u)\n",
             cg_display_id, width_, height_, target_fps);
 
-    stream_ = [[SCStream alloc] initWithFilter:filter
-                                 configuration:config
-                                      delegate:nil];
-
     delegate_ = [[SCKCapturerDelegate alloc] init];
     delegate_.owner = this;
+
+    stream_ = [[SCStream alloc] initWithFilter:filter
+                                 configuration:config
+                                      delegate:delegate_];
 
     NSError* addErr = nil;
     [stream_ addStreamOutput:delegate_
@@ -319,6 +354,10 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
 }
 
 bool SCKCapturer::init(uint32_t display_index) {
+    has_display_index_ = true;
+    display_index_ = display_index;
+    has_display_id_ = false;
+
     __block bool success = false;
     __block uint32_t cap_w = 0, cap_h = 0;
     __block SCDisplay* chosen_display = nil;
@@ -383,18 +422,20 @@ bool SCKCapturer::init(uint32_t display_index) {
     config.width  = cap_w;
     config.height = cap_h;
     config.minimumFrameInterval = CMTimeMake(1, 60);  // 60 fps
-    config.queueDepth = 3;
+    // The pipeline still keeps only the freshest frame. A deeper SCK queue gives
+    // macOS enough recyclable buffers when VT and idle resend briefly retain one.
+    config.queueDepth = 8;
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.showsCursor = YES;
-
-    // Create the stream.
-    stream_ = [[SCStream alloc] initWithFilter:filter
-                                 configuration:config
-                                      delegate:nil];
 
     // Create and attach the output delegate.
     delegate_ = [[SCKCapturerDelegate alloc] init];
     delegate_.owner = this;
+
+    // Create the stream.
+    stream_ = [[SCStream alloc] initWithFilter:filter
+                                 configuration:config
+                                      delegate:delegate_];
 
     NSError* addErr = nil;
     [stream_ addStreamOutput:delegate_
@@ -442,22 +483,59 @@ bool SCKCapturer::start(std::function<void(const CapturedFrame&)> on_frame) {
     return ok;
 }
 
+bool SCKCapturer::restart(std::function<void(const CapturedFrame&)> on_frame) {
+    fprintf(stderr, "[sck] restarting capture\n");
+    fflush(stderr);
+
+    stop();
+
+    bool initialized = false;
+    if (has_display_id_) {
+        initialized = init_with_display_id(display_id_,
+                                           configured_capture_width_,
+                                           configured_capture_height_,
+                                           configured_target_fps_);
+    } else if (has_display_index_) {
+        initialized = init(display_index_);
+    }
+
+    if (!initialized) {
+        fprintf(stderr, "[sck] restart failed: capture init failed\n");
+        return false;
+    }
+
+    if (!start(std::move(on_frame))) {
+        fprintf(stderr, "[sck] restart failed: startCapture failed\n");
+        return false;
+    }
+
+    return true;
+}
+
+void SCKCapturer::set_error_callback(std::function<void(const char*)> on_error) {
+    on_error_ = std::move(on_error);
+}
+
 void SCKCapturer::stop() {
-    if (!running_.exchange(false)) return;
+    bool was_running = running_.exchange(false);
+    on_frame_ = nullptr;
 
     if (stream_) {
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        if (was_running) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 
-        [stream_ stopCaptureWithCompletionHandler:^(NSError * _Nullable error) {
-            if (error) {
-                fprintf(stderr, "[sck] stopCapture error: %s\n",
-                        [[error localizedDescription] UTF8String]);
-            }
-            dispatch_semaphore_signal(sem);
-        }];
+            [stream_ stopCaptureWithCompletionHandler:^(NSError * _Nullable error) {
+                if (error) {
+                    fprintf(stderr, "[sck] stopCapture error: %s\n",
+                            [[error localizedDescription] UTF8String]);
+                }
+                dispatch_semaphore_signal(sem);
+            }];
 
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        }
 
+        delegate_.owner = nullptr;
         stream_   = nil;
         delegate_ = nil;
 

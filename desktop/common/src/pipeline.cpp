@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -42,6 +43,8 @@ static int64_t now_us() {
 }
 
 static int64_t idle_interval_us_for_fps(uint32_t fps) {
+  if (fps == 0)
+    return 33333;
   return static_cast<int64_t>(1000000.0 / fps + 0.5);
 }
 
@@ -61,6 +64,51 @@ Pipeline::Pipeline(Capturer *capturer, Encoder *encoder, TCPClient *client,
       mouse_(mouse), deck_(deck) {}
 
 Pipeline::~Pipeline() { stop(); }
+
+void Pipeline::mark_failed(const char *reason) {
+  if (!running_.exchange(false))
+    return;
+
+  fprintf(stderr, "[pipeline] %s; marking pipeline failed\n",
+          reason ? reason : "failure");
+
+  {
+    std::lock_guard<std::mutex> lock(capture_mutex_);
+    capture_cv_.notify_all();
+  }
+  {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    send_cv_.notify_all();
+  }
+}
+
+void Pipeline::handle_capturer_error(const char *reason) {
+  if (!running_.load())
+    return;
+
+  if (capturer_restarting_.exchange(true))
+    return;
+
+  const std::string message = reason ? reason : "capturer error";
+  fprintf(stderr, "[pipeline] %s; restarting capturer\n", message.c_str());
+
+  bool restarted = false;
+  {
+    std::lock_guard<std::mutex> lock(capturer_mutex_);
+    if (running_.load()) {
+      restarted = capturer_->restart(capture_callback_);
+    }
+  }
+
+  capturer_restarting_.store(false);
+
+  if (!restarted) {
+    mark_failed("capturer restart failed");
+    return;
+  }
+
+  fprintf(stderr, "[pipeline] capturer restarted\n");
+}
 
 bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
                          uint32_t bitrate_kbps, bool touch_enabled,
@@ -177,11 +225,19 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   last_encode_us_.store(0);
   last_send_us_.store(0);
   last_capture_to_send_us_.store(0);
+  last_capture_callback_us_.store(now_us());
   next_video_sequence_.store(1);
+  capturer_restarting_.store(false);
+
+  capturer_->set_error_callback([this](const char *reason) {
+    handle_capturer_error(reason ? reason : "capturer error");
+  });
 
   // Start capture -- frames get pushed into capture_queue_.
   // Newest-frame-wins: we keep at most 1 frame, always the latest.
-  capturer_->start([this](const CapturedFrame &frame) {
+  capture_callback_ = [this](const CapturedFrame &frame) {
+    last_capture_callback_us_.store(now_us());
+
     if (!running_.load()) {
       CapturedFrame releasable = frame;
       release_captured_frame(releasable);
@@ -208,7 +264,16 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
     }
     capture_queue_.push_back(frame);
     capture_cv_.notify_one();
-  });
+  };
+
+  if (!capturer_->start(capture_callback_)) {
+    fprintf(stderr, "[pipeline] capturer start failed\n");
+    running_.store(false);
+    capturer_->stop();
+    encoder_->shutdown();
+    capturer_->set_error_callback(nullptr);
+    return false;
+  }
 
   // Launch worker threads.
   encode_thread_ = std::thread(&Pipeline::encode_loop, this);
@@ -226,17 +291,22 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
 }
 
 void Pipeline::stop() {
+  const bool had_threads = encode_thread_.joinable() || send_thread_.joinable() ||
+                           recv_thread_.joinable() || ping_thread_.joinable();
   bool was_running = running_.exchange(false);
 
   // Always join threads if they are joinable, even if running_ was
   // already false (e.g., set by recv_loop on connection loss).
   // Without this, the std::thread destructors would call std::terminate.
 
-  if (was_running) {
-    fprintf(stderr, "[pipeline] stopping...\n");
+  if (was_running || had_threads) {
+    fprintf(stderr, was_running ? "[pipeline] stopping...\n"
+                                : "[pipeline] stopping after failure...\n");
 
     // Stop capture first (no more frames enqueued).
+    std::lock_guard<std::mutex> lock(capturer_mutex_);
     capturer_->stop();
+    capturer_->set_error_callback(nullptr);
   }
 
   // Wake the encode thread so it can exit.
@@ -264,7 +334,7 @@ void Pipeline::stop() {
   if (ping_thread_.joinable())
     ping_thread_.join();
 
-  if (!was_running) {
+  if (!was_running && !had_threads) {
     // Already stopped — threads joined, nothing more to do.
     return;
   }
@@ -283,6 +353,7 @@ void Pipeline::stop() {
   encoder_->shutdown();
   touch_->shutdown();
   mouse_->shutdown();
+  capture_callback_ = nullptr;
 
   fprintf(stderr,
           "[pipeline] stopped (encoded %llu frames, idle_resent %llu, "
@@ -397,6 +468,15 @@ void Pipeline::encode_loop() {
       last_frame = frame;
       // Do NOT release frame — it lives on as last_frame.
     } else {
+      if (capturer_->emits_idle_frames()) {
+        const int64_t now = now_us();
+        const int64_t last_callback = last_capture_callback_us_.load();
+        if (last_callback > 0 && now - last_callback > 5000000) {
+          mark_failed("capturer stopped delivering frames for 5s");
+          break;
+        }
+      }
+
       // ---- Idle path: re-encode the last frame to keep decoder warm ----
       if (last_frame.native_handle) {
         int64_t t_enc_start = now_us();
