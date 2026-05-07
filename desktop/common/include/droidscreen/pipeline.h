@@ -128,6 +128,8 @@ private:
     std::condition_variable capture_cv_;
     std::function<void(const CapturedFrame&)> capture_callback_;
     std::mutex capturer_mutex_;
+    std::thread capturer_restart_thread_;
+    std::mutex capturer_restart_thread_mutex_;
 
     // --- Send queue: encoded packets waiting for TCP send ---
     struct SendPacket {

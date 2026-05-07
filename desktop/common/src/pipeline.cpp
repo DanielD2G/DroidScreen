@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" {
@@ -90,24 +91,41 @@ void Pipeline::handle_capturer_error(const char *reason) {
     return;
 
   const std::string message = reason ? reason : "capturer error";
-  fprintf(stderr, "[pipeline] %s; restarting capturer\n", message.c_str());
+  fprintf(stderr, "[pipeline] %s; scheduling capturer restart\n",
+          message.c_str());
 
-  bool restarted = false;
-  {
-    std::lock_guard<std::mutex> lock(capturer_mutex_);
-    if (running_.load()) {
-      restarted = capturer_->restart(capture_callback_);
+  std::lock_guard<std::mutex> thread_lock(capturer_restart_thread_mutex_);
+  if (capturer_restart_thread_.joinable())
+    capturer_restart_thread_.join();
+
+  capturer_restart_thread_ = std::thread([this, message]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    if (!running_.load()) {
+      capturer_restarting_.store(false);
+      return;
     }
-  }
 
-  capturer_restarting_.store(false);
+    fprintf(stderr, "[pipeline] %s; restarting capturer\n", message.c_str());
 
-  if (!restarted) {
-    mark_failed("capturer restart failed");
-    return;
-  }
+    bool restarted = false;
+    {
+      std::lock_guard<std::mutex> lock(capturer_mutex_);
+      if (running_.load())
+        restarted = capturer_->restart(capture_callback_);
+    }
 
-  fprintf(stderr, "[pipeline] capturer restarted\n");
+    capturer_restarting_.store(false);
+
+    if (!restarted) {
+      if (running_.load())
+        mark_failed("capturer restart failed");
+      return;
+    }
+
+    if (running_.load())
+      fprintf(stderr, "[pipeline] capturer restarted\n");
+  });
 }
 
 bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
@@ -291,8 +309,14 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
 }
 
 void Pipeline::stop() {
+  bool had_restart_thread = false;
+  {
+    std::lock_guard<std::mutex> lock(capturer_restart_thread_mutex_);
+    had_restart_thread = capturer_restart_thread_.joinable();
+  }
   const bool had_threads = encode_thread_.joinable() || send_thread_.joinable() ||
-                           recv_thread_.joinable() || ping_thread_.joinable();
+                           recv_thread_.joinable() || ping_thread_.joinable() ||
+                           had_restart_thread;
   bool was_running = running_.exchange(false);
 
   // Always join threads if they are joinable, even if running_ was
@@ -333,6 +357,15 @@ void Pipeline::stop() {
     recv_thread_.join();
   if (ping_thread_.joinable())
     ping_thread_.join();
+
+  {
+    std::lock_guard<std::mutex> lock(capturer_restart_thread_mutex_);
+    if (capturer_restart_thread_.joinable() &&
+        capturer_restart_thread_.get_id() != std::this_thread::get_id()) {
+      capturer_restart_thread_.join();
+    }
+  }
+  capturer_restarting_.store(false);
 
   if (!was_running && !had_threads) {
     // Already stopped — threads joined, nothing more to do.
