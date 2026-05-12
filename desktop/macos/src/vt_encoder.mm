@@ -227,10 +227,12 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_ExpectedFrameRate, fr);
 
+#if defined(__MAC_15_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_15_0
     if (@available(macOS 15.0, *)) {
         VTSessionSetProperty(session_,
             kVTCompressionPropertyKey_MaximumRealTimeFrameRate, fr);
     }
+#endif
     CFRelease(fr);
 
     // Keyframe interval: every 2 seconds.
