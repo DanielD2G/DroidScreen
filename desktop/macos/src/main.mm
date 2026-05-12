@@ -11,6 +11,7 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <QuartzCore/QuartzCore.h>
 #import <CoreAudio/CoreAudio.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <IOKit/hidsystem/ev_keymap.h>
@@ -40,11 +41,175 @@ extern "C" {
 #include <thread>
 #include <memory>
 #include <unordered_map>
+#include <cmath>
 #include <signal.h>
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <execinfo.h>
+
+// =============================================================================
+#pragma mark - Validation Scene
+// =============================================================================
+
+@interface ValidationSceneView : NSView
+@end
+
+@implementation ValidationSceneView
+
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.wantsLayer = YES;
+        CALayer* root = [CALayer layer];
+        root.frame = self.bounds;
+        root.backgroundColor = NSColor.blackColor.CGColor;
+        root.needsDisplayOnBoundsChange = YES;
+        self.layer = root;
+        [self buildValidationLayers];
+    }
+    return self;
+}
+
+- (BOOL)wantsUpdateLayer {
+    return YES;
+}
+
+- (void)buildValidationLayers {
+    NSRect b = self.bounds;
+    CALayer* root = self.layer;
+    root.sublayers = @[];
+
+    CAGradientLayer* bg = [CAGradientLayer layer];
+    bg.frame = CGRectMake(0, 0, b.size.width, b.size.height);
+    bg.colors = @[
+        (id)[NSColor colorWithCalibratedRed:0.04 green:0.07 blue:0.10 alpha:1.0].CGColor,
+        (id)[NSColor colorWithCalibratedRed:0.10 green:0.18 blue:0.22 alpha:1.0].CGColor
+    ];
+    bg.startPoint = CGPointMake(0, 0);
+    bg.endPoint = CGPointMake(1, 1);
+    [root addSublayer:bg];
+
+    NSArray<NSColor*>* colors = @[
+        [NSColor colorWithCalibratedRed:0.95 green:0.22 blue:0.18 alpha:1.0],
+        [NSColor colorWithCalibratedRed:0.10 green:0.74 blue:0.55 alpha:1.0],
+        [NSColor colorWithCalibratedRed:0.20 green:0.43 blue:0.95 alpha:1.0],
+        [NSColor colorWithCalibratedRed:0.98 green:0.76 blue:0.20 alpha:1.0]
+    ];
+
+    CGFloat stripeW = MAX(44.0, b.size.width / 18.0);
+    for (int i = 0; i < 4; i++) {
+        CALayer* stripe = [CALayer layer];
+        stripe.frame = CGRectMake(-stripeW, b.size.height * (0.16 + i * 0.18),
+                                  stripeW, b.size.height * 0.14);
+        stripe.backgroundColor = colors[i % colors.count].CGColor;
+        stripe.opacity = 0.88;
+        stripe.cornerRadius = 10;
+        [root addSublayer:stripe];
+
+        CABasicAnimation* move = [CABasicAnimation animationWithKeyPath:@"position.x"];
+        move.fromValue = @(-stripeW * 2.0);
+        move.toValue = @(b.size.width + stripeW * 2.0);
+        move.duration = 0.85 + i * 0.08;
+        move.repeatCount = HUGE_VALF;
+        move.beginTime = CACurrentMediaTime() + i * 0.16;
+        move.timingFunction =
+            [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+        [stripe addAnimation:move forKey:@"sweep"];
+    }
+
+    CALayer* marker = [CALayer layer];
+    marker.frame = CGRectMake(40, b.size.height - 120, 92, 92);
+    marker.backgroundColor = NSColor.whiteColor.CGColor;
+    marker.cornerRadius = 46;
+    [root addSublayer:marker];
+
+    CABasicAnimation* markerMove = [CABasicAnimation animationWithKeyPath:@"position.x"];
+    markerMove.fromValue = @(70.0);
+    markerMove.toValue = @(b.size.width - 70.0);
+    markerMove.duration = 1.15;
+    markerMove.autoreverses = YES;
+    markerMove.repeatCount = HUGE_VALF;
+    markerMove.timingFunction =
+        [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    [marker addAnimation:markerMove forKey:@"markerMove"];
+
+    CATextLayer* text = [CATextLayer layer];
+    text.frame = CGRectMake(48, 42, b.size.width - 96, 72);
+    text.contentsScale = NSScreen.mainScreen.backingScaleFactor;
+    text.string = @"DroidScreen latency validation";
+    text.foregroundColor = NSColor.whiteColor.CGColor;
+    text.fontSize = 44;
+    text.alignmentMode = kCAAlignmentLeft;
+    [root addSublayer:text];
+}
+
+@end
+
+static int run_validation_scene_helper(uint32_t displayID) {
+    @autoreleasepool {
+        NSApplication* app = [NSApplication sharedApplication];
+        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+
+        NSScreen* targetScreen = nil;
+        for (int attempt = 0; attempt < 50 && !targetScreen; attempt++) {
+            for (NSScreen* screen in NSScreen.screens) {
+                NSNumber* screenID = screen.deviceDescription[@"NSScreenNumber"];
+                if (screenID && screenID.unsignedIntValue == displayID) {
+                    targetScreen = screen;
+                    break;
+                }
+            }
+            if (!targetScreen) {
+                usleep(100000);
+            }
+        }
+
+        if (!targetScreen) {
+            fprintf(stderr,
+                    "[validation-helper] screen %u not visible to AppKit\n",
+                    displayID);
+            fflush(stderr);
+            return 2;
+        }
+
+        NSRect frame = targetScreen.frame;
+        NSWindow* window = [[NSWindow alloc] initWithContentRect:frame
+                                                       styleMask:NSWindowStyleMaskBorderless
+                                                         backing:NSBackingStoreBuffered
+                                                           defer:NO
+                                                          screen:targetScreen];
+        window.releasedWhenClosed = NO;
+        window.backgroundColor = NSColor.blackColor;
+        window.opaque = YES;
+        window.ignoresMouseEvents = YES;
+        window.level = NSStatusWindowLevel;
+        window.collectionBehavior =
+            NSWindowCollectionBehaviorCanJoinAllSpaces |
+            NSWindowCollectionBehaviorFullScreenAuxiliary |
+            NSWindowCollectionBehaviorStationary;
+        window.contentView =
+            [[ValidationSceneView alloc] initWithFrame:NSMakeRect(0, 0,
+                                                                  frame.size.width,
+                                                                  frame.size.height)];
+        [window setFrame:frame display:YES];
+        [window.contentView displayIfNeeded];
+        [window makeKeyAndOrderFront:nil];
+        [window orderFrontRegardless];
+        [window displayIfNeeded];
+        [app activateIgnoringOtherApps:YES];
+        [CATransaction flush];
+
+        fprintf(stderr,
+                "[validation-helper] scene visible display=%u frame=%s level=%ld\n",
+                displayID, NSStringFromRect(frame).UTF8String, (long)window.level);
+        fflush(stderr);
+
+        [app run];
+        (void)window;
+        return 0;
+    }
+}
 
 // =============================================================================
 #pragma mark - Now Playing Helper
@@ -843,6 +1008,16 @@ static NSImage* CreateStatusBarIcon() {
 
     // Stats timer.
     NSTimer* _statsTimer;
+    uint64_t _lastStatsCaptured;
+    uint64_t _lastStatsEncoded;
+    uint64_t _lastStatsDropped;
+    uint64_t _lastStatsBytes;
+    CFAbsoluteTime _lastStatsTime;
+
+    // Validation-only animated window. Enabled by the validation script via
+    // DROIDSCREEN_VALIDATION_SCENE=1 and pinned to the virtual display ID.
+    NSWindow* _validationWindow;
+    NSTask* _validationTask;
 
     // GCD timer for pushing volume/media state to Android.
     dispatch_source_t _deckTimer;
@@ -1519,6 +1694,7 @@ static bool speed_test_handshake(droidscreen::TCPClient* client) {
     req.max_bitrate_kbps = 15000;
     req.touch_enabled    = 0;
     req.frame_interval_us = 16667; /* 60 fps */
+    req.reserved[0] = DS_CODEC_CAP_H264;
 
     uint8_t req_buf[DS_HANDSHAKE_REQ_SIZE];
     ds_handshake_req_serialize(req_buf, &req);
@@ -1690,6 +1866,118 @@ struct StreamSettings {
 }
 
 // -----------------------------------------------------------------------------
+#pragma mark - Validation Scene
+// -----------------------------------------------------------------------------
+
+- (BOOL)validationSceneEnabled {
+    const char* value = getenv("DROIDSCREEN_VALIDATION_SCENE");
+    return value && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+- (void)showValidationSceneOnDisplay:(CGDirectDisplayID)displayID {
+    if (![self validationSceneEnabled]) return;
+
+    if (!NSThread.isMainThread) {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [self showValidationSceneOnDisplay:displayID];
+        });
+        return;
+    }
+
+    NSScreen* targetScreen = nil;
+    for (NSScreen* screen in NSScreen.screens) {
+        NSNumber* screenID = screen.deviceDescription[@"NSScreenNumber"];
+        if (screenID && screenID.unsignedIntValue == displayID) {
+            targetScreen = screen;
+            break;
+        }
+    }
+
+    if (!targetScreen) {
+        NSLog(@"[Validation] Virtual display screen %u not visible to AppKit; skipping scene",
+              displayID);
+        fprintf(stderr, "[validation] screen %u not visible to AppKit\n", displayID);
+        fflush(stderr);
+        return;
+    }
+
+    if (_validationTask) {
+        if (_validationTask.isRunning) {
+            [_validationTask terminate];
+            [_validationTask waitUntilExit];
+        }
+        _validationTask = nil;
+    }
+
+    NSDictionary<NSString*, NSString*>* processEnv =
+        NSProcessInfo.processInfo.environment;
+    NSString* executablePath = processEnv[@"DROIDSCREEN_VALIDATION_HELPER_PATH"];
+    BOOL useExternalHelper = executablePath.length > 0;
+    if (!useExternalHelper) {
+        executablePath = NSBundle.mainBundle.executablePath;
+    }
+    if (executablePath.length == 0) {
+        fprintf(stderr, "[validation] missing executable path\n");
+        fflush(stderr);
+        return;
+    }
+
+    _validationTask = [[NSTask alloc] init];
+    _validationTask.executableURL = [NSURL fileURLWithPath:executablePath];
+    NSString* displayArg = [NSString stringWithFormat:@"%u", displayID];
+    NSString* parentArg = [NSString stringWithFormat:@"%d", getpid()];
+    _validationTask.arguments = useExternalHelper
+        ? @[displayArg, parentArg]
+        : @[@"--validation-scene-helper", displayArg];
+
+    NSMutableDictionary<NSString*, NSString*>* env =
+        [processEnv mutableCopy];
+    env[@"DROIDSCREEN_VALIDATION_HELPER"] = @"1";
+    _validationTask.environment = env;
+
+    NSError* taskError = nil;
+    if (![_validationTask launchAndReturnError:&taskError]) {
+        fprintf(stderr, "[validation] helper launch failed: %s\n",
+                taskError.localizedDescription.UTF8String ?: "unknown");
+        fflush(stderr);
+        _validationTask = nil;
+        return;
+    }
+
+    fprintf(stderr, "[validation] helper launched pid=%d display=%u external=%d\n",
+            (int)_validationTask.processIdentifier, displayID,
+            useExternalHelper ? 1 : 0);
+    fflush(stderr);
+}
+
+- (void)stopValidationScene {
+    if (!NSThread.isMainThread) {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [self stopValidationScene];
+        });
+        return;
+    }
+
+    if (_validationWindow) {
+        [_validationWindow close];
+        _validationWindow = nil;
+        NSLog(@"[Validation] Scene stopped");
+        fprintf(stderr, "[validation] scene stopped\n");
+        fflush(stderr);
+    }
+    if (_validationTask) {
+        pid_t pid = _validationTask.processIdentifier;
+        if (_validationTask.isRunning) {
+            [_validationTask terminate];
+            [_validationTask waitUntilExit];
+        }
+        _validationTask = nil;
+        fprintf(stderr, "[validation] helper stopped pid=%d\n", (int)pid);
+        fflush(stderr);
+    }
+}
+
+// -----------------------------------------------------------------------------
 #pragma mark - Menu Actions
 // -----------------------------------------------------------------------------
 
@@ -1837,6 +2125,8 @@ struct StreamSettings {
 
         // Give macOS a moment to register the new display.
         std::this_thread::sleep_for(std::chrono::seconds(2));
+        [self showValidationSceneOnDisplay:_virtualDisplay->display_id()];
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
         // 3. Create capturer.
         //    Capture at the FRAMEBUFFER resolution, capped to the device's native res.
@@ -1866,6 +2156,7 @@ struct StreamSettings {
             NSLog(@"[Stream] Capturer init failed");
             [self updateStatusText:@"Status: Capture init failed"];
             [self updateConnectMenuTitle:@"Connect"];
+            [self stopValidationScene];
             _virtualDisplay->destroy();
             _virtualDisplay.reset();
             _capturer.reset();
@@ -1888,6 +2179,7 @@ struct StreamSettings {
             NSLog(@"[Stream] TCP connect failed");
             [self updateStatusText:@"Status: Connection failed (is Android app running?)"];
             [self updateConnectMenuTitle:@"Connect"];
+            [self stopValidationScene];
             _virtualDisplay->destroy();
             _virtualDisplay.reset();
             _capturer.reset();
@@ -2034,7 +2326,9 @@ struct StreamSettings {
 
         if (!_pipeline->start(_streamWidth, _streamHeight,
                               settings.fps, settings.bitrate_kbps,
-                              settings.min_idle_fps, accessibilityGranted)) {
+                              settings.min_idle_fps, accessibilityGranted,
+                              DS_CODEC_HEVC,
+                              DS_CODEC_CAP_H264 | DS_CODEC_CAP_HEVC)) {
             NSLog(@"[Stream] Pipeline start failed");
             [self updateStatusText:@"Status: Pipeline start failed"];
             [self updateConnectMenuTitle:@"Connect"];
@@ -2045,6 +2339,7 @@ struct StreamSettings {
             _touch.reset();
             _client->close();
             _client.reset();
+            [self stopValidationScene];
             _virtualDisplay->destroy();
             _virtualDisplay.reset();
             _capturer.reset();
@@ -2122,6 +2417,7 @@ struct StreamSettings {
         if (_capturer) {
             _capturer.reset();
         }
+        [self stopValidationScene];
         if (_virtualDisplay) {
             _virtualDisplay->destroy();
             _virtualDisplay.reset();
@@ -2249,6 +2545,11 @@ struct StreamSettings {
 
 - (void)startStatsTimer {
     [self stopStatsTimer];
+    _lastStatsCaptured = 0;
+    _lastStatsEncoded = 0;
+    _lastStatsDropped = 0;
+    _lastStatsBytes = 0;
+    _lastStatsTime = CFAbsoluteTimeGetCurrent();
     _statsTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                    target:self
                                                  selector:@selector(statsTimerFired:)
@@ -2279,12 +2580,34 @@ struct StreamSettings {
         }
 
         // Log stats.
-        uint64_t enc  = pl->frames_encoded();
-        uint64_t byt  = pl->bytes_sent();
-        int64_t  rtt  = pl->last_rtt_us();
+        uint64_t cap = pl->frames_captured();
+        uint64_t enc = pl->frames_encoded();
+        uint64_t drop = pl->frames_dropped();
+        uint64_t byt = pl->bytes_sent();
+        int64_t rtt = pl->last_rtt_us();
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        double elapsed = now - _lastStatsTime;
+        double capFps = elapsed > 0 ? (cap - _lastStatsCaptured) / elapsed : 0.0;
+        double encFps = elapsed > 0 ? (enc - _lastStatsEncoded) / elapsed : 0.0;
+        double mbps = elapsed > 0 ? ((byt - _lastStatsBytes) * 8.0 / elapsed / 1000000.0) : 0.0;
 
-        NSLog(@"[Stats] encoded=%llu bytes=%llu rtt=%lld us",
-              (unsigned long long)enc, (unsigned long long)byt, (long long)rtt);
+        NSLog(@"[Stats] captured=%llu encoded=%llu dropped=%llu bytes=%llu rtt=%lld us cap_fps=%.1f enc_fps=%.1f mbps=%.1f cap_q=%zu send_q=%zu",
+              (unsigned long long)cap,
+              (unsigned long long)enc,
+              (unsigned long long)drop,
+              (unsigned long long)byt,
+              (long long)rtt,
+              capFps,
+              encFps,
+              mbps,
+              pl->capture_queue_depth(),
+              pl->send_queue_depth());
+
+        _lastStatsCaptured = cap;
+        _lastStatsEncoded = enc;
+        _lastStatsDropped = drop;
+        _lastStatsBytes = byt;
+        _lastStatsTime = now;
     } @catch (NSException* e) {
         NSLog(@"[Stats] Exception in statsTimerFired: %@", e);
     }
@@ -2348,6 +2671,11 @@ struct StreamSettings {
 
 int main(int argc, const char* argv[]) {
     @autoreleasepool {
+        if (argc >= 3 && strcmp(argv[1], "--validation-scene-helper") == 0) {
+            uint32_t displayID = (uint32_t)strtoul(argv[2], nullptr, 10);
+            return run_validation_scene_helper(displayID);
+        }
+
         // ── Single-instance guard ──────────────────────────────────────────────
         // Si hay otra instancia corriendo, terminarla antes de continuar.
         // La nueva instancia "gana" y la vieja es terminada.

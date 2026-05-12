@@ -20,11 +20,74 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace droidscreen {
 
 static const uint8_t kAnnexBStartCode[4] = {0x00, 0x00, 0x00, 0x01};
+
+struct VTEncodeContext {
+    std::function<void(const EncodedPacket&)> on_packet;
+};
+
+static bool sample_contains_keyframe_nal(CMSampleBufferRef sample_buf,
+                                         ds_codec_t codec,
+                                         bool* parsed) {
+    if (parsed) *parsed = false;
+
+    CMBlockBufferRef block_buf = CMSampleBufferGetDataBuffer(sample_buf);
+    if (!block_buf) return false;
+
+    size_t total_len = 0;
+    char* data_ptr = nullptr;
+    if (CMBlockBufferGetDataPointer(block_buf, 0, nullptr, &total_len,
+                                     &data_ptr) != noErr ||
+            !data_ptr || total_len == 0) {
+        return false;
+    }
+
+    bool saw_video_nal = false;
+    size_t offset = 0;
+    while (offset + 4 <= total_len) {
+        uint32_t nal_len =
+            (static_cast<uint32_t>((uint8_t)data_ptr[offset])     << 24) |
+            (static_cast<uint32_t>((uint8_t)data_ptr[offset + 1]) << 16) |
+            (static_cast<uint32_t>((uint8_t)data_ptr[offset + 2]) <<  8) |
+            (static_cast<uint32_t>((uint8_t)data_ptr[offset + 3]));
+        if (nal_len == 0 || offset + 4 + nal_len > total_len) {
+            break;
+        }
+
+        const uint8_t* nal = (const uint8_t*)data_ptr + offset + 4;
+        if (codec == DS_CODEC_HEVC) {
+            if (nal_len >= 2) {
+                uint8_t nal_type = (uint8_t)((nal[0] >> 1) & 0x3F);
+                if (nal_type <= 31) {
+                    saw_video_nal = true;
+                }
+                if (nal_type == 19 || nal_type == 20 || nal_type == 21) {
+                    if (parsed) *parsed = true;
+                    return true;
+                }
+            }
+        } else {
+            uint8_t nal_type = (uint8_t)(nal[0] & 0x1F);
+            if (nal_type == 1 || nal_type == 5) {
+                saw_video_nal = true;
+            }
+            if (nal_type == 5) {
+                if (parsed) *parsed = true;
+                return true;
+            }
+        }
+
+        offset += 4 + nal_len;
+    }
+
+    if (parsed) *parsed = saw_video_nal;
+    return false;
+}
 
 VTEncoder::VTEncoder() = default;
 
@@ -33,10 +96,15 @@ VTEncoder::~VTEncoder() {
 }
 
 bool VTEncoder::init(uint32_t width, uint32_t height,
-                     uint32_t fps, uint32_t bitrate_kbps) {
+                     uint32_t fps, uint32_t bitrate_kbps,
+                     ds_codec_t codec) {
     width_  = width;
     height_ = height;
     fps_    = fps;
+    codec_  = codec;
+    CMVideoCodecType vt_codec =
+        (codec_ == DS_CODEC_HEVC) ? kCMVideoCodecType_HEVC
+                                  : kCMVideoCodecType_H264;
 
     // ---- Encoder specification: force HW + low-latency mode ----
     const void* spec_keys[] = {
@@ -57,7 +125,7 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
     OSStatus status = VTCompressionSessionCreate(
         kCFAllocatorDefault,
         (int32_t)width, (int32_t)height,
-        kCMVideoCodecType_H264,
+        vt_codec,
         encoder_spec,
         nullptr,   // sourceImageBufferAttributes
         nullptr,   // compressedDataAllocator
@@ -92,14 +160,27 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
 
-    // Main profile — good compression, no B-frames implicitly.
+    // Main/Baseline profile with no B-frames. HEVC gets Main, H.264 gets
+    // Constrained Baseline to avoid decoder reordering.
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_ProfileLevel,
-        kVTProfileLevel_H264_Baseline_AutoLevel);
+        codec_ == DS_CODEC_HEVC
+            ? kVTProfileLevel_HEVC_Main_AutoLevel
+            : kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel);
+
+    if (codec_ == DS_CODEC_H264) {
+        // Baseline should already imply CAVLC, but Qualcomm decoders are less
+        // likely to add reorder/entropy overhead when the bitstream is explicit.
+        VTSessionSetProperty(session_,
+            kVTCompressionPropertyKey_H264EntropyMode,
+            kVTH264EntropyMode_CAVLC);
+    }
 
     // No B-frames — already implied by Baseline but be explicit.
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    VTSessionSetProperty(session_,
+        kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
 
     // Zero frame delay — emit output as soon as possible.
     int zero_val = 0;
@@ -145,6 +226,11 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
                                      kCFNumberSInt32Type, &fps_val);
     VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_ExpectedFrameRate, fr);
+
+    if (@available(macOS 15.0, *)) {
+        VTSessionSetProperty(session_,
+            kVTCompressionPropertyKey_MaximumRealTimeFrameRate, fr);
+    }
     CFRelease(fr);
 
     // Keyframe interval: every 2 seconds.
@@ -161,8 +247,9 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
     keyframe_pending_.store(false);
 
     fprintf(stderr, "[vt] encoder initialized: %ux%u@%u, %u kbps "
-            "(low-latency, HW, h264 baseline)\n",
-            width, height, fps, bitrate_kbps);
+            "(low-latency, HW, codec=%s)\n",
+            width, height, fps, bitrate_kbps,
+            codec_ == DS_CODEC_HEVC ? "hevc-main" : "h264-baseline");
     return true;
 }
 
@@ -173,11 +260,7 @@ bool VTEncoder::encode(void* native_frame, int64_t timestamp_us,
     CVPixelBufferRef pixel_buf = static_cast<CVPixelBufferRef>(native_frame);
     if (!pixel_buf) return false;
 
-    // Store callback for the async output.
-    {
-        std::lock_guard<std::mutex> lock(encode_mutex_);
-        current_callback_ = on_packet;
-    }
+    auto* ctx = new VTEncodeContext{std::move(on_packet)};
 
     CMTime pts = CMTimeMake(timestamp_us, 1000000);
 
@@ -197,12 +280,13 @@ bool VTEncoder::encode(void* native_frame, int64_t timestamp_us,
     // VT internally retains what it needs for the hardware encode.
     OSStatus status = VTCompressionSessionEncodeFrame(
         session_, pixel_buf, pts, kCMTimeInvalid,
-        frame_props, nullptr, nullptr);
+        frame_props, ctx, nullptr);
 
     if (frame_props) CFRelease(frame_props);
 
     if (status != noErr) {
         fprintf(stderr, "[vt] EncodeFrame failed: %d\n", (int)status);
+        delete ctx;
         return false;
     }
 
@@ -214,10 +298,13 @@ bool VTEncoder::encode(void* native_frame, int64_t timestamp_us,
 }
 
 void VTEncoder::output_callback(void* refcon,
-                                void* /*source_frame_refcon*/,
+                                void* source_frame_refcon,
                                 OSStatus status,
                                 VTEncodeInfoFlags /*info_flags*/,
                                 CMSampleBufferRef sample_buf) {
+    std::unique_ptr<VTEncodeContext> ctx(
+        static_cast<VTEncodeContext*>(source_frame_refcon));
+
     if (status != noErr || !sample_buf) {
         if (status != noErr) {
             fprintf(stderr, "[vt] output callback error: %d\n", (int)status);
@@ -227,42 +314,65 @@ void VTEncoder::output_callback(void* refcon,
 
     VTEncoder* self = static_cast<VTEncoder*>(refcon);
 
-    bool is_keyframe = false;
+    bool parsed_keyframe_nal = false;
+    bool is_keyframe =
+        sample_contains_keyframe_nal(sample_buf, self->codec_,
+                                     &parsed_keyframe_nal);
+
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(
         sample_buf, false);
-    if (attachments && CFArrayGetCount(attachments) > 0) {
+    if (!parsed_keyframe_nal && attachments && CFArrayGetCount(attachments) > 0) {
         CFDictionaryRef dict =
             (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
         CFBooleanRef not_sync = (CFBooleanRef)CFDictionaryGetValue(
             dict, kCMSampleAttachmentKey_NotSync);
-        is_keyframe = (!not_sync || !CFBooleanGetValue(not_sync));
+        if (not_sync) {
+            is_keyframe = !CFBooleanGetValue(not_sync);
+        }
     }
 
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buf);
     int64_t timestamp_us = (int64_t)(CMTimeGetSeconds(pts) * 1e6);
 
-    if (is_keyframe || !self->config_sent_) {
+    bool emit_config = is_keyframe;
+    {
+        std::lock_guard<std::mutex> lock(self->encode_mutex_);
+        if (!self->config_sent_) {
+            self->config_sent_ = true;
+            emit_config = true;
+        }
+    }
+    if (emit_config) {
         CMFormatDescriptionRef fmt =
             CMSampleBufferGetFormatDescription(sample_buf);
-        if (fmt) {
-            self->emit_config(fmt, timestamp_us);
+        if (fmt && ctx && ctx->on_packet) {
+            self->emit_config(fmt, timestamp_us, ctx->on_packet);
         }
     }
 
-    self->emit_frame(sample_buf, is_keyframe);
+    if (ctx && ctx->on_packet) {
+        self->emit_frame(sample_buf, is_keyframe, ctx->on_packet);
+    }
 }
 
 void VTEncoder::emit_config(CMFormatDescriptionRef fmt,
-                            int64_t timestamp_us) {
+                            int64_t timestamp_us,
+                            const std::function<void(const EncodedPacket&)>& on_packet) {
     std::vector<uint8_t> config_data;
 
-    // H.264: SPS (index 0) + PPS (index 1).
-    for (int i = 0; i < 2; i++) {
+    int param_count = codec_ == DS_CODEC_HEVC ? 3 : 2;
+    for (int i = 0; i < param_count; i++) {
         const uint8_t* param_ptr = nullptr;
         size_t param_len = 0;
-        if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                fmt, i, &param_ptr, &param_len, nullptr, nullptr) == noErr
-            && param_ptr && param_len > 0) {
+        OSStatus status = noErr;
+        if (codec_ == DS_CODEC_HEVC) {
+            status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                fmt, i, &param_ptr, &param_len, nullptr, nullptr);
+        } else {
+            status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                fmt, i, &param_ptr, &param_len, nullptr, nullptr);
+        }
+        if (status == noErr && param_ptr && param_len > 0) {
             config_data.insert(config_data.end(),
                                kAnnexBStartCode, kAnnexBStartCode + 4);
             config_data.insert(config_data.end(),
@@ -272,20 +382,18 @@ void VTEncoder::emit_config(CMFormatDescriptionRef fmt,
 
     if (config_data.empty()) return;
 
-    std::lock_guard<std::mutex> lock(encode_mutex_);
-    if (current_callback_) {
-        EncodedPacket pkt;
-        pkt.data         = config_data.data();
-        pkt.size         = config_data.size();
-        pkt.is_keyframe  = false;
-        pkt.is_config    = true;
-        pkt.timestamp_us = timestamp_us;
-        current_callback_(pkt);
-    }
-    config_sent_ = true;
+    EncodedPacket pkt;
+    pkt.data         = config_data.data();
+    pkt.size         = config_data.size();
+    pkt.is_keyframe  = false;
+    pkt.is_config    = true;
+    pkt.timestamp_us = timestamp_us;
+    on_packet(pkt);
 }
 
-void VTEncoder::emit_frame(CMSampleBufferRef sample_buf, bool is_keyframe) {
+void VTEncoder::emit_frame(
+    CMSampleBufferRef sample_buf, bool is_keyframe,
+    const std::function<void(const EncodedPacket&)>& on_packet) {
     CMBlockBufferRef block_buf = CMSampleBufferGetDataBuffer(sample_buf);
     if (!block_buf) return;
 
@@ -302,6 +410,7 @@ void VTEncoder::emit_frame(CMSampleBufferRef sample_buf, bool is_keyframe) {
 
     // AVCC → Annex B: replace 4-byte length prefixes with start codes.
     // Pre-allocated buffer avoids per-frame heap allocation.
+    std::lock_guard<std::mutex> lock(encode_mutex_);
     annex_b_buf_.resize(total_len);
     memcpy(annex_b_buf_.data(), data_ptr, total_len);
 
@@ -321,16 +430,13 @@ void VTEncoder::emit_frame(CMSampleBufferRef sample_buf, bool is_keyframe) {
         offset += 4 + nal_len;
     }
 
-    std::lock_guard<std::mutex> lock(encode_mutex_);
-    if (current_callback_) {
-        EncodedPacket pkt;
-        pkt.data         = annex_b_buf_.data();
-        pkt.size         = annex_b_buf_.size();
-        pkt.is_keyframe  = is_keyframe;
-        pkt.is_config    = false;
-        pkt.timestamp_us = timestamp_us;
-        current_callback_(pkt);
-    }
+    EncodedPacket pkt;
+    pkt.data         = annex_b_buf_.data();
+    pkt.size         = annex_b_buf_.size();
+    pkt.is_keyframe  = is_keyframe;
+    pkt.is_config    = false;
+    pkt.timestamp_us = timestamp_us;
+    on_packet(pkt);
 }
 
 bool VTEncoder::set_bitrate(uint32_t bitrate_kbps) {

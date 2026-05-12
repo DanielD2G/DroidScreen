@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -48,7 +49,9 @@ public:
     bool start(uint32_t width, uint32_t height,
                uint32_t fps, uint32_t bitrate_kbps,
                uint32_t min_idle_fps,
-               bool touch_enabled);
+               bool touch_enabled,
+               ds_codec_t preferred_codec = DS_CODEC_H264,
+               uint8_t codec_caps = DS_CODEC_CAP_H264);
 
     /// Stop all threads and clean up.
     void stop();
@@ -76,6 +79,7 @@ public:
     int64_t last_rtt_us() const { return last_rtt_us_.load(); }
     int64_t last_encode_us() const { return last_encode_us_.load(); }
     int64_t last_send_us() const { return last_send_us_.load(); }
+    int64_t last_capture_to_send_us() const { return last_capture_to_send_us_.load(); }
     size_t capture_queue_depth() const;
     size_t send_queue_depth() const;
 
@@ -83,7 +87,9 @@ private:
     // Perform the protocol handshake with the Android device.
     bool handshake(uint32_t width, uint32_t height,
                    uint32_t fps, uint32_t bitrate_kbps,
-                   bool touch_enabled);
+                   bool touch_enabled,
+                   ds_codec_t preferred_codec,
+                   uint8_t codec_caps);
 
     // Thread: pop frames from capture_queue and submit to encoder.
     // VT callback pushes results to send_queue (never blocks on TCP).
@@ -101,6 +107,13 @@ private:
     // Handle an incoming control message.
     void handle_control(const uint8_t* data, size_t len);
 
+    // Try to recover a failed capturer stream without dropping the transport.
+    void handle_capturer_error(const char* reason);
+
+    // Mark the pipeline failed from a worker/capture callback. The owner will
+    // call stop(), close the socket, and reconnect.
+    void mark_failed(const char* reason);
+
     Capturer*      capturer_;
     Encoder*       encoder_;
     TCPClient*     client_;
@@ -113,13 +126,23 @@ private:
     std::deque<CapturedFrame> capture_queue_;
     std::mutex capture_mutex_;
     std::condition_variable capture_cv_;
+    std::function<void(const CapturedFrame&)> capture_callback_;
+    std::mutex capturer_mutex_;
+    std::thread capturer_restart_thread_;
+    std::mutex capturer_restart_thread_mutex_;
 
     // --- Send queue: encoded packets waiting for TCP send ---
     struct SendPacket {
         std::vector<uint8_t> data;
         uint8_t flags;
+        int64_t capture_ts_us;
+        int64_t capture_to_encode_us;
         int64_t encode_done_us;   // timestamp when VT callback fired
+        uint64_t sequence;
+        bool is_idle;
+        float motion_score;
     };
+
     static constexpr size_t kMaxSendQueueSize = 4;
     std::deque<SendPacket> send_queue_;
     std::mutex send_mutex_;
@@ -136,6 +159,7 @@ private:
     std::thread ping_thread_;
 
     std::atomic<bool> running_{false};
+    std::atomic<bool> capturer_restarting_{false};
     std::atomic<uint64_t> frames_encoded_{0};
     std::atomic<uint64_t> frames_captured_{0};
     std::atomic<uint64_t> frames_dropped_{0};
@@ -145,6 +169,20 @@ private:
     std::atomic<int64_t>  last_rtt_us_{0};
     std::atomic<int64_t>  last_encode_us_{0};
     std::atomic<int64_t>  last_send_us_{0};
+    std::atomic<int64_t>  last_capture_to_send_us_{0};
+    std::atomic<int64_t>  last_capture_callback_us_{0};
+    std::atomic<uint64_t> next_video_sequence_{1};
+    ds_codec_t accepted_codec_ = DS_CODEC_H264;
+    uint32_t target_fps_ = 60;
+    uint32_t target_bitrate_kbps_ = 0;
+
+    int64_t quality_window_start_us_ = 0;
+    uint64_t quality_window_bytes_ = 0;
+    uint64_t quality_window_delta_bytes_ = 0;
+    uint64_t quality_window_key_bytes_ = 0;
+    uint64_t quality_window_frames_ = 0;
+    uint64_t quality_window_keyframes_ = 0;
+    double quality_window_motion_sum_ = 0.0;
 
     // Maximum interval between frames during idle periods (microseconds).
     // When no new capture arrives within this interval, the last frame is

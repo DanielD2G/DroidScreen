@@ -11,6 +11,7 @@
 #include "droidscreen/capturer.h"
 
 #include <atomic>
+#include <functional>
 
 #ifdef __OBJC__
 @class SCKCapturerDelegate;
@@ -41,6 +42,12 @@ public:
                               uint32_t capture_height = 0,
                               uint32_t target_fps = 60);
     bool start(std::function<void(const CapturedFrame&)> on_frame) override;
+    bool restart(std::function<void(const CapturedFrame&)> on_frame) override;
+    void set_error_callback(std::function<void(const char*)> on_error) override;
+    // ScreenCaptureKit may stop delivering callbacks while the display is
+    // static. Stream failures are reported through the SCStreamDelegate error
+    // callback instead of inferred from callback silence.
+    bool emits_idle_frames() const override { return false; }
     void stop() override;
 
     uint32_t width() const override { return width_; }
@@ -48,6 +55,7 @@ public:
 
     // Called by the Obj-C delegate to deliver frames.
     void deliver_frame(const CapturedFrame& frame);
+    void handle_stream_error(const char* message);
 
 private:
     uint32_t width_  = 0;
@@ -55,10 +63,20 @@ private:
     std::atomic<bool> running_{false};
 
     std::function<void(const CapturedFrame&)> on_frame_;
+    std::function<void(const char*)> on_error_;
 
     // Objective-C objects (bridged via void* or __bridge).
     SCStream* stream_                  = nullptr;
     SCKCapturerDelegate* delegate_     = nullptr;
+
+    bool has_display_index_ = false;
+    uint32_t display_index_ = 0;
+
+    bool has_display_id_ = false;
+    uint32_t display_id_ = 0;
+    uint32_t configured_capture_width_ = 0;
+    uint32_t configured_capture_height_ = 0;
+    uint32_t configured_target_fps_ = 60;
 };
 
 } // namespace droidscreen

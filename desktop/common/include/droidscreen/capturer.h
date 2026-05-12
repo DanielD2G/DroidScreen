@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <utility>
 
 namespace droidscreen {
 
@@ -22,6 +23,7 @@ struct CapturedFrame {
     uint32_t height;
     int64_t timestamp_us;
     bool is_idle;          // true if the frame content hasn't changed
+    float motion_score = 0.0f;  // average luma delta vs previous frame (0..255)
 };
 
 class Capturer {
@@ -35,6 +37,22 @@ public:
 
     /// Start capturing frames. Calls on_frame from the capture thread.
     virtual bool start(std::function<void(const CapturedFrame&)> on_frame) = 0;
+
+    /// Restart capture after a platform stream error without tearing down the
+    /// transport. Implementations that need to rebuild native stream objects can
+    /// override this; the default handles capturers whose start() is reusable.
+    virtual bool restart(std::function<void(const CapturedFrame&)> on_frame) {
+        stop();
+        return start(std::move(on_frame));
+    }
+
+    /// Called when the platform capture API reports a fatal stream error.
+    virtual void set_error_callback(std::function<void(const char*)> on_error) {
+        (void)on_error;
+    }
+
+    /// True when the capturer emits callbacks even while content is static.
+    virtual bool emits_idle_frames() const { return false; }
 
     /// Stop capturing and release resources.
     virtual void stop() = 0;

@@ -13,6 +13,10 @@ add_executable(droidscreen_desktop MACOSX_BUNDLE
     src/mouse_injector_mac.mm
 )
 
+add_executable(droidscreen_validation_scene_helper
+    src/validation_scene_helper.mm
+)
+
 add_library(droidscreen_mediaremote_mini SHARED
     src/mediaremote_helper.m
 )
@@ -61,6 +65,12 @@ target_link_libraries(droidscreen_mediaremote_mini PRIVATE
     "-framework AppKit"
 )
 
+target_link_libraries(droidscreen_validation_scene_helper PRIVATE
+    "-framework AppKit"
+    "-framework QuartzCore"
+    "-framework Foundation"
+)
+
 target_compile_features(droidscreen_desktop PRIVATE cxx_std_17)
 
 # macOS frameworks.
@@ -71,6 +81,7 @@ target_link_libraries(droidscreen_desktop PRIVATE
     "-framework CoreMedia"
     "-framework CoreVideo"
     "-framework CoreGraphics"
+    "-framework QuartzCore"
     "-framework Foundation"
     "-framework CoreAudio"
     "-framework AudioToolbox"
@@ -86,6 +97,7 @@ set_source_files_properties(
     src/virtual_display.mm
     src/touch_injector_mac.mm
     src/mouse_injector_mac.mm
+    src/validation_scene_helper.mm
     PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
 )

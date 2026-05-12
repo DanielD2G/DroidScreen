@@ -12,6 +12,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <vector>
 
 #ifdef __OBJC__
 #import <VideoToolbox/VideoToolbox.h>
@@ -27,7 +28,8 @@ public:
     ~VTEncoder() override;
 
     bool init(uint32_t width, uint32_t height,
-              uint32_t fps, uint32_t bitrate_kbps) override;
+              uint32_t fps, uint32_t bitrate_kbps,
+              ds_codec_t codec = DS_CODEC_H264) override;
     bool encode(void* native_frame, int64_t timestamp_us,
                 std::function<void(const EncodedPacket&)> on_packet) override;
     bool set_bitrate(uint32_t bitrate_kbps) override;
@@ -39,21 +41,21 @@ private:
     uint32_t width_  = 0;
     uint32_t height_ = 0;
     uint32_t fps_    = 0;
+    ds_codec_t codec_ = DS_CODEC_H264;
 
     std::atomic<bool> keyframe_pending_{false};
     bool config_sent_ = false;
 
-    // Mutex to protect the on_packet callback during encoding.
+    // Mutex to protect one-time config emission and Annex B scratch storage.
     std::mutex encode_mutex_;
 
-    // The active on_packet callback (set per-encode call).
-    std::function<void(const EncodedPacket&)> current_callback_;
-
     /// Extract SPS/PPS from the format description and emit as config packet.
-    void emit_config(CMFormatDescriptionRef fmt, int64_t timestamp_us);
+    void emit_config(CMFormatDescriptionRef fmt, int64_t timestamp_us,
+                     const std::function<void(const EncodedPacket&)>& on_packet);
 
     /// Convert AVCC-formatted sample buffer to Annex B and emit.
-    void emit_frame(CMSampleBufferRef sample_buf, bool is_keyframe);
+    void emit_frame(CMSampleBufferRef sample_buf, bool is_keyframe,
+                    const std::function<void(const EncodedPacket&)>& on_packet);
 
     /// Static VTCompressionSession output callback.
     static void output_callback(void* refcon,

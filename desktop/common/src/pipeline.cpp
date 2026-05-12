@@ -20,10 +20,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <thread>
 #include <vector>
 
 extern "C" {
 #include "droidscreen/deck.h"
+#include "droidscreen/frame.h"
 #include "droidscreen/handshake.h"
 #include "droidscreen/mouse.h"
 #include "droidscreen/pen.h"
@@ -41,6 +44,8 @@ static int64_t now_us() {
 }
 
 static int64_t idle_interval_us_for_fps(uint32_t fps) {
+  if (fps == 0)
+    return 33333;
   return static_cast<int64_t>(1000000.0 / fps + 0.5);
 }
 
@@ -61,19 +66,84 @@ Pipeline::Pipeline(Capturer *capturer, Encoder *encoder, TCPClient *client,
 
 Pipeline::~Pipeline() { stop(); }
 
+void Pipeline::mark_failed(const char *reason) {
+  if (!running_.exchange(false))
+    return;
+
+  fprintf(stderr, "[pipeline] %s; marking pipeline failed\n",
+          reason ? reason : "failure");
+
+  {
+    std::lock_guard<std::mutex> lock(capture_mutex_);
+    capture_cv_.notify_all();
+  }
+  {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    send_cv_.notify_all();
+  }
+}
+
+void Pipeline::handle_capturer_error(const char *reason) {
+  if (!running_.load())
+    return;
+
+  if (capturer_restarting_.exchange(true))
+    return;
+
+  const std::string message = reason ? reason : "capturer error";
+  fprintf(stderr, "[pipeline] %s; scheduling capturer restart\n",
+          message.c_str());
+
+  std::lock_guard<std::mutex> thread_lock(capturer_restart_thread_mutex_);
+  if (capturer_restart_thread_.joinable())
+    capturer_restart_thread_.join();
+
+  capturer_restart_thread_ = std::thread([this, message]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    if (!running_.load()) {
+      capturer_restarting_.store(false);
+      return;
+    }
+
+    fprintf(stderr, "[pipeline] %s; restarting capturer\n", message.c_str());
+
+    bool restarted = false;
+    {
+      std::lock_guard<std::mutex> lock(capturer_mutex_);
+      if (running_.load())
+        restarted = capturer_->restart(capture_callback_);
+    }
+
+    capturer_restarting_.store(false);
+
+    if (!restarted) {
+      if (running_.load())
+        mark_failed("capturer restart failed");
+      return;
+    }
+
+    if (running_.load())
+      fprintf(stderr, "[pipeline] capturer restarted\n");
+  });
+}
+
 bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
-                         uint32_t bitrate_kbps, bool touch_enabled) {
+                         uint32_t bitrate_kbps, bool touch_enabled,
+                         ds_codec_t preferred_codec, uint8_t codec_caps) {
   // Desktop sends HANDSHAKE_REQ to Android.
   ds_handshake_req_t req{};
   req.protocol_version = DS_PROTOCOL_VERSION;
   req.width = static_cast<uint16_t>(width);
   req.height = static_cast<uint16_t>(height);
   req.fps = static_cast<uint8_t>(fps);
-  req.codec = DS_CODEC_H264;
+  req.codec = static_cast<uint8_t>(preferred_codec);
   req.max_bitrate_kbps = bitrate_kbps;
   req.touch_enabled = touch_enabled ? 1 : 0;
   req.frame_interval_us =
       (fps > 0) ? static_cast<uint32_t>(1000000.0 / fps + 0.5) : 16667;
+  req.reserved[0] = codec_caps ? codec_caps
+                               : static_cast<uint8_t>(DS_CODEC_CAP_H264);
 
   uint8_t req_buf[DS_HANDSHAKE_REQ_SIZE];
   ds_handshake_req_serialize(req_buf, &req);
@@ -84,8 +154,9 @@ bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
     return false;
   }
 
-  fprintf(stderr, "[pipeline] handshake sent: %ux%u@%u fps, %u kbps (fixed)\n",
-          width, height, fps, bitrate_kbps);
+  fprintf(stderr,
+          "[pipeline] handshake sent: %ux%u@%u fps, %u kbps, preferred codec=%u caps=0x%02x\n",
+          width, height, fps, bitrate_kbps, req.codec, req.reserved[0]);
 
   // Wait for Android's HANDSHAKE_RESP.
   ds_header_t hdr;
@@ -125,27 +196,41 @@ bool Pipeline::handshake(uint32_t width, uint32_t height, uint32_t fps,
           resp.accepted_width, resp.accepted_height, resp.accepted_fps,
           resp.accepted_codec, resp.decoder_max_bitrate, resp.touch_supported);
 
+  accepted_codec_ = static_cast<ds_codec_t>(resp.accepted_codec);
+
   return true;
 }
 
 bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
                      uint32_t bitrate_kbps, uint32_t min_idle_fps,
-                     bool touch_enabled) {
+                     bool touch_enabled, ds_codec_t preferred_codec,
+                     uint8_t codec_caps) {
   if (running_.load()) {
     fprintf(stderr, "[pipeline] already running\n");
     return false;
   }
 
   // Perform protocol handshake.
-  if (!handshake(width, height, fps, bitrate_kbps, touch_enabled)) {
+  if (!handshake(width, height, fps, bitrate_kbps, touch_enabled,
+                 preferred_codec, codec_caps)) {
     return false;
   }
 
   // Initialize encoder with fixed bitrate (no ramping on USB).
-  if (!encoder_->init(width, height, fps, bitrate_kbps)) {
+  if (!encoder_->init(width, height, fps, bitrate_kbps, accepted_codec_)) {
     fprintf(stderr, "[pipeline] encoder init failed\n");
     return false;
   }
+
+  target_fps_ = fps;
+  target_bitrate_kbps_ = bitrate_kbps;
+  quality_window_start_us_ = 0;
+  quality_window_bytes_ = 0;
+  quality_window_delta_bytes_ = 0;
+  quality_window_key_bytes_ = 0;
+  quality_window_frames_ = 0;
+  quality_window_keyframes_ = 0;
+  quality_window_motion_sum_ = 0.0;
 
   max_idle_interval_us_ = idle_interval_us_for_fps(min_idle_fps);
   running_.store(true);
@@ -157,10 +242,20 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   bytes_sent_.store(0);
   last_encode_us_.store(0);
   last_send_us_.store(0);
+  last_capture_to_send_us_.store(0);
+  last_capture_callback_us_.store(now_us());
+  next_video_sequence_.store(1);
+  capturer_restarting_.store(false);
+
+  capturer_->set_error_callback([this](const char *reason) {
+    handle_capturer_error(reason ? reason : "capturer error");
+  });
 
   // Start capture -- frames get pushed into capture_queue_.
   // Newest-frame-wins: we keep at most 1 frame, always the latest.
-  capturer_->start([this](const CapturedFrame &frame) {
+  capture_callback_ = [this](const CapturedFrame &frame) {
+    last_capture_callback_us_.store(now_us());
+
     if (!running_.load()) {
       CapturedFrame releasable = frame;
       release_captured_frame(releasable);
@@ -187,7 +282,16 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
     }
     capture_queue_.push_back(frame);
     capture_cv_.notify_one();
-  });
+  };
+
+  if (!capturer_->start(capture_callback_)) {
+    fprintf(stderr, "[pipeline] capturer start failed\n");
+    running_.store(false);
+    capturer_->stop();
+    encoder_->shutdown();
+    capturer_->set_error_callback(nullptr);
+    return false;
+  }
 
   // Launch worker threads.
   encode_thread_ = std::thread(&Pipeline::encode_loop, this);
@@ -205,17 +309,28 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
 }
 
 void Pipeline::stop() {
+  bool had_restart_thread = false;
+  {
+    std::lock_guard<std::mutex> lock(capturer_restart_thread_mutex_);
+    had_restart_thread = capturer_restart_thread_.joinable();
+  }
+  const bool had_threads = encode_thread_.joinable() || send_thread_.joinable() ||
+                           recv_thread_.joinable() || ping_thread_.joinable() ||
+                           had_restart_thread;
   bool was_running = running_.exchange(false);
 
   // Always join threads if they are joinable, even if running_ was
   // already false (e.g., set by recv_loop on connection loss).
   // Without this, the std::thread destructors would call std::terminate.
 
-  if (was_running) {
-    fprintf(stderr, "[pipeline] stopping...\n");
+  if (was_running || had_threads) {
+    fprintf(stderr, was_running ? "[pipeline] stopping...\n"
+                                : "[pipeline] stopping after failure...\n");
 
     // Stop capture first (no more frames enqueued).
+    std::lock_guard<std::mutex> lock(capturer_mutex_);
     capturer_->stop();
+    capturer_->set_error_callback(nullptr);
   }
 
   // Wake the encode thread so it can exit.
@@ -243,7 +358,16 @@ void Pipeline::stop() {
   if (ping_thread_.joinable())
     ping_thread_.join();
 
-  if (!was_running) {
+  {
+    std::lock_guard<std::mutex> lock(capturer_restart_thread_mutex_);
+    if (capturer_restart_thread_.joinable() &&
+        capturer_restart_thread_.get_id() != std::this_thread::get_id()) {
+      capturer_restart_thread_.join();
+    }
+  }
+  capturer_restarting_.store(false);
+
+  if (!was_running && !had_threads) {
     // Already stopped — threads joined, nothing more to do.
     return;
   }
@@ -262,6 +386,7 @@ void Pipeline::stop() {
   encoder_->shutdown();
   touch_->shutdown();
   mouse_->shutdown();
+  capture_callback_ = nullptr;
 
   fprintf(stderr,
           "[pipeline] stopped (encoded %llu frames, idle_resent %llu, "
@@ -291,7 +416,8 @@ void Pipeline::encode_loop() {
   last_frame.native_handle = nullptr;
   last_frame.release_fn = nullptr;
 
-  auto on_packet = [this](const EncodedPacket &pkt, int64_t t_enc_start) {
+  auto on_packet = [this](const EncodedPacket &pkt, int64_t t_enc_start,
+                          bool is_idle, float motion_score) {
     int64_t t_enc_end = now_us();
     last_encode_us_.store(t_enc_end - t_enc_start);
 
@@ -304,7 +430,12 @@ void Pipeline::encode_loop() {
     SendPacket sp;
     sp.data.assign(pkt.data, pkt.data + pkt.size);
     sp.flags = flags;
+    sp.capture_ts_us = pkt.timestamp_us;
+    sp.capture_to_encode_us = t_enc_end - pkt.timestamp_us;
     sp.encode_done_us = t_enc_end;
+    sp.sequence = next_video_sequence_.fetch_add(1);
+    sp.is_idle = is_idle;
+    sp.motion_score = pkt.is_config ? 0.0f : motion_score;
 
     {
       std::unique_lock<std::mutex> lock(send_mutex_);
@@ -356,8 +487,9 @@ void Pipeline::encode_loop() {
       int64_t t_enc_start = now_us();
       bool ok = encoder_->encode(
           frame.native_handle, frame.timestamp_us,
-          [&on_packet, t_enc_start](const EncodedPacket &pkt) {
-            on_packet(pkt, t_enc_start);
+          [&on_packet, t_enc_start, motion_score = frame.motion_score](
+              const EncodedPacket &pkt) {
+            on_packet(pkt, t_enc_start, false, motion_score);
           });
       if (!ok) {
         fprintf(stderr, "[encode] encode submit failed\n");
@@ -369,13 +501,22 @@ void Pipeline::encode_loop() {
       last_frame = frame;
       // Do NOT release frame — it lives on as last_frame.
     } else {
+      if (capturer_->emits_idle_frames()) {
+        const int64_t now = now_us();
+        const int64_t last_callback = last_capture_callback_us_.load();
+        if (last_callback > 0 && now - last_callback > 5000000) {
+          mark_failed("capturer stopped delivering frames for 5s");
+          break;
+        }
+      }
+
       // ---- Idle path: re-encode the last frame to keep decoder warm ----
       if (last_frame.native_handle) {
         int64_t t_enc_start = now_us();
         bool ok = encoder_->encode(
             last_frame.native_handle, t_enc_start,
             [&on_packet, t_enc_start](const EncodedPacket &pkt) {
-              on_packet(pkt, t_enc_start);
+              on_packet(pkt, t_enc_start, true, 0.0f);
             });
         if (!ok) {
           fprintf(stderr, "[encode] idle re-encode failed\n");
@@ -419,14 +560,91 @@ void Pipeline::send_loop() {
     }
 
     int64_t t_send_start = now_us();
+    const int64_t encode_to_send_us = t_send_start - pkt.encode_done_us;
+    const int64_t capture_to_send_us = t_send_start - pkt.capture_ts_us;
+    last_capture_to_send_us_.store(capture_to_send_us);
+
+    ds_video_telemetry_t telemetry{};
+    telemetry.sequence = pkt.sequence;
+    telemetry.capture_to_encode_us = pkt.capture_to_encode_us;
+    telemetry.encode_to_send_us = encode_to_send_us;
+    telemetry.capture_to_send_us = capture_to_send_us;
+    telemetry.rtt_us = last_rtt_us_.load();
+    telemetry.flags = pkt.is_idle ? DS_VIDEO_TELEMETRY_FLAG_IDLE : 0;
+
+    std::vector<uint8_t> wire_payload;
+    wire_payload.resize(DS_VIDEO_TELEMETRY_SIZE + pkt.data.size());
+    ds_frame_write_telemetry(wire_payload.data(), wire_payload.size(), &telemetry);
+    memcpy(wire_payload.data() + DS_VIDEO_TELEMETRY_SIZE,
+           pkt.data.data(), pkt.data.size());
 
     {
       std::lock_guard<std::mutex> wlock(write_mutex_);
-      if (client_->send_message(DS_MSG_VIDEO_FRAME, pkt.flags, pkt.data.data(),
-                                pkt.data.size())) {
+      if (client_->send_message(DS_MSG_VIDEO_FRAME, pkt.flags,
+                                wire_payload.data(), wire_payload.size())) {
         int64_t t_send_end = now_us();
         last_send_us_.store(t_send_end - t_send_start);
-        bytes_sent_.fetch_add(DS_HEADER_SIZE + pkt.data.size());
+        bytes_sent_.fetch_add(DS_HEADER_SIZE + wire_payload.size());
+
+        if (!pkt.is_idle && (pkt.flags & DS_FLAG_CONFIG) == 0) {
+          if (quality_window_start_us_ == 0) {
+            quality_window_start_us_ = t_send_end;
+          }
+          quality_window_bytes_ += pkt.data.size();
+          quality_window_frames_++;
+          quality_window_motion_sum_ += pkt.motion_score;
+          if ((pkt.flags & DS_FLAG_KEYFRAME) != 0) {
+            quality_window_keyframes_++;
+            quality_window_key_bytes_ += pkt.data.size();
+          } else {
+            quality_window_delta_bytes_ += pkt.data.size();
+          }
+
+          int64_t elapsed_us = t_send_end - quality_window_start_us_;
+          if (elapsed_us >= 1000000 && quality_window_frames_ > 0) {
+            double elapsed_s = (double)elapsed_us / 1000000.0;
+            double fps = (double)quality_window_frames_ / elapsed_s;
+            double kbps = ((double)quality_window_bytes_ * 8.0 / 1000.0) / elapsed_s;
+            double frame_kbits =
+                ((double)quality_window_bytes_ * 8.0 / 1000.0) /
+                (double)quality_window_frames_;
+            uint64_t delta_frames =
+                quality_window_frames_ > quality_window_keyframes_
+                    ? quality_window_frames_ - quality_window_keyframes_
+                    : 0;
+            double delta_kbits = delta_frames
+                ? ((double)quality_window_delta_bytes_ * 8.0 / 1000.0) /
+                      (double)delta_frames
+                : 0.0;
+            double key_kbits = quality_window_keyframes_
+                ? ((double)quality_window_key_bytes_ * 8.0 / 1000.0) /
+                      (double)quality_window_keyframes_
+                : 0.0;
+            double motion_luma =
+                quality_window_motion_sum_ / (double)quality_window_frames_;
+            double bits_per_motion =
+                motion_luma > 0.25
+                    ? (frame_kbits * 1000.0) / motion_luma
+                    : 0.0;
+            double budget_kbits = target_fps_ > 0
+                ? (double)target_bitrate_kbps_ / (double)target_fps_
+                : 0.0;
+            fprintf(stderr,
+                    "[quality] fps=%.1f kbps=%.0f frame=%.1fkb "
+                    "delta=%.1fkb key=%.1fkb motion=%.2f bits_per_motion=%.0f "
+                    "budget=%.1fkb\n",
+                    fps, kbps, frame_kbits, delta_kbits, key_kbits,
+                    motion_luma, bits_per_motion, budget_kbits);
+
+            quality_window_start_us_ = t_send_end;
+            quality_window_bytes_ = 0;
+            quality_window_delta_bytes_ = 0;
+            quality_window_key_bytes_ = 0;
+            quality_window_frames_ = 0;
+            quality_window_keyframes_ = 0;
+            quality_window_motion_sum_ = 0.0;
+          }
+        }
       } else {
         fprintf(stderr, "[send] TCP send failed\n");
         running_.store(false);
