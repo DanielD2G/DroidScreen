@@ -347,9 +347,12 @@ static NSDictionary* fetchNowPlayingSnapshot(BOOL* didTimeoutOut = nil) {
                 maxfd = MAX(maxfd, stderrPipe[0]);
             }
 
+            // With both pipes closed we're only waiting for the child to exit:
+            // poll briefly instead of sleeping until the deadline.
+            NSTimeInterval waitSeconds = maxfd < 0 ? MIN(remaining, 0.01) : remaining;
             struct timeval tv;
-            tv.tv_sec = (int)remaining;
-            tv.tv_usec = (int)((remaining - tv.tv_sec) * 1000000.0);
+            tv.tv_sec = (int)waitSeconds;
+            tv.tv_usec = (int)((waitSeconds - tv.tv_sec) * 1000000.0);
             int selectResult = select(maxfd + 1, &readfds, nullptr, nullptr, &tv);
             if (selectResult > 0) {
                 char buffer[4096];
@@ -1084,6 +1087,9 @@ static BOOL adb_droidscreen_running() {
     NSString* _lastMediaArtworkTrackKey;
     BOOL _forceArtworkPush;
     NSDictionary* _lastNowPlayingSnapshot;
+    NSString* _lastObservedTrackKey;
+    // Bumped on every tablet media action; in-flight snapshots older than it are dropped.
+    std::atomic<uint64_t> _mediaActionGen;
     NSDate* _lastNowPlayingSnapshotAt;
 }
 
@@ -2393,8 +2399,15 @@ struct StreamSettings {
     if (!pl || !pl->is_running()) return;
 
     @try {
+        // A snapshot that started before a tablet media action reflects the old
+        // state (e.g. still playing) and would undo the tablet's toggle.
+        const uint64_t actionGen = _mediaActionGen.load();
         BOOL helperTimedOut = NO;
         NSDictionary* snapshot = fetchNowPlayingSnapshot(&helperTimedOut);
+        if (_mediaActionGen.load() != actionGen) {
+            fprintf(stderr, "[deck] Dropping media snapshot taken before a media action\n");
+            return;
+        }
         NSString* title = snapshot[@"title"];
         if (title.length > 0) {
             _lastNowPlayingSnapshot = [snapshot copy];
@@ -2417,6 +2430,15 @@ struct StreamSettings {
         }
 
         NSString* trackKey = mediaTrackKeyForSnapshot(snapshot);
+        // The tablet drops its artwork whenever the track changes, so forget what
+        // was delivered on every change (A -> artless B -> A must resend A's art).
+        // An empty snapshot (nothing playing) also clears the tablet's art, so
+        // it counts as a change too.
+        NSString* observedKey = trackKey.length > 0 ? trackKey : @"";
+        if (!_lastObservedTrackKey || ![_lastObservedTrackKey isEqualToString:observedKey]) {
+            _lastObservedTrackKey = [observedKey copy];
+            _lastMediaArtworkTrackKey = nil;
+        }
         bool includeArtwork = _forceArtworkPush;
         if (!includeArtwork && trackKey.length > 0 &&
             ![_lastMediaArtworkTrackKey isEqualToString:trackKey]) {
@@ -2424,7 +2446,11 @@ struct StreamSettings {
         }
 
         std::string json = buildMediaStateJSON(snapshot, includeArtwork);
-        if (includeArtwork && trackKey.length > 0) {
+        // Only treat the track's artwork as delivered once it actually went out.
+        // MediaRemote often reports a new track before its artwork; marking it
+        // sent then suppressed the artwork until the next forced push.
+        if (includeArtwork && trackKey.length > 0 &&
+            json.find("\"album_art_b64\":") != std::string::npos) {
             _lastMediaArtworkTrackKey = [trackKey copy];
             _forceArtworkPush = NO;
         }
@@ -2444,6 +2470,7 @@ struct StreamSettings {
 
 - (void)scheduleDeckMediaRefreshBurst {
     if (!_deckStateQueue) return;
+    _mediaActionGen.fetch_add(1);
     _forceArtworkPush = YES;
     dispatch_async(_deckStateQueue, ^{
         [self pushDeckMediaState];
