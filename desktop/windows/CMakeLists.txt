@@ -58,7 +58,9 @@ target_link_libraries(droidscreen_desktop
         ole32
 )
 
-target_compile_features(droidscreen_desktop PRIVATE cxx_std_17)
+# C++20: C++/WinRT uses standard <coroutine> (the old /await experimental
+# coroutines are rejected by current MSVC).
+target_compile_features(droidscreen_desktop PRIVATE cxx_std_20)
 
 target_compile_definitions(droidscreen_desktop PRIVATE
     WIN32_LEAN_AND_MEAN
@@ -76,5 +78,4 @@ set_target_properties(droidscreen_desktop PROPERTIES
 # WIN32 in add_executable sets /SUBSYSTEM:WINDOWS and uses WinMain entry point.
 if(MSVC)
     target_link_options(droidscreen_desktop PRIVATE /SUBSYSTEM:WINDOWS)
-    target_compile_options(droidscreen_desktop PRIVATE /await)
 endif()
