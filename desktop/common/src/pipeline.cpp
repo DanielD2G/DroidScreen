@@ -245,7 +245,7 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   // Wi-Fi link can actually back off.
   rate_controller_ = std::make_unique<RateController>(
       encoder_, bitrate_kbps,
-      /*min_kbps=*/std::max(4000u, std::min(bitrate_kbps / 4, 8000u)),
+      /*min_kbps=*/(std::max)(4000u, (std::min)(bitrate_kbps / 4, 8000u)),
       /*max_kbps=*/bitrate_kbps);
 
   running_.store(true);
@@ -578,7 +578,7 @@ void Pipeline::encode_loop() {
 
     if (got_new_frame) {
       const int64_t t_enc_start = now_us();
-      const int64_t pts = std::max(frame.timestamp_us, last_pts_us_ + 1);
+      const int64_t pts = (std::max)(frame.timestamp_us, last_pts_us_ + 1);
       last_pts_us_ = pts;
       bool ok = encoder_->encode(
           frame.native_handle, pts,
@@ -598,7 +598,7 @@ void Pipeline::encode_loop() {
       last_frame = frame;
     } else if (do_idle) {
       const int64_t t_enc_start = now_us();
-      const int64_t pts = std::max(t_enc_start, last_pts_us_ + 1);
+      const int64_t pts = (std::max)(t_enc_start, last_pts_us_ + 1);
       last_pts_us_ = pts;
       bool ok = encoder_->encode(
           last_frame.native_handle, pts,
@@ -960,7 +960,7 @@ int64_t Pipeline::sender_delay_us() const {
   {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex &>(send_mutex_));
     if (!send_queue_.empty())
-      delay = std::max(delay, now - send_queue_.front().encode_done_us);
+      delay = (std::max)(delay, now - send_queue_.front().encode_done_us);
   }
   return delay;
 }
