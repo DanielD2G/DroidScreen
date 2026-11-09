@@ -590,16 +590,15 @@ static bool run_wireless_hello(int fd) {
     LOGI("hello: desktop '%s' %s", hello.name,
          resp.status == DS_HELLO_ACCEPTED ? "accepted" : "rejected");
 
-    uint8_t resp_hdr[DS_HEADER_SIZE];
+    /* One message = one tcp_send_all() (see g_send_mutex in tcp_server.cpp). */
+    uint8_t wire[DS_HEADER_SIZE + DS_HELLO_RESP_SIZE];
     ds_header_t resp_header;
     resp_header.type = DS_MSG_HELLO_RESP;
     resp_header.flags = 0;
     resp_header.length = DS_HELLO_RESP_SIZE;
-    ds_header_serialize(resp_hdr, &resp_header);
-    uint8_t resp_buf[DS_HELLO_RESP_SIZE];
-    ds_hello_resp_serialize(resp_buf, &resp);
-    if (tcp_send_all(fd, resp_hdr, DS_HEADER_SIZE) != 0 ||
-        tcp_send_all(fd, resp_buf, DS_HELLO_RESP_SIZE) != 0) {
+    ds_header_serialize(wire, &resp_header);
+    ds_hello_resp_serialize(wire + DS_HEADER_SIZE, &resp);
+    if (tcp_send_all(fd, wire, sizeof(wire)) != 0) {
         LOGE("hello: failed to send response");
         return false;
     }
@@ -809,18 +808,16 @@ static void* recv_thread_func(void* /*arg*/) {
         resp.decoder_max_bitrate = req.max_bitrate_kbps;
         resp.touch_supported    = 1;
 
-        uint8_t resp_hdr[DS_HEADER_SIZE];
+        /* One message = one tcp_send_all() (see g_send_mutex in tcp_server.cpp). */
+        uint8_t resp_wire[DS_HEADER_SIZE + DS_HANDSHAKE_RESP_SIZE];
         ds_header_t resp_header;
         resp_header.type   = DS_MSG_HANDSHAKE_RESP;
         resp_header.flags  = 0;
         resp_header.length = DS_HANDSHAKE_RESP_SIZE;
-        ds_header_serialize(resp_hdr, &resp_header);
+        ds_header_serialize(resp_wire, &resp_header);
+        ds_handshake_resp_serialize(resp_wire + DS_HEADER_SIZE, &resp);
 
-        uint8_t resp_payload[DS_HANDSHAKE_RESP_SIZE];
-        ds_handshake_resp_serialize(resp_payload, &resp);
-
-        if (tcp_send_all(g_client_fd, resp_hdr, DS_HEADER_SIZE) != 0 ||
-            tcp_send_all(g_client_fd, resp_payload, DS_HANDSHAKE_RESP_SIZE) != 0) {
+        if (tcp_send_all(g_client_fd, resp_wire, sizeof(resp_wire)) != 0) {
             LOGE("recv_thread: failed to send handshake response");
             tcp_close(g_client_fd);
             g_client_fd = -1;
