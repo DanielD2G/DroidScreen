@@ -409,10 +409,10 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
 
     if (keyframe_pending_.exchange(false)) {
         hw_frame_->pict_type = AV_PICTURE_TYPE_I;
-        hw_frame_->key_frame = 1;
+        hw_frame_->flags |= AV_FRAME_FLAG_KEY;
     } else {
         hw_frame_->pict_type = AV_PICTURE_TYPE_NONE;
-        hw_frame_->key_frame = 0;
+        hw_frame_->flags &= ~AV_FRAME_FLAG_KEY;
     }
 
     // Step 4: Send frame to encoder (zero-copy — encoder reads the D3D11
