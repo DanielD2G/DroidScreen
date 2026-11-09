@@ -1,9 +1,14 @@
 /*
  * DroidScreen - JNI bridge between Kotlin and native C/C++ code.
  *
- * Manages TCP server, receive/decode threads, and touch forwarding.
+ * Manages TCP server, receive/decode threads, and input forwarding.
  * Supports reconnection: recv_thread loops back to accept() after
  * a client disconnects, resetting the decoder and ring buffer.
+ *
+ * Decoder ownership: g_decoder is created and destroyed only by the recv
+ * thread while the decode thread is parked (park_decode_thread), and by
+ * nativeStop after both threads are joined. The decode thread uses it without
+ * a lock, so no lock is ever held across a blocking MediaCodec call.
  */
 
 #include <jni.h>
@@ -21,10 +26,14 @@
 #include <sched.h>
 #include <sys/resource.h>
 #include <time.h>
+#include <algorithm>
+#include <vector>
 
 #include "tcp_server.h"
 #include "decoder.h"
 #include "ring_buffer.h"
+#include "ds_clock.h"
+#include "outbound.h"
 #include "mouse_sender.h"
 #include "pen_sender.h"
 #include "touch_sender.h"
@@ -50,12 +59,13 @@ extern "C" {
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-/* Ring buffer capacity: 16 MB.
- * 4K keyframes and brief decode stalls can easily overflow 4 MB. */
-#define RING_BUFFER_CAPACITY (16 * 1024 * 1024)
-
 /* Max single frame payload size: 4 MB */
 #define MAX_FRAME_SIZE (4 * 1024 * 1024)
+
+/* Ring buffer physical capacity: 8 MB (power of 2). It only has to admit
+ * CONFIG + one maximum-size IDR; how much latency the ring may hold is a
+ * separate time budget (kBacklogBudgetMs, see backlog_tick). */
+#define RING_BUFFER_CAPACITY (8 * 1024 * 1024)
 
 /* Wire payload can include a telemetry prefix before the NAL payload. */
 #define MAX_WIRE_VIDEO_PAYLOAD_SIZE (MAX_FRAME_SIZE + DS_VIDEO_TELEMETRY_SIZE)
@@ -70,6 +80,14 @@ typedef struct {
 #define INTERNAL_VIDEO_HEADER_SIZE (1 + sizeof(AndroidFrameTelemetry))
 #define MAX_VIDEO_MSG_SIZE (MAX_FRAME_SIZE + INTERNAL_VIDEO_HEADER_SIZE)
 
+/* CONFIG (SPS/PPS/VPS, a few hundred bytes; 64 KB is generous) plus a max IDR,
+ * each with its u32 ring framing. */
+static_assert(RING_BUFFER_CAPACITY >=
+                  (64 * 1024 + 4) + (MAX_VIDEO_MSG_SIZE + 4),
+              "ring must admit CONFIG + a maximum-size IDR");
+static_assert((RING_BUFFER_CAPACITY & (RING_BUFFER_CAPACITY - 1)) == 0,
+              "ring capacity must be a power of 2");
+
 /* Status constants — must match MainActivity.kt companion object */
 #define STATUS_WAITING      0
 #define STATUS_CONNECTED    1
@@ -79,17 +97,33 @@ typedef struct {
 #define MC_BUFFER_FLAG_KEY_FRAME    1u
 #define MC_BUFFER_FLAG_CODEC_CONFIG 2u
 
-/* ---- Decode thread condition variable ----
- * Signalled by: async MediaCodec callbacks, ring buffer writes (recv_thread).
- * Waited on by: decode_thread instead of polling with usleep. */
+/* ---- Decode thread wakeup and parking ----
+ * g_decode_cv: signalled by ring buffer writes (recv_thread), async MediaCodec
+ * callbacks and session start. The decode thread waits on it (with a short
+ * timeout for recovery/backlog timers) instead of polling.
+ * g_park_cv: the decode thread reports it is parked (not touching g_decoder),
+ * so the recv thread can destroy or recreate the decoder. */
 static std::mutex              g_decode_mutex;
 static std::condition_variable g_decode_cv;
+static std::condition_variable g_park_cv;
+static bool                    g_decode_signal = false;  /* guarded */
+static bool                    g_decode_parked = true;   /* guarded */
 
-static void decoder_wakeup_cb(void* /*userdata*/) {
+static void wake_decode_thread() {
+    {
+        std::lock_guard<std::mutex> lock(g_decode_mutex);
+        g_decode_signal = true;
+    }
     g_decode_cv.notify_one();
 }
 
-static void decoder_rendered_cb(void* /*userdata*/, int64_t pts_us);
+static void decoder_wakeup_cb(void* /*userdata*/) {
+    wake_decode_thread();
+}
+
+static void decoder_released_cb(void* userdata, int64_t pts_us, bool rendered);
+static void decoder_frame_rendered_cb(void* userdata, int64_t pts_us,
+                                      int64_t system_nano);
 
 /* ---- Global state ---- */
 static std::atomic<bool> g_running{false};
@@ -100,41 +134,71 @@ static ANativeWindow*    g_window    = nullptr;
 static ring_buffer*      g_ring_buf  = nullptr;
 static pthread_t         g_recv_thread;
 static pthread_t         g_decode_thread;
-static DecoderContext*   g_decoder   = nullptr;
-static std::mutex        g_decoder_api_mutex;
+static DecoderContext*   g_decoder   = nullptr;   /* see ownership note above */
 static std::atomic<uint32_t> g_stream_frame_interval_us{16667};
 static std::atomic<int64_t>  g_next_pts_us{0};
-static std::atomic<bool>     g_decoder_direct_submit{false};
 static std::atomic<int>      g_active_codec_id{DS_CODEC_H264};
 static std::atomic<bool>     g_h264_constraints_only_sps{false};
 
 /* ---- Stats tracking (read from JNI, written from recv/decode threads) ---- */
 static std::atomic<uint64_t> g_stats_bytes_received{0};
-static std::atomic<uint64_t> g_stats_frames_decoded{0};
+static std::atomic<uint64_t> g_stats_frames_rendered{0};   /* releases with render=true */
 static std::atomic<uint64_t> g_stats_frames_fed{0};
 static std::atomic<uint64_t> g_stats_feed_errors{0};
 static std::atomic<int64_t>  g_stats_last_frame_arrival_us{0};
 static std::atomic<int64_t>  g_stats_frame_jitter_us{0};
 static std::atomic<uint64_t> g_stats_frames_skipped{0};
-static std::atomic<int64_t>  g_stats_latency_to_feed_us{0};
-static std::atomic<int64_t>  g_stats_latency_to_release_us{0};
-static std::atomic<int64_t>  g_stats_desktop_capture_to_send_us{0};
-static std::atomic<int64_t>  g_stats_desktop_capture_to_encode_us{0};
-static std::atomic<int64_t>  g_stats_desktop_encode_to_send_us{0};
-static std::atomic<int64_t>  g_stats_android_recv_to_feed_us{0};
-static std::atomic<int64_t>  g_stats_android_recv_to_release_us{0};
-static std::atomic<int64_t>  g_stats_video_rtt_us{0};
 static std::atomic<uint64_t> g_stats_idle_frames{0};
+static std::atomic<uint64_t> g_stats_render_callbacks{0};
+/* Latest telemetry values (per frame, not smoothed). */
+static std::atomic<int64_t>  g_stats_desktop_capture_to_send_us{0};
+static std::atomic<int64_t>  g_stats_video_rtt_us{0};
+static std::atomic<uint32_t> g_stats_clock_uncertainty_us{0};
+/* p50 of the last ~2 s window (0 = no samples), for the stats UI. */
+static std::atomic<int64_t>  g_stats_comp_render_p50_us{0};
+static std::atomic<int64_t>  g_stats_send_render_p50_us{0};
+static std::atomic<int64_t>  g_stats_recv_render_p50_us{0};
+
+/* ---- Pending frame telemetry ----
+ * One entry per fed (non-config) frame, keyed by its unique PTS:
+ *   FED      -> fed to MediaCodec, output not released yet
+ *   RELEASED -> released with render=true, waiting for onFrameRendered
+ * Released with render=false, or rendered, frees the entry. Entries whose
+ * output never came back (decoder dropped it) or whose render callback never
+ * arrived (callbacks may be missing) are expired by age. */
+enum : uint8_t { PT_FREE = 0, PT_FED = 1, PT_RELEASED = 2 };
 
 typedef struct {
-    bool valid;
+    uint8_t state;
     int64_t pts_us;
+    int64_t stamp_us;   /* feed time (FED) or release time (RELEASED) */
     AndroidFrameTelemetry meta;
 } PendingFrameTelemetry;
 
-#define PENDING_TELEMETRY_CAP 256
+#define PENDING_TELEMETRY_CAP 64
+static constexpr int64_t kPendingFedMaxAgeUs   = 2000000;  /* output never released */
+static constexpr int64_t kPendingRenderWaitUs  = 1000000;  /* render callback missing */
 static PendingFrameTelemetry g_pending_telemetry[PENDING_TELEMETRY_CAP];
 static std::mutex g_pending_telemetry_mutex;
+static uint64_t g_pending_expired = 0;     /* guarded: lost outputs / callbacks */
+static std::atomic<uint32_t> g_decoder_inflight{0};  /* FED entries */
+
+/* ---- Per-frame latency samples for the current log window (all frames,
+ * no smoothing). Filled by the render callback, swapped out by the logger. */
+typedef struct {
+    std::vector<int32_t> comp_render_us;   /* desktop compositor -> Android render */
+    std::vector<int32_t> send_render_us;   /* desktop send start -> Android render */
+    std::vector<int32_t> recv_render_us;   /* Android receive   -> Android render */
+} LatencyWindow;
+static LatencyWindow g_lat_window;
+static std::mutex    g_lat_mutex;
+
+/* ---- Receiver backlog (ring time budget) ---- */
+static std::atomic<uint32_t> g_ring_frames{0};        /* video messages in the ring */
+static std::atomic<uint64_t> g_recv_rate_Bps{0};      /* measured receive byte-rate */
+static std::atomic<uint64_t> g_bitrate_floor_Bps{0};  /* negotiated bitrate */
+static constexpr int64_t kBacklogReportUs = 100000;   /* 10 Hz report to the desktop */
+static constexpr int64_t kBacklogBudgetMs = 500;
 
 typedef struct {
     int codec_id;
@@ -165,9 +229,7 @@ static jfieldID          g_choiceIsQcomC2 = nullptr;
 static jfieldID          g_choiceIsQcomOmx = nullptr;
 
 static int64_t now_us() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+    return ds_now_us();
 }
 
 /* ---- Loss recovery ----
@@ -406,12 +468,6 @@ static bool choose_decoder_for_stream(uint8_t codec_mask, uint16_t width,
     return out->valid;
 }
 
-static int64_t ewma_us(int64_t prev, int64_t sample) {
-    if (sample < 0) return prev;
-    if (prev <= 0) return sample;
-    return prev + (sample - prev) / 10;
-}
-
 static uint32_t media_codec_flags_from_video_flags(uint8_t video_flags,
                                                    int* is_config) {
     int keyframe = 0;
@@ -562,10 +618,9 @@ static void notify_volume_state(int volume, bool muted) {
 static void store_pending_telemetry(int64_t pts_us,
                                     const AndroidFrameTelemetry* meta);
 static void remove_pending_telemetry(int64_t pts_us);
-static void record_feed_latency(const AndroidFrameTelemetry* meta,
-                                int64_t feed_us);
-static bool feed_video_message_direct(const uint8_t* msg, size_t msg_len,
-                                      int32_t input_idx);
+static void clear_pending_telemetry();
+static void record_fed_frame(const AndroidFrameTelemetry* meta);
+static void park_decode_thread();
 
 static void bytes_to_hex(const uint8_t* in, size_t len, char* out) {
     static const char kHex[] = "0123456789abcdef";
@@ -812,48 +867,47 @@ static void* recv_thread_func(void* /*arg*/) {
             continue;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-            if (g_decoder) {
+        /* The decode thread is parked here (configured == false), so the
+         * decoder can be (re)created without any lock. */
+        if (g_decoder) {
+            decoder_destroy(g_decoder);
+            g_decoder = nullptr;
+        }
+        g_decoder = decoder_create(g_window, selection.mime,
+                                   selection.codec_name, &selection.hints);
+        if (g_decoder) {
+            decoder_set_wakeup(g_decoder, decoder_wakeup_cb, nullptr);
+            decoder_set_output_callbacks(g_decoder, decoder_released_cb,
+                                         decoder_frame_rendered_cb, nullptr);
+            if (decoder_configure(g_decoder, req.width, req.height,
+                                  req.fps) != 0) {
+                LOGW("recv_thread: selected decoder failed; trying H.264 fallback");
                 decoder_destroy(g_decoder);
                 g_decoder = nullptr;
-            }
-            g_decoder = decoder_create(g_window, selection.mime,
-                                       selection.codec_name, &selection.hints);
-            if (g_decoder) {
-                decoder_set_wakeup(g_decoder, decoder_wakeup_cb, nullptr);
-                decoder_set_rendered_callback(g_decoder, decoder_rendered_cb,
-                                              nullptr, false);
-                if (decoder_configure(g_decoder, req.width, req.height,
-                                      req.fps) != 0) {
-                    LOGW("recv_thread: selected decoder failed; trying H.264 fallback");
-                    decoder_destroy(g_decoder);
-                    g_decoder = nullptr;
 
-                    NativeDecoderSelection fallback;
-                    if (selection.codec_id != DS_CODEC_H264 &&
-                            choose_decoder_for_stream(DS_CODEC_CAP_H264,
-                                                      req.width, req.height,
-                                                      req.fps, &fallback)) {
-                        selection = fallback;
-                        g_decoder = decoder_create(g_window, selection.mime,
-                                                   selection.codec_name,
-                                                   &selection.hints);
-                        if (g_decoder) {
-                            decoder_set_wakeup(g_decoder, decoder_wakeup_cb, nullptr);
-                            decoder_set_rendered_callback(g_decoder,
-                                                          decoder_rendered_cb,
-                                                          nullptr, false);
-                        }
+                NativeDecoderSelection fallback;
+                if (selection.codec_id != DS_CODEC_H264 &&
+                        choose_decoder_for_stream(DS_CODEC_CAP_H264,
+                                                  req.width, req.height,
+                                                  req.fps, &fallback)) {
+                    selection = fallback;
+                    g_decoder = decoder_create(g_window, selection.mime,
+                                               selection.codec_name,
+                                               &selection.hints);
+                    if (g_decoder) {
+                        decoder_set_wakeup(g_decoder, decoder_wakeup_cb, nullptr);
+                        decoder_set_output_callbacks(g_decoder, decoder_released_cb,
+                                                     decoder_frame_rendered_cb,
+                                                     nullptr);
                     }
+                }
 
-                    if (!g_decoder ||
-                            decoder_configure(g_decoder, req.width, req.height,
-                                              req.fps) != 0) {
-                        if (g_decoder) {
-                            decoder_destroy(g_decoder);
-                            g_decoder = nullptr;
-                        }
+                if (!g_decoder ||
+                        decoder_configure(g_decoder, req.width, req.height,
+                                          req.fps) != 0) {
+                    if (g_decoder) {
+                        decoder_destroy(g_decoder);
+                        g_decoder = nullptr;
                     }
                 }
             }
@@ -867,18 +921,20 @@ static void* recv_thread_func(void* /*arg*/) {
             continue;
         }
 
-        /* Direct submit bypasses the decode thread's loss-recovery gate; all
-         * packets go through the ring so recovery has a single owner. */
-        g_decoder_direct_submit.store(false, std::memory_order_release);
         g_active_codec_id.store(selection.codec_id, std::memory_order_release);
         g_h264_constraints_only_sps.store(
             selection.hints.has_android_low_latency ||
                 selection.hints.is_qcom_c2 ||
                 selection.hints.is_qcom_omx,
             std::memory_order_release);
-        LOGI("recv_thread: accepted codec=%d direct_submit=%d",
-             selection.codec_id,
-             g_decoder_direct_submit.load(std::memory_order_relaxed) ? 1 : 0);
+        LOGI("recv_thread: accepted codec=%d", selection.codec_id);
+        /* Floor for the backlog time budget: the stream's negotiated bitrate
+         * (the measured rate collapses to almost nothing on a still screen). */
+        g_bitrate_floor_Bps.store(
+            req.max_bitrate_kbps > 0 ? (uint64_t)req.max_bitrate_kbps * 125u
+                                     : 250000u,
+            std::memory_order_relaxed);
+        g_recv_rate_Bps.store(0, std::memory_order_relaxed);
 
         /* Send handshake response */
         ds_handshake_resp_t resp;
@@ -911,10 +967,20 @@ static void* recv_thread_func(void* /*arg*/) {
         /* Only now let the decode thread run: its first act is a keyframe
          * request, and the desktop expects HANDSHAKE_RESP as the first message. */
         reset_recovery_for_session();
-        g_decoder_configured.store(true, std::memory_order_release);
+        outbound_set_session(g_client_fd);
+        {
+            std::lock_guard<std::mutex> lock(g_decode_mutex);
+            g_decoder_configured.store(true, std::memory_order_release);
+            g_decode_signal = true;
+        }
+        g_decode_cv.notify_one();
 
         /* Notify Java: connected and streaming */
         notify_status(STATUS_CONNECTED);
+
+        /* Receive byte-rate over ~500 ms windows (backlog time budget). */
+        int64_t rate_window_start_us = now_us();
+        uint64_t rate_window_bytes = 0;
 
         /* ---- Message loop ---- */
         while (g_running.load(std::memory_order_acquire)) {
@@ -945,6 +1011,15 @@ static void* recv_thread_func(void* /*arg*/) {
                     /* Stats: track bytes received */
                     g_stats_bytes_received.fetch_add(
                         DS_HEADER_SIZE + hdr.length, std::memory_order_relaxed);
+                    rate_window_bytes += DS_HEADER_SIZE + hdr.length;
+                    if (recv_us - rate_window_start_us >= 500000) {
+                        g_recv_rate_Bps.store(
+                            rate_window_bytes * 1000000ull /
+                                (uint64_t)(recv_us - rate_window_start_us),
+                            std::memory_order_relaxed);
+                        rate_window_start_us = recv_us;
+                        rate_window_bytes = 0;
+                    }
 
                     /* Stats: track frame pacing (jitter via EWMA) */
                     {
@@ -996,48 +1071,38 @@ static void* recv_thread_func(void* /*arg*/) {
                     }
 
                     size_t msg_len = nal_len + INTERNAL_VIDEO_HEADER_SIZE;
-                    bool consumed = false;
-                    if (g_decoder_direct_submit.load(std::memory_order_acquire) &&
-                            g_decoder_configured.load(std::memory_order_acquire) &&
-                            ring_buffer_available_read(g_ring_buf) == 0) {
-                        int32_t input_idx = -1;
-                        {
-                            std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-                            if (g_decoder) {
-                                input_idx = decoder_pop_input(g_decoder);
-                            }
-                        }
-                        if (input_idx >= 0) {
-                            consumed = feed_video_message_direct(video_msg_buf,
-                                                                 msg_len,
-                                                                 input_idx);
-                            if (consumed) {
-                                g_decode_cv.notify_one();
-                            }
-                        }
-                    }
-
-                    if (!consumed && ring_buffer_write_message(
-                            g_ring_buf, video_msg_buf, msg_len) != 0) {
+                    if (ring_buffer_write_message(g_ring_buf, video_msg_buf, msg_len) != 0) {
                         LOGW("recv_thread: ring buffer full, dropping frame");
                         enter_recovery(android_telemetry.rx_seq,
                                        (hdr.flags & DS_FLAG_CONFIG) != 0, "ring buffer full");
                     } else {
-                        /* Wake decode thread — new data available */
-                        g_decode_cv.notify_one();
+                        g_ring_frames.fetch_add(1, std::memory_order_acq_rel);
+                        wake_decode_thread();
                     }
                     break;
                 }
 
                 case DS_MSG_PING: {
-                    /* Respond with PONG */
+                    /* PONG: echoed desktop_send_us + our CLOCK_MONOTONIC now,
+                     * for RTT and the desktop<->Android clock offset. Sent
+                     * right here (not via the outbound queue) so queued input
+                     * can't inflate the RTT. */
+                    if (hdr.length < DS_PING_PAYLOAD_SIZE) {
+                        LOGW("recv_thread: short PING (%u bytes)", hdr.length);
+                        break;
+                    }
+                    uint8_t pong_buf[DS_HEADER_SIZE + DS_PONG_PAYLOAD_SIZE];
                     ds_header_t pong;
                     pong.type   = DS_MSG_PONG;
                     pong.flags  = 0;
-                    pong.length = 0;
-                    uint8_t pong_buf[DS_HEADER_SIZE];
+                    pong.length = DS_PONG_PAYLOAD_SIZE;
                     ds_header_serialize(pong_buf, &pong);
-                    tcp_send_all(g_client_fd, pong_buf, DS_HEADER_SIZE);
+                    memcpy(pong_buf + DS_HEADER_SIZE, payload_buf, 8);  /* already LE */
+                    uint64_t android_now = (uint64_t)now_us();
+                    for (int i = 0; i < 8; i++) {
+                        pong_buf[DS_HEADER_SIZE + 8 + i] = (uint8_t)(android_now >> (8 * i));
+                    }
+                    tcp_send_all(g_client_fd, pong_buf, sizeof(pong_buf));
                     break;
                 }
 
@@ -1087,57 +1152,57 @@ static void* recv_thread_func(void* /*arg*/) {
         /* ---- Cleanup between sessions ---- */
         LOGI("recv_thread: client disconnected, cleaning up for reconnection");
 
+        /* No more input/backlog messages for this connection. */
+        outbound_set_session(-1);
+
         /* Close client socket */
         if (g_client_fd >= 0) {
             tcp_close(g_client_fd);
             g_client_fd = -1;
         }
 
-        /* Signal decode thread to pause */
-        g_decoder_configured.store(false, std::memory_order_release);
+        /* Park the decode thread (it stops touching g_decoder), then destroy
+         * the decoder; decoder_destroy joins the sync output thread before it
+         * deletes the codec. No lock is held here that either thread needs. */
+        park_decode_thread();
+        if (g_decoder) {
+            decoder_destroy(g_decoder);
+            g_decoder = nullptr;
+        }
+
+        /* Nothing touches the ring or the telemetry now: reset for next session. */
+        if (g_ring_buf) {
+            ring_buffer_reset(g_ring_buf);
+        }
+        g_ring_frames.store(0, std::memory_order_relaxed);
+        clear_pending_telemetry();
+        {
+            std::lock_guard<std::mutex> lock(g_lat_mutex);
+            g_lat_window.comp_render_us.clear();
+            g_lat_window.send_render_us.clear();
+            g_lat_window.recv_render_us.clear();
+        }
 
         /* Reset stats for next session */
         g_stats_bytes_received.store(0, std::memory_order_relaxed);
-        g_stats_frames_decoded.store(0, std::memory_order_relaxed);
+        g_stats_frames_rendered.store(0, std::memory_order_relaxed);
         g_stats_frames_fed.store(0, std::memory_order_relaxed);
         g_stats_feed_errors.store(0, std::memory_order_relaxed);
         g_stats_last_frame_arrival_us.store(0, std::memory_order_relaxed);
         g_stats_frame_jitter_us.store(0, std::memory_order_relaxed);
         g_stats_frames_skipped.store(0, std::memory_order_relaxed);
-        g_stats_latency_to_feed_us.store(0, std::memory_order_relaxed);
-        g_stats_latency_to_release_us.store(0, std::memory_order_relaxed);
-        g_stats_desktop_capture_to_send_us.store(0, std::memory_order_relaxed);
-        g_stats_desktop_capture_to_encode_us.store(0, std::memory_order_relaxed);
-        g_stats_desktop_encode_to_send_us.store(0, std::memory_order_relaxed);
-        g_stats_android_recv_to_feed_us.store(0, std::memory_order_relaxed);
-        g_stats_android_recv_to_release_us.store(0, std::memory_order_relaxed);
-        g_stats_video_rtt_us.store(0, std::memory_order_relaxed);
         g_stats_idle_frames.store(0, std::memory_order_relaxed);
+        g_stats_render_callbacks.store(0, std::memory_order_relaxed);
+        g_stats_desktop_capture_to_send_us.store(0, std::memory_order_relaxed);
+        g_stats_video_rtt_us.store(0, std::memory_order_relaxed);
+        g_stats_clock_uncertainty_us.store(0, std::memory_order_relaxed);
+        g_stats_comp_render_p50_us.store(0, std::memory_order_relaxed);
+        g_stats_send_render_p50_us.store(0, std::memory_order_relaxed);
+        g_stats_recv_render_p50_us.store(0, std::memory_order_relaxed);
+        g_recv_rate_Bps.store(0, std::memory_order_relaxed);
         g_next_pts_us.store(0, std::memory_order_relaxed);
-        g_decoder_direct_submit.store(false, std::memory_order_relaxed);
         g_active_codec_id.store(DS_CODEC_H264, std::memory_order_relaxed);
         g_h264_constraints_only_sps.store(false, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lock(g_pending_telemetry_mutex);
-            memset(g_pending_telemetry, 0, sizeof(g_pending_telemetry));
-        }
-
-        /* Give decode thread time to notice and stop touching the decoder */
-        usleep(5000);  /* 5ms — decode thread polls at 100us */
-
-        /* Reset ring buffer to purge stale video data */
-        if (g_ring_buf) {
-            ring_buffer_reset(g_ring_buf);
-        }
-
-        /* Destroy decoder for clean state. The next handshake chooses codec again. */
-        {
-            std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-            if (g_decoder) {
-                decoder_destroy(g_decoder);
-                g_decoder = nullptr;
-            }
-        }
 
         /* Notify Java: disconnected (will show "reconnecting..." UI) */
         if (g_running.load(std::memory_order_acquire)) {
@@ -1151,179 +1216,267 @@ static void* recv_thread_func(void* /*arg*/) {
     return nullptr;
 }
 
+/* ---- Pending frame telemetry (see PendingFrameTelemetry) ---- */
+
+static void pending_free_locked(PendingFrameTelemetry* e) {
+    if (e->state == PT_FED) {
+        g_decoder_inflight.fetch_sub(1, std::memory_order_relaxed);
+    }
+    e->state = PT_FREE;
+}
+
 static void store_pending_telemetry(int64_t pts_us,
                                     const AndroidFrameTelemetry* meta) {
     if (!meta || meta->telemetry.sequence == 0) return;
+    int64_t now = now_us();
     std::lock_guard<std::mutex> lock(g_pending_telemetry_mutex);
-    size_t slot = (size_t)(meta->telemetry.sequence & (PENDING_TELEMETRY_CAP - 1));
-    g_pending_telemetry[slot].pts_us = pts_us;
-    g_pending_telemetry[slot].meta = *meta;
-    g_pending_telemetry[slot].valid = true;
+    PendingFrameTelemetry* slot = nullptr;
+    PendingFrameTelemetry* oldest = nullptr;
+    for (size_t i = 0; i < PENDING_TELEMETRY_CAP; i++) {
+        PendingFrameTelemetry* e = &g_pending_telemetry[i];
+        if (e->state == PT_FED && now - e->stamp_us > kPendingFedMaxAgeUs) {
+            pending_free_locked(e);
+            g_pending_expired++;
+        } else if (e->state == PT_RELEASED && now - e->stamp_us > kPendingRenderWaitUs) {
+            pending_free_locked(e);
+            g_pending_expired++;
+        }
+        if (e->state == PT_FREE) {
+            if (!slot) slot = e;
+        } else if (!oldest || e->stamp_us < oldest->stamp_us) {
+            oldest = e;
+        }
+    }
+    if (!slot) {
+        slot = oldest;
+        pending_free_locked(slot);
+        g_pending_expired++;
+    }
+    slot->state = PT_FED;
+    slot->pts_us = pts_us;
+    slot->stamp_us = now;
+    slot->meta = *meta;
+    g_decoder_inflight.fetch_add(1, std::memory_order_relaxed);
 }
 
+static PendingFrameTelemetry* find_pending_locked(int64_t pts_us) {
+    for (size_t i = 0; i < PENDING_TELEMETRY_CAP; i++) {
+        PendingFrameTelemetry* e = &g_pending_telemetry[i];
+        if (e->state != PT_FREE && e->pts_us == pts_us) return e;
+    }
+    return nullptr;
+}
+
+/* Feed failed: the frame never reached the decoder. */
 static void remove_pending_telemetry(int64_t pts_us) {
     std::lock_guard<std::mutex> lock(g_pending_telemetry_mutex);
-    for (size_t i = 0; i < PENDING_TELEMETRY_CAP; i++) {
-        if (g_pending_telemetry[i].valid &&
-                g_pending_telemetry[i].pts_us == pts_us) {
-            g_pending_telemetry[i].valid = false;
-            return;
-        }
-    }
+    PendingFrameTelemetry* e = find_pending_locked(pts_us);
+    if (e) pending_free_locked(e);
 }
 
-static bool take_pending_telemetry(int64_t pts_us,
-                                   AndroidFrameTelemetry* out) {
+static void clear_pending_telemetry() {
     std::lock_guard<std::mutex> lock(g_pending_telemetry_mutex);
     for (size_t i = 0; i < PENDING_TELEMETRY_CAP; i++) {
-        if (g_pending_telemetry[i].valid &&
-                g_pending_telemetry[i].pts_us == pts_us) {
-            if (out) *out = g_pending_telemetry[i].meta;
-            g_pending_telemetry[i].valid = false;
-            return true;
+        g_pending_telemetry[i].state = PT_FREE;
+    }
+    g_pending_expired = 0;
+    g_decoder_inflight.store(0, std::memory_order_relaxed);
+}
+
+/* Successful feed of a non-config frame: latest desktop-side telemetry. */
+static void record_fed_frame(const AndroidFrameTelemetry* meta) {
+    if (!meta || meta->telemetry.sequence == 0) return;
+    if (meta->telemetry.flags & DS_VIDEO_TELEMETRY_FLAG_IDLE) {
+        g_stats_idle_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_stats_desktop_capture_to_send_us.store(meta->telemetry.capture_to_send_us,
+                                             std::memory_order_relaxed);
+    g_stats_video_rtt_us.store(meta->telemetry.rtt_us, std::memory_order_relaxed);
+    g_stats_clock_uncertainty_us.store(meta->telemetry.clock_uncertainty_us,
+                                       std::memory_order_relaxed);
+}
+
+/* Every output release (sync: output thread, async: decode thread). The
+ * rendered-FPS counter lives here: render callbacks can be batched or missing. */
+static void decoder_released_cb(void* /*userdata*/, int64_t pts_us, bool rendered) {
+    if (rendered) {
+        g_stats_frames_rendered.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::lock_guard<std::mutex> lock(g_pending_telemetry_mutex);
+    PendingFrameTelemetry* e = find_pending_locked(pts_us);
+    if (!e) return;
+    if (!rendered) {
+        pending_free_locked(e);          /* dropped by render-queue-depth=1 */
+    } else if (e->state == PT_FED) {
+        g_decoder_inflight.fetch_sub(1, std::memory_order_relaxed);
+        e->state = PT_RELEASED;
+        e->stamp_us = now_us();
+    }
+}
+
+static int64_t clamp_sample(int64_t us) {
+    if (us < INT32_MIN) return INT32_MIN;
+    if (us > INT32_MAX) return INT32_MAX;
+    return us;
+}
+
+/* onFrameRendered (NDK internal thread): the frame reached the display at
+ * system_nano (CLOCK_MONOTONIC, same clock as now_us()). */
+static void decoder_frame_rendered_cb(void* /*userdata*/, int64_t pts_us,
+                                      int64_t system_nano) {
+    g_stats_render_callbacks.fetch_add(1, std::memory_order_relaxed);
+
+    AndroidFrameTelemetry meta;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_telemetry_mutex);
+        PendingFrameTelemetry* e = find_pending_locked(pts_us);
+        if (!e) return;
+        meta = e->meta;
+        pending_free_locked(e);
+    }
+    if (meta.telemetry.flags & DS_VIDEO_TELEMETRY_FLAG_IDLE) return;
+
+    const int64_t render_us = system_nano / 1000;
+    const ds_video_telemetry_t& t = meta.telemetry;
+    const bool clock_ok = t.clock_uncertainty_us > 0;
+    const int64_t recv_render = render_us - meta.recv_us;
+    int64_t comp_render = -1;
+    int64_t send_render = -1;
+    if (clock_ok && t.display_time_us != 0) {
+        comp_render = render_us - (t.display_time_us + t.clock_offset_us);
+    }
+    if (clock_ok && t.desktop_send_us != 0) {
+        send_render = render_us - (t.desktop_send_us + t.clock_offset_us);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_lat_mutex);
+        g_lat_window.recv_render_us.push_back((int32_t)clamp_sample(recv_render));
+        if (comp_render != -1) {
+            g_lat_window.comp_render_us.push_back((int32_t)clamp_sample(comp_render));
+        }
+        if (send_render != -1) {
+            g_lat_window.send_render_us.push_back((int32_t)clamp_sample(send_render));
         }
     }
-    return false;
-}
-
-static void record_feed_latency(const AndroidFrameTelemetry* meta,
-                                int64_t feed_us) {
-    if (!meta || meta->telemetry.sequence == 0) return;
-    int64_t recv_to_feed = feed_us - meta->recv_us;
-    bool is_idle = (meta->telemetry.flags & DS_VIDEO_TELEMETRY_FLAG_IDLE) != 0;
-    if (is_idle) {
-        g_stats_idle_frames.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    int64_t transit_est = meta->telemetry.rtt_us > 0
-        ? meta->telemetry.rtt_us / 2 : 0;
-    int64_t e2e_feed = meta->telemetry.capture_to_send_us
-        + transit_est + recv_to_feed;
-
-    g_stats_desktop_capture_to_send_us.store(
-        meta->telemetry.capture_to_send_us, std::memory_order_relaxed);
-    g_stats_desktop_capture_to_encode_us.store(
-        meta->telemetry.capture_to_encode_us, std::memory_order_relaxed);
-    g_stats_desktop_encode_to_send_us.store(
-        meta->telemetry.encode_to_send_us, std::memory_order_relaxed);
-    g_stats_video_rtt_us.store(meta->telemetry.rtt_us, std::memory_order_relaxed);
-    g_stats_android_recv_to_feed_us.store(
-        ewma_us(g_stats_android_recv_to_feed_us.load(std::memory_order_relaxed),
-                recv_to_feed),
-        std::memory_order_relaxed);
-    g_stats_latency_to_feed_us.store(
-        ewma_us(g_stats_latency_to_feed_us.load(std::memory_order_relaxed),
-                e2e_feed),
-        std::memory_order_relaxed);
-}
-
-static void record_release_latency(int64_t pts_us, int64_t release_us) {
-    AndroidFrameTelemetry meta;
-    if (!take_pending_telemetry(pts_us, &meta)) return;
-
-    int64_t recv_to_release = release_us - meta.recv_us;
-    bool is_idle = (meta.telemetry.flags & DS_VIDEO_TELEMETRY_FLAG_IDLE) != 0;
-    if (is_idle) {
-        return;
-    }
-    int64_t transit_est = meta.telemetry.rtt_us > 0
-        ? meta.telemetry.rtt_us / 2 : 0;
-    int64_t e2e_release = meta.telemetry.capture_to_send_us
-        + transit_est + recv_to_release;
 
     /* "Wake" latency: first real frame after the screen sat still. This is
-     * what typing into an idle editor feels like, and what the idle
-     * keep-alive frames exist to protect. */
-    static int64_t last_real_release_us = 0;
-    if (last_real_release_us > 0 && release_us - last_real_release_us > 500000) {
-        LOGI("wake: gap=%lldms e2e=%.1fms android=%.1fms desk=%.1fms",
-             (long long)((release_us - last_real_release_us) / 1000),
-             e2e_release / 1000.0, recv_to_release / 1000.0,
-             meta.telemetry.capture_to_send_us / 1000.0);
+     * what typing into an idle editor feels like. */
+    static std::atomic<int64_t> last_real_render_us{0};
+    int64_t last = last_real_render_us.exchange(render_us, std::memory_order_relaxed);
+    if (last > 0 && render_us - last > 500000) {
+        LOGI("wake: gap=%lldms comp_render=%.1fms send_render=%.1fms recv_render=%.1fms",
+             (long long)((render_us - last) / 1000),
+             comp_render != -1 ? comp_render / 1000.0 : -1.0,
+             send_render != -1 ? send_render / 1000.0 : -1.0,
+             recv_render / 1000.0);
     }
-    last_real_release_us = release_us;
-
-    g_stats_android_recv_to_release_us.store(
-        ewma_us(g_stats_android_recv_to_release_us.load(std::memory_order_relaxed),
-                recv_to_release),
-        std::memory_order_relaxed);
-    g_stats_latency_to_release_us.store(
-        ewma_us(g_stats_latency_to_release_us.load(std::memory_order_relaxed),
-                e2e_release),
-        std::memory_order_relaxed);
 }
 
-static void decoder_rendered_cb(void* /*userdata*/, int64_t pts_us) {
-    g_stats_frames_decoded.fetch_add(1, std::memory_order_relaxed);
-    record_release_latency(pts_us, now_us());
-    g_decode_cv.notify_one();
+/* ---- Window percentiles (all samples of the window, nearest-rank) ---- */
+typedef struct {
+    size_t n;
+    double p50_ms, p95_ms, p99_ms, max_ms;
+} LatencySummary;
+
+static LatencySummary summarize(std::vector<int32_t>& v) {
+    LatencySummary s = {v.size(), 0.0, 0.0, 0.0, 0.0};
+    if (v.empty()) return s;
+    std::sort(v.begin(), v.end());
+    auto rank = [&](double p) {
+        size_t idx = (size_t)(p * (double)v.size());
+        if (idx >= v.size()) idx = v.size() - 1;
+        return v[idx] / 1000.0;
+    };
+    s.p50_ms = rank(0.50);
+    s.p95_ms = rank(0.95);
+    s.p99_ms = rank(0.99);
+    s.max_ms = v.back() / 1000.0;
+    return s;
 }
 
-static bool feed_video_message_direct(const uint8_t* msg, size_t msg_len,
-                                      int32_t input_idx) {
-    if (!msg || msg_len < INTERNAL_VIDEO_HEADER_SIZE + 1 || input_idx < 0) {
-        return false;
-    }
+/* ---- Receiver backlog: report to the desktop and enforce the time budget ---- */
+static void backlog_tick() {
+    static int64_t last_report_us = 0;
+    static int over_budget_ticks = 0;
+    int64_t now = now_us();
+    if (now - last_report_us < kBacklogReportUs) return;
+    last_report_us = now;
 
-    uint8_t video_flags = msg[0];
-    AndroidFrameTelemetry frame_meta;
-    memcpy(&frame_meta, msg + 1, sizeof(frame_meta));
-    uint8_t* video_data = const_cast<uint8_t*>(msg + INTERNAL_VIDEO_HEADER_SIZE);
-    size_t nal_len = msg_len - INTERNAL_VIDEO_HEADER_SIZE;
+    uint32_t ring_bytes = (uint32_t)ring_buffer_available_read(g_ring_buf);
+    uint32_t ring_frames = g_ring_frames.load(std::memory_order_acquire);
+    uint32_t decoder_frames = g_decoder_inflight.load(std::memory_order_relaxed);
 
-    int is_config = 0;
-    uint32_t mc_flags =
-        media_codec_flags_from_video_flags(video_flags, &is_config);
-
-    if (is_config) {
-        patch_h264_config_for_decoder(video_data, &nal_len);
-    }
-
-    int64_t pts_us = reserve_frame_pts_us(is_config != 0);
-    if (!is_config) {
-        store_pending_telemetry(pts_us, &frame_meta);
-    }
-    int ret = -1;
-    {
-        std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-        if (g_decoder && g_decoder_configured.load(std::memory_order_acquire)) {
-            ret = decoder_feed_index(g_decoder, input_idx, video_data, nal_len,
-                                     pts_us, mc_flags);
+    uint8_t msg[DS_HEADER_SIZE + DS_BACKLOG_PAYLOAD_SIZE];
+    ds_header_t hdr;
+    hdr.type = DS_MSG_CONTROL;
+    hdr.flags = 0;
+    hdr.length = DS_BACKLOG_PAYLOAD_SIZE;
+    ds_header_serialize(msg, &hdr);
+    uint8_t* p = msg + DS_HEADER_SIZE;
+    p[0] = DS_CTRL_RECEIVER_BACKLOG;
+    const uint32_t vals[3] = {ring_bytes, ring_frames, decoder_frames};
+    for (int v = 0; v < 3; v++) {
+        for (int i = 0; i < 4; i++) {
+            p[1 + v * 4 + i] = (uint8_t)(vals[v] >> (8 * i));
         }
     }
+    outbound_enqueue(msg, sizeof(msg));
 
-    if (ret == 0) {
-        g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
-        if (!is_config) {
-            int64_t feed_us = now_us();
-            record_feed_latency(&frame_meta, feed_us);
+    /* Time budget: bytes waiting / receive rate (never below the negotiated
+     * bitrate). Must hold for two consecutive reports (>= 100 ms) so a single
+     * large IDR that is fed a moment later doesn't count. Over budget, skip to
+     * the next keyframe through the normal loss-recovery path. */
+    uint64_t rate = std::max(g_recv_rate_Bps.load(std::memory_order_relaxed),
+                             g_bitrate_floor_Bps.load(std::memory_order_relaxed));
+    int64_t backlog_ms = rate > 0 ? (int64_t)((uint64_t)ring_bytes * 1000u / rate) : 0;
+    if (backlog_ms > kBacklogBudgetMs) {
+        if (++over_budget_ticks >= 2 &&
+                !g_recovering_hint.load(std::memory_order_acquire)) {
+            LOGW("receiver backlog %lld ms (%u bytes, %u frames) over %lld ms budget",
+                 (long long)backlog_ms, ring_bytes, ring_frames,
+                 (long long)kBacklogBudgetMs);
+            enter_recovery(g_rx_seq.load(std::memory_order_acquire), false,
+                           "receiver backlog");
+            over_budget_ticks = 0;
         }
-        return true;
+    } else {
+        over_budget_ticks = 0;
     }
-
-    if (!is_config) {
-        remove_pending_telemetry(pts_us);
-        enter_recovery(g_rx_seq.load(std::memory_order_acquire), false, "direct feed failed");
-    }
-    g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
-    return false;
 }
+
+/* Recv thread: stop the decode thread from touching g_decoder and wait until
+ * it has. The decode thread never blocks for long (bounded MediaCodec waits),
+ * and holds no lock while doing so. */
+static void park_decode_thread() {
+    std::unique_lock<std::mutex> lock(g_decode_mutex);
+    g_decoder_configured.store(false, std::memory_order_release);
+    g_decode_signal = true;
+    g_decode_cv.notify_all();
+    g_park_cv.wait(lock, [] { return g_decode_parked; });
+}
+
+static bool decode_active() {
+    return g_running.load(std::memory_order_acquire) &&
+           g_decoder_configured.load(std::memory_order_acquire);
+}
+
+/* Sync mode input wait: the output thread frees buffers concurrently, so wait
+ * for one in slices (checking for session end) instead of giving up. */
+static constexpr int64_t kInputWaitSliceUs = 5000;
+static constexpr int64_t kInputWaitTotalUs = 40000;
 
 /* ---- Decode thread ----
- * Reads NAL units from ring buffer and feeds them to MediaCodec decoder.
- * Survives reconnections — pauses when decoder is unconfigured.
+ * Reads NAL units from the ring buffer and feeds them to MediaCodec.
+ * Survives reconnections — parks while the decoder is unconfigured.
  *
- * Two operation modes (selected automatically per-session):
+ *   ASYNC (non-Qualcomm): input indices come from MediaCodec callbacks
+ *     (decoder_pop_input); outputs are drained here (decoder_drain).
+ *   SYNC (Qualcomm): dequeueInputBuffer waits here; the decoder's own output
+ *     thread is the single consumer of dequeue/releaseOutputBuffer.
  *
- *   ASYNC (API 28+):  Event-driven via condition variable.
- *     MediaCodec callbacks + ring-buffer writes signal g_decode_cv.
- *     Uses decoder_pop_input() / decoder_feed_index() — zero polling.
- *
- *   SYNC (API 26-27): Burst-read ring buffer, feed with dequeueInputBuffer.
- *     Falls back to 50µs polling when idle.
- *
- * Both modes feed ALL NALs (never skip at input) and use decoder_drain()
- * for render-queue-depth=1 at the output level.
+ * Both: when there is nothing to do, wait on g_decode_cv (ring writes, async
+ * callbacks). Render-queue-depth=1 at the output.
  */
 static void* decode_thread_func(void* /*arg*/) {
     /* Set high priority */
@@ -1348,287 +1501,229 @@ static void* decode_thread_func(void* /*arg*/) {
     auto* nal_buf = static_cast<uint8_t*>(malloc(MAX_VIDEO_MSG_SIZE));
     if (!nal_buf) {
         LOGE("decode_thread: failed to allocate NAL buffer");
+        std::lock_guard<std::mutex> lock(g_decode_mutex);
+        g_decode_parked = true;
+        g_park_cv.notify_all();
         return nullptr;
     }
 
-    uint32_t frames_fed = 0;
-    uint32_t frames_rendered = 0;
-    uint32_t feed_errors = 0;
-    uint32_t frames_skipped = 0;
-    uint64_t last_logged_fed = 0;
-    int64_t last_log_us = now_us();
     int32_t held_async_input_idx = -1;
-    struct timespec ts_start, ts_now;
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    int64_t last_log_us = now_us();
+    uint64_t last_log_fed = 0;
+    uint64_t last_log_rendered = 0;
+    uint64_t last_log_cb = 0;
 
     while (g_running.load(std::memory_order_acquire)) {
-        /* Wait for decoder to be configured (pauses between reconnections) */
-        if (!g_decoder_configured.load(std::memory_order_acquire)) {
-            usleep(1000);
-            frames_fed = 0;
-            frames_rendered = 0;
-            feed_errors = 0;
-            frames_skipped = 0;
-            last_logged_fed = 0;
-            last_log_us = now_us();
-            held_async_input_idx = -1;
-            g_next_pts_us.store(0, std::memory_order_relaxed);
-            clock_gettime(CLOCK_MONOTONIC, &ts_start);
-            continue;
+        /* Park between sessions; the recv thread waits for g_decode_parked
+         * before it destroys or recreates the decoder. */
+        {
+            std::unique_lock<std::mutex> lock(g_decode_mutex);
+            if (!g_decoder_configured.load(std::memory_order_acquire)) {
+                if (!g_decode_parked) {
+                    g_decode_parked = true;
+                    held_async_input_idx = -1;
+                    g_park_cv.notify_all();
+                }
+                g_decode_cv.wait_for(lock, std::chrono::milliseconds(100), [] {
+                    return g_decoder_configured.load(std::memory_order_acquire) ||
+                           !g_running.load(std::memory_order_acquire);
+                });
+                if (g_decoder_configured.load(std::memory_order_acquire)) {
+                    /* New session: fresh counters for the log window. */
+                    last_log_us = now_us();
+                    last_log_fed = 0;
+                    last_log_rendered = 0;
+                    last_log_cb = 0;
+                }
+                continue;
+            }
+            g_decode_parked = false;
         }
 
-        bool is_async = decoder_is_async(g_decoder);
+        DecoderContext* decoder = g_decoder;
+        bool is_async = decoder_is_async(decoder);
         bool any_work = false;
         recovery_tick();
+        backlog_tick();
 
-        /* ---- 1. Drain output (both modes) ---- */
-        int64_t rendered_pts_us = -1;
-        int r = 0;
-        {
-            std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-            r = decoder_drain(g_decoder, &rendered_pts_us);
-        }
-        if (r > 0) {
-            frames_rendered += r;
-            g_stats_frames_decoded.fetch_add(r, std::memory_order_relaxed);
-            record_release_latency(rendered_pts_us, now_us());
+        /* ---- 1. Drain output (async only; sync has its output thread) ---- */
+        if (is_async && decoder_drain(decoder) > 0) {
             any_work = true;
         }
 
         /* ---- 2. Feed NALs from ring buffer ---- */
-        if (is_async) {
-            /* ASYNC: use pre-dequeued input indices from callbacks */
-            while (g_running.load(std::memory_order_acquire)) {
-                int32_t input_idx = held_async_input_idx;
+        while (decode_active()) {
+            backlog_tick();  /* a long burst must not starve the 10 Hz report */
+            int32_t input_idx = -1;
+            if (is_async) {
+                input_idx = held_async_input_idx;
                 if (input_idx >= 0) {
                     held_async_input_idx = -1;
                 } else {
-                    std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-                    input_idx = g_decoder ? decoder_pop_input(g_decoder) : -1;
+                    input_idx = decoder_pop_input(decoder);
                 }
                 if (input_idx < 0) break;  /* no input buffer available */
+            }
 
-                size_t msg_len = ring_buffer_read_message(
-                    g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
-                if (msg_len < INTERNAL_VIDEO_HEADER_SIZE + 1) {
-                    /* Keep the dequeued input buffer for the next real NAL.
-                     * Queueing empty buffers adds avoidable MediaCodec work. */
-                    held_async_input_idx = input_idx;
-                    break;
+            size_t msg_len = ring_buffer_read_message(
+                g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
+            if (msg_len < INTERNAL_VIDEO_HEADER_SIZE + 1) {
+                /* Keep a dequeued async input buffer for the next real NAL.
+                 * Queueing empty buffers adds avoidable MediaCodec work. */
+                if (is_async) held_async_input_idx = input_idx;
+                break;
+            }
+            g_ring_frames.fetch_sub(1, std::memory_order_acq_rel);
+            any_work = true;
+
+            uint8_t video_flags = nal_buf[0];
+            AndroidFrameTelemetry frame_meta;
+            memcpy(&frame_meta, nal_buf + 1, sizeof(frame_meta));
+            uint8_t* video_data = nal_buf + INTERNAL_VIDEO_HEADER_SIZE;
+            size_t nal_len = msg_len - INTERNAL_VIDEO_HEADER_SIZE;
+
+            int is_config = 0;
+            uint32_t mc_flags =
+                media_codec_flags_from_video_flags(video_flags, &is_config);
+
+            if (is_config) {
+                patch_h264_config_for_decoder(video_data, &nal_len);
+            }
+            const bool is_key = (mc_flags & MC_BUFFER_FLAG_KEY_FRAME) != 0;
+            if (!is_config && !is_key &&
+                    g_recovering_hint.load(std::memory_order_acquire)) {
+                if (is_async) held_async_input_idx = input_idx;  /* reuse it */
+                g_stats_frames_skipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            if (!is_async) {
+                for (int64_t waited = 0;
+                        input_idx < 0 && waited < kInputWaitTotalUs && decode_active();
+                        waited += kInputWaitSliceUs) {
+                    input_idx = decoder_dequeue_input(decoder, kInputWaitSliceUs);
                 }
-                any_work = true;
+            }
 
-                uint8_t video_flags = nal_buf[0];
-                AndroidFrameTelemetry frame_meta;
-                memcpy(&frame_meta, nal_buf + 1, sizeof(frame_meta));
-                uint8_t* video_data = nal_buf + INTERNAL_VIDEO_HEADER_SIZE;
-                size_t nal_len = msg_len - INTERNAL_VIDEO_HEADER_SIZE;
-
-                int is_config = 0;
-                uint32_t mc_flags =
-                    media_codec_flags_from_video_flags(video_flags, &is_config);
-
-                if (is_config) {
-                    patch_h264_config_for_decoder(video_data, &nal_len);
-                }
-                const bool is_key = (mc_flags & MC_BUFFER_FLAG_KEY_FRAME) != 0;
-                if (!is_config && !is_key &&
-                        g_recovering_hint.load(std::memory_order_acquire)) {
-                    held_async_input_idx = input_idx;  /* reuse for the next NAL */
-                    frames_skipped++;
-                    g_stats_frames_skipped.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-
-                int64_t pts_us = reserve_frame_pts_us(is_config != 0);
+            int64_t pts_us = reserve_frame_pts_us(is_config != 0);
+            if (!is_config) {
+                store_pending_telemetry(pts_us, &frame_meta);
+            }
+            int ret = input_idx >= 0
+                ? decoder_feed_index(decoder, input_idx, video_data, nal_len,
+                                     pts_us, mc_flags)
+                : -1;
+            if (ret == 0) {
+                g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
+                on_packet_fed(frame_meta.rx_seq, is_config != 0, is_key);
                 if (!is_config) {
-                    store_pending_telemetry(pts_us, &frame_meta);
+                    record_fed_frame(&frame_meta);
                 }
-                int ret = -1;
-                {
-                    std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-                    ret = decoder_feed_index(g_decoder, input_idx,
-                                             video_data, nal_len,
-                                             pts_us, mc_flags);
-                }
-                if (ret == 0) {
-                    frames_fed++;
-                    g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
-                    on_packet_fed(frame_meta.rx_seq, is_config != 0, is_key);
-                    if (!is_config) {
-                        int64_t feed_us = now_us();
-                        record_feed_latency(&frame_meta, feed_us);
-                    }
-                } else {
-                    if (!is_config) {
-                        remove_pending_telemetry(pts_us);
-                    }
-                    /* Config loss too: later frames can't decode without it. */
-                    enter_recovery(frame_meta.rx_seq, is_config != 0,
-                                   is_config ? "async config feed failed" : "async feed failed");
-                    feed_errors++;
-                    g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
-                }
-
-            }
-        } else {
-            /* SYNC: burst-read ring buffer, dequeue input buffers inline */
-            while (g_running.load(std::memory_order_acquire)) {
-                size_t msg_len = ring_buffer_read_message(
-                    g_ring_buf, nal_buf, MAX_VIDEO_MSG_SIZE);
-                if (msg_len < INTERNAL_VIDEO_HEADER_SIZE + 1) break;
-                any_work = true;
-
-                uint8_t video_flags = nal_buf[0];
-                AndroidFrameTelemetry frame_meta;
-                memcpy(&frame_meta, nal_buf + 1, sizeof(frame_meta));
-                uint8_t* video_data = nal_buf + INTERNAL_VIDEO_HEADER_SIZE;
-                size_t nal_len = msg_len - INTERNAL_VIDEO_HEADER_SIZE;
-
-                int is_config = 0;
-                uint32_t mc_flags =
-                    media_codec_flags_from_video_flags(video_flags, &is_config);
-
-                if (is_config) {
-                    patch_h264_config_for_decoder(video_data, &nal_len);
-                }
-                const bool is_key = (mc_flags & MC_BUFFER_FLAG_KEY_FRAME) != 0;
-                if (!is_config && !is_key &&
-                        g_recovering_hint.load(std::memory_order_acquire)) {
-                    frames_skipped++;
-                    g_stats_frames_skipped.fetch_add(1, std::memory_order_relaxed);
-                    continue;
-                }
-
-                int64_t pts_us = reserve_frame_pts_us(is_config != 0);
-                if (!is_config) {
-                    store_pending_telemetry(pts_us, &frame_meta);
-                }
-                /* Wi-Fi delivers frames in bursts; all decoder input buffers
-                 * can be momentarily busy. Instead of dropping the frame
-                 * (which corrupts the stream until the next IDR), render what
-                 * is decoded to free a buffer and retry for a few ms. */
-                int ret = -1;
-                for (int attempt = 0; attempt < 6; ++attempt) {
-                    {
-                        std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-                        ret = decoder_feed(g_decoder, video_data, nal_len,
-                                           pts_us, mc_flags);
-                    }
-                    if (ret == 0 || !g_running.load(std::memory_order_acquire)) break;
-                    int64_t rp = -1;
-                    int rr = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-                        if (g_decoder) rr = decoder_drain_wait(g_decoder, 2000, &rp);
-                    }
-                    if (rr > 0) {
-                        frames_rendered += rr;
-                        g_stats_frames_decoded.fetch_add(rr, std::memory_order_relaxed);
-                        record_release_latency(rp, now_us());
-                    }
-                }
-                if (ret != 0) {
-                    /* Config loss too: later frames can't decode without it. */
-                    enter_recovery(frame_meta.rx_seq, is_config != 0,
-                                   is_config ? "config feed failed" : "decoder input busy");
-                }
-                if (ret == 0) {
-                    frames_fed++;
-                    g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
-                    on_packet_fed(frame_meta.rx_seq, is_config != 0, is_key);
-                    if (!is_config) {
-                        int64_t feed_us = now_us();
-                        record_feed_latency(&frame_meta, feed_us);
-                    }
-                } else {
-                    if (!is_config) {
-                        remove_pending_telemetry(pts_us);
-                    }
-                    feed_errors++;
-                    g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
-                }
-
-            }
-        }
-
-        /* ---- 3. Drain again after feeding ---- */
-        if (any_work) {
-            rendered_pts_us = -1;
-            {
-                std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-                r = decoder_drain(g_decoder, &rendered_pts_us);
-            }
-            if (r > 0) {
-                frames_rendered += r;
-                g_stats_frames_decoded.fetch_add(r, std::memory_order_relaxed);
-                record_release_latency(rendered_pts_us, now_us());
-            }
-        }
-
-        /* ---- 4. Wait for next event ---- */
-        if (!any_work) {
-            if (is_async) {
-                /* Event-driven: async callbacks + ring writes signal the CV. */
-                std::unique_lock<std::mutex> lock(g_decode_mutex);
-                g_decode_cv.wait_for(lock, std::chrono::milliseconds(1));
             } else {
-                /* Sync: block *on the decoder output* so we render the instant a
-                 * frame is ready (near-zero render latency) while sleeping in the
-                 * kernel — not busy-polling. This both cuts render latency and
-                 * frees the core, so the (unpinned) recv_thread is no longer
-                 * starved as it was by the old 50us spin (~20k polls/s). The next
-                 * NAL from recv_thread is picked up on the following iteration;
-                 * at streaming frame rates the inter-frame gap (>=8ms) exceeds
-                 * this wait, so it adds no measurable input latency. */
-                int64_t rp = -1;
-                int r2 = 0;
-                {
-                    std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-                    if (g_decoder) r2 = decoder_drain_wait(g_decoder, 4000, &rp);
+                if (!is_config) {
+                    remove_pending_telemetry(pts_us);
                 }
-                if (r2 > 0) {
-                    frames_rendered += r2;
-                    g_stats_frames_decoded.fetch_add(r2, std::memory_order_relaxed);
-                    record_release_latency(rp, now_us());
-                }
+                if (!decode_active()) break;  /* session ending, not a loss */
+                /* Config loss too: later frames can't decode without it. */
+                const char* why = is_config
+                    ? "config feed failed"
+                    : (input_idx < 0 ? "decoder input busy" : "feed failed");
+                enter_recovery(frame_meta.rx_seq, is_config != 0, why);
+                g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
-        /* ---- 5. Stats logging ---- */
-        uint64_t total_fed = g_stats_frames_fed.load(std::memory_order_relaxed);
+        /* ---- 3. Drain again after feeding (async) ---- */
+        if (any_work && is_async) {
+            decoder_drain(decoder);
+        }
+
+        /* ---- 4. Wait for the next event ---- */
+        if (!any_work) {
+            std::unique_lock<std::mutex> lock(g_decode_mutex);
+            g_decode_cv.wait_for(
+                lock, std::chrono::milliseconds(is_async ? 1 : 10), [] {
+                    return g_decode_signal ||
+                           !g_decoder_configured.load(std::memory_order_acquire) ||
+                           !g_running.load(std::memory_order_acquire);
+                });
+            g_decode_signal = false;
+        }
+
+        /* ---- 5. Stats log (~2 s window, every frame of the window) ---- */
         int64_t log_us = now_us();
-        if (total_fed > 0 && total_fed != last_logged_fed &&
-                log_us - last_log_us >= 2000000) {
-            last_logged_fed = total_fed;
-            last_log_us = log_us;
+        uint64_t total_fed = g_stats_frames_fed.load(std::memory_order_relaxed);
+        if (log_us - last_log_us >= 2000000 && total_fed != last_log_fed) {
+            double elapsed = (log_us - last_log_us) / 1e6;
             uint64_t total_rendered =
-                g_stats_frames_decoded.load(std::memory_order_relaxed);
-            clock_gettime(CLOCK_MONOTONIC, &ts_now);
-            double elapsed = (ts_now.tv_sec - ts_start.tv_sec)
-                           + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
+                g_stats_frames_rendered.load(std::memory_order_relaxed);
+            uint64_t total_cb = g_stats_render_callbacks.load(std::memory_order_relaxed);
+
+            LatencyWindow w;
+            {
+                std::lock_guard<std::mutex> lock(g_lat_mutex);
+                std::swap(w, g_lat_window);
+                /* Keep the capacity: no reallocations in the render callback. */
+                g_lat_window.comp_render_us.reserve(w.comp_render_us.capacity());
+                g_lat_window.send_render_us.reserve(w.send_render_us.capacity());
+                g_lat_window.recv_render_us.reserve(w.recv_render_us.capacity());
+            }
+            LatencySummary comp = summarize(w.comp_render_us);
+            LatencySummary send = summarize(w.send_render_us);
+            LatencySummary recv = summarize(w.recv_render_us);
+            g_stats_comp_render_p50_us.store((int64_t)(comp.p50_ms * 1000), std::memory_order_relaxed);
+            g_stats_send_render_p50_us.store((int64_t)(send.p50_ms * 1000), std::memory_order_relaxed);
+            g_stats_recv_render_p50_us.store((int64_t)(recv.p50_ms * 1000), std::memory_order_relaxed);
+
+            uint64_t expired;
+            {
+                std::lock_guard<std::mutex> lock(g_pending_telemetry_mutex);
+                expired = g_pending_expired;
+            }
             size_t ring_used = ring_buffer_available_read(g_ring_buf);
-            LOGI("decode[%s]: fed=%u rendered=%u err=%u | "
-                 "%.1f fed/s %.1f render/s idle=%llu | ring=%zu bytes | "
-                 "lat feed=%.1fms release=%.1fms desk=%.1fms android=%.1fms rtt=%.1fms "
-                 "capenc=%.1fms encsend=%.1fms skip=%u",
+            uint64_t rate = std::max(g_recv_rate_Bps.load(std::memory_order_relaxed),
+                                     g_bitrate_floor_Bps.load(std::memory_order_relaxed));
+
+            LOGI("decode[%s]: fed=%llu rendered=%llu err=%llu | "
+                 "%.1f fed/s %.1f render/s idle=%llu skip=%llu | "
+                 "ring=%zu bytes %u frames %.0fms dec=%u | "
+                 "comp_render n=%zu p50=%.1f p95=%.1f p99=%.1f max=%.1f | "
+                 "send_render n=%zu p50=%.1f p95=%.1f p99=%.1f max=%.1f | "
+                 "recv_render n=%zu p50=%.1f p95=%.1f p99=%.1f max=%.1f | "
+                 "clock_unc=%.2fms rtt=%.1fms capsend=%.1fms | cb=%llu expired=%llu",
                  is_async ? "async" : "sync",
-                 (unsigned)total_fed, (unsigned)total_rendered, feed_errors,
-                 total_fed / elapsed, total_rendered / elapsed,
+                 (unsigned long long)total_fed, (unsigned long long)total_rendered,
+                 (unsigned long long)g_stats_feed_errors.load(std::memory_order_relaxed),
+                 (total_fed - last_log_fed) / elapsed,
+                 (total_rendered - last_log_rendered) / elapsed,
                  (unsigned long long)g_stats_idle_frames.load(std::memory_order_relaxed),
-                 ring_used,
-                 g_stats_latency_to_feed_us.load(std::memory_order_relaxed) / 1000.0,
-                 g_stats_latency_to_release_us.load(std::memory_order_relaxed) / 1000.0,
-                 g_stats_desktop_capture_to_send_us.load(std::memory_order_relaxed) / 1000.0,
-                 g_stats_android_recv_to_release_us.load(std::memory_order_relaxed) / 1000.0,
+                 (unsigned long long)g_stats_frames_skipped.load(std::memory_order_relaxed),
+                 ring_used, g_ring_frames.load(std::memory_order_relaxed),
+                 rate > 0 ? ring_used * 1000.0 / rate : 0.0,
+                 g_decoder_inflight.load(std::memory_order_relaxed),
+                 comp.n, comp.p50_ms, comp.p95_ms, comp.p99_ms, comp.max_ms,
+                 send.n, send.p50_ms, send.p95_ms, send.p99_ms, send.max_ms,
+                 recv.n, recv.p50_ms, recv.p95_ms, recv.p99_ms, recv.max_ms,
+                 g_stats_clock_uncertainty_us.load(std::memory_order_relaxed) / 1000.0,
                  g_stats_video_rtt_us.load(std::memory_order_relaxed) / 1000.0,
-                 g_stats_desktop_capture_to_encode_us.load(std::memory_order_relaxed) / 1000.0,
-                 g_stats_desktop_encode_to_send_us.load(std::memory_order_relaxed) / 1000.0,
-                 frames_skipped);
+                 g_stats_desktop_capture_to_send_us.load(std::memory_order_relaxed) / 1000.0,
+                 (unsigned long long)(total_cb - last_log_cb),
+                 (unsigned long long)expired);
+
+            last_log_us = log_us;
+            last_log_fed = total_fed;
+            last_log_rendered = total_rendered;
+            last_log_cb = total_cb;
         }
     }
 
     free(nal_buf);
+    {
+        /* Never leave the recv thread waiting in park_decode_thread. */
+        std::lock_guard<std::mutex> lock(g_decode_mutex);
+        g_decode_parked = true;
+    }
+    g_park_cv.notify_all();
     LOGI("decode_thread: exiting");
     return nullptr;
 }
@@ -1754,6 +1849,7 @@ Java_com_droidscreen_app_MainActivity_nativeInit(
     g_decoder_configured.store(false, std::memory_order_release);
 
     /* Spawn threads */
+    outbound_start();
     pthread_create(&g_recv_thread, nullptr, recv_thread_func, nullptr);
     pthread_create(&g_decode_thread, nullptr, decode_thread_func, nullptr);
 
@@ -1788,17 +1884,16 @@ Java_com_droidscreen_app_MainActivity_nativeStop(
         g_server_fd = -1;
     }
 
-    /* Join threads */
+    /* Join threads (wake the decode thread if it is waiting) */
+    g_decode_cv.notify_all();
     pthread_join(g_recv_thread, nullptr);
     pthread_join(g_decode_thread, nullptr);
+    outbound_stop();
 
-    /* Cleanup decoder */
-    {
-        std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-        if (g_decoder) {
-            decoder_destroy(g_decoder);
-            g_decoder = nullptr;
-        }
+    /* Cleanup decoder: both threads are gone, nobody else touches it. */
+    if (g_decoder) {
+        decoder_destroy(g_decoder);
+        g_decoder = nullptr;
     }
 
     /* Cleanup ring buffer */
@@ -1845,19 +1940,19 @@ Java_com_droidscreen_app_MainActivity_nativeStop(
     LOGI("nativeStop: stopped");
 }
 
+/* Input and Deck/volume: built and stamped here (UI thread), sent in order
+ * by the outbound sender thread. These calls never block on the socket. */
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendTouch(
         JNIEnv* /*env*/, jobject /*thiz*/,
         jint action, jint pointerId, jint xFrac, jint yFrac,
         jint pressure, jint touchMajor, jint touchMinor,
         jint orientation) {
-
-    if (g_client_fd < 0) {
-        return;
-    }
-
-    touch_sender_send(g_client_fd, action, pointerId, xFrac, yFrac, pressure,
-                      touchMajor, touchMinor, orientation);
+    if (!outbound_connected()) return;
+    uint8_t msg[DS_OUTBOUND_MAX_MSG];
+    size_t len = touch_build(msg, action, pointerId, xFrac, yFrac, pressure,
+                             touchMajor, touchMinor, orientation);
+    outbound_enqueue(msg, len);
 }
 
 JNIEXPORT void JNICALL
@@ -1866,43 +1961,49 @@ Java_com_droidscreen_app_MainActivity_nativeSendPen(
         jint action, jint pointerId, jint toolType, jint buttons,
         jint xFrac, jint yFrac, jint pressure,
         jint distance, jint tilt, jint rotation) {
-
-    if (g_client_fd < 0) {
-        return;
-    }
-
-    pen_sender_send(g_client_fd, action, pointerId, toolType, buttons,
-                    xFrac, yFrac, pressure, distance, tilt, rotation);
+    if (!outbound_connected()) return;
+    uint8_t msg[DS_OUTBOUND_MAX_MSG];
+    size_t len = pen_build(msg, action, pointerId, toolType, buttons,
+                           xFrac, yFrac, pressure, distance, tilt, rotation);
+    outbound_enqueue(msg, len);
 }
 
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendMouse(
         JNIEnv* /*env*/, jobject /*thiz*/,
         jint action, jint buttons, jint xFrac, jint yFrac) {
-
-    if (g_client_fd < 0) {
-        return;
-    }
-
-    mouse_sender_send(g_client_fd, action, buttons, xFrac, yFrac);
+    if (!outbound_connected()) return;
+    uint8_t msg[DS_OUTBOUND_MAX_MSG];
+    size_t len = mouse_build(msg, action, buttons, xFrac, yFrac);
+    outbound_enqueue(msg, len);
 }
 
+/*
+ * Stats for the UI (index -> meaning, must match MainActivity):
+ *   0 bytes received        1 frames rendered (releases)   2 frames fed
+ *   3 feed errors           4 arrival jitter us (smoothed)  5 frame interval us
+ *   6 frames skipped        7 compositor->render p50 us     8 desktop send->render p50 us
+ *   9 desktop capture->send us (last frame)                10 Android recv->render p50 us
+ *  11 clock offset uncertainty us                          12 RTT us (last frame)
+ *  13 idle frames
+ * The p50 values cover the last ~2 s log window; 0 = no samples.
+ */
 JNIEXPORT jlongArray JNICALL
 Java_com_droidscreen_app_MainActivity_nativeGetStats(
         JNIEnv* env, jobject /*thiz*/) {
     jlong stats[14];
     stats[0] = static_cast<jlong>(g_stats_bytes_received.load(std::memory_order_relaxed));
-    stats[1] = static_cast<jlong>(g_stats_frames_decoded.load(std::memory_order_relaxed));
+    stats[1] = static_cast<jlong>(g_stats_frames_rendered.load(std::memory_order_relaxed));
     stats[2] = static_cast<jlong>(g_stats_frames_fed.load(std::memory_order_relaxed));
     stats[3] = static_cast<jlong>(g_stats_feed_errors.load(std::memory_order_relaxed));
     stats[4] = static_cast<jlong>(g_stats_frame_jitter_us.load(std::memory_order_relaxed));
     stats[5] = static_cast<jlong>(g_stream_frame_interval_us.load(std::memory_order_relaxed));
     stats[6] = static_cast<jlong>(g_stats_frames_skipped.load(std::memory_order_relaxed));
-    stats[7] = static_cast<jlong>(g_stats_latency_to_feed_us.load(std::memory_order_relaxed));
-    stats[8] = static_cast<jlong>(g_stats_latency_to_release_us.load(std::memory_order_relaxed));
+    stats[7] = static_cast<jlong>(g_stats_comp_render_p50_us.load(std::memory_order_relaxed));
+    stats[8] = static_cast<jlong>(g_stats_send_render_p50_us.load(std::memory_order_relaxed));
     stats[9] = static_cast<jlong>(g_stats_desktop_capture_to_send_us.load(std::memory_order_relaxed));
-    stats[10] = static_cast<jlong>(g_stats_android_recv_to_feed_us.load(std::memory_order_relaxed));
-    stats[11] = static_cast<jlong>(g_stats_android_recv_to_release_us.load(std::memory_order_relaxed));
+    stats[10] = static_cast<jlong>(g_stats_recv_render_p50_us.load(std::memory_order_relaxed));
+    stats[11] = static_cast<jlong>(g_stats_clock_uncertainty_us.load(std::memory_order_relaxed));
     stats[12] = static_cast<jlong>(g_stats_video_rtt_us.load(std::memory_order_relaxed));
     stats[13] = static_cast<jlong>(g_stats_idle_frames.load(std::memory_order_relaxed));
 
@@ -1915,24 +2016,20 @@ JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendDeckAction(
         JNIEnv* /*env*/, jobject /*thiz*/,
         jint actionType, jint slotIndex) {
-
-    if (g_client_fd < 0) {
-        return;
-    }
-
-    deck_action_send(g_client_fd, actionType, slotIndex);
+    if (!outbound_connected()) return;
+    uint8_t msg[DS_OUTBOUND_MAX_MSG];
+    size_t len = deck_action_build(msg, actionType, slotIndex);
+    outbound_enqueue(msg, len);
 }
 
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendVolumeChange(
         JNIEnv* /*env*/, jobject /*thiz*/,
         jint volume, jint muted) {
-
-    if (g_client_fd < 0) {
-        return;
-    }
-
-    volume_change_send(g_client_fd, volume, muted);
+    if (!outbound_connected()) return;
+    uint8_t msg[DS_OUTBOUND_MAX_MSG];
+    size_t len = volume_change_build(msg, volume, muted);
+    outbound_enqueue(msg, len);
 }
 
 /* Soft keyboard text. Kotlin passes UTF-8 bytes (not jstring: JNI's modified
@@ -1940,7 +2037,7 @@ Java_com_droidscreen_app_MainActivity_nativeSendVolumeChange(
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendKeyText(
         JNIEnv* env, jobject /*thiz*/, jbyteArray utf8) {
-    if (g_client_fd < 0 || utf8 == nullptr) {
+    if (!outbound_connected() || utf8 == nullptr) {
         return;
     }
     jsize len = env->GetArrayLength(utf8);
@@ -1951,17 +2048,15 @@ Java_com_droidscreen_app_MainActivity_nativeSendKeyText(
     if (bytes == nullptr) {
         return;
     }
-    key_text_send(g_client_fd, reinterpret_cast<const char*>(bytes), (size_t)len);
+    key_text_enqueue(reinterpret_cast<const char*>(bytes), (size_t)len);
     env->ReleaseByteArrayElements(utf8, bytes, JNI_ABORT);
 }
 
 JNIEXPORT void JNICALL
 Java_com_droidscreen_app_MainActivity_nativeSendKey(
         JNIEnv* /*env*/, jobject /*thiz*/, jint key, jint modifiers) {
-    if (g_client_fd < 0) {
-        return;
-    }
-    key_special_send(g_client_fd, key, modifiers);
+    if (!outbound_connected()) return;
+    key_special_enqueue(key, modifiers);
 }
 
 } /* extern "C" */

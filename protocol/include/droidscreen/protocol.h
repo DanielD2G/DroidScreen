@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 /* Protocol version */
-#define DS_PROTOCOL_VERSION  9
+#define DS_PROTOCOL_VERSION  10
 
 /* Default TCP port */
 #define DS_DEFAULT_PORT      38271
@@ -64,8 +64,28 @@ typedef enum {
     DS_CTRL_DISCONNECT         = 0x04,
     DS_CTRL_DISPLAY_OFF        = 0x05,
     DS_CTRL_DISPLAY_ON         = 0x06,
-    DS_CTRL_SPEED_TEST         = 0x07
+    DS_CTRL_SPEED_TEST         = 0x07,
+    /* Android -> desktop, ~10 Hz: receive backlog, see DS_BACKLOG_* below. */
+    DS_CTRL_RECEIVER_BACKLOG   = 0x08
 } ds_ctrl_type_t;
+
+/*
+ * DS_CTRL_RECEIVER_BACKLOG payload (little-endian, after the ctrl byte):
+ *   u32 ring_bytes      compressed video waiting in the Android ring buffer
+ *   u32 ring_frames     video messages waiting in the ring buffer
+ *   u32 decoder_frames  frames fed to MediaCodec but not yet released
+ */
+#define DS_BACKLOG_PAYLOAD_SIZE 13u  /* 1 ctrl byte + 3 x u32 */
+
+/*
+ * PING / PONG payloads (little-endian), used for RTT and for the
+ * desktop<->Android clock offset:
+ *   PING: u64 desktop_send_us   (desktop steady clock)
+ *   PONG: u64 desktop_send_us   (echoed from the PING)
+ *         u64 android_now_us    (Android CLOCK_MONOTONIC when answering)
+ */
+#define DS_PING_PAYLOAD_SIZE 8u
+#define DS_PONG_PAYLOAD_SIZE 16u
 
 /*
  * Wire header: 6 bytes, little-endian

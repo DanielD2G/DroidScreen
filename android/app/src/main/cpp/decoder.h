@@ -1,9 +1,11 @@
 /*
- * DroidScreen - H.264 hardware decoder using Android NDK MediaCodec
+ * DroidScreen - H.264/HEVC hardware decoder using Android NDK MediaCodec
  *
- * Supports two operation modes:
- *   - Sync mode (API 26+): polling-based dequeue (fallback)
- *   - Async mode (API 28+): callback-driven, event-based (preferred)
+ * Two operation modes, chosen per codec (never mixed):
+ *   - Sync (Qualcomm): the feed thread dequeues input buffers; a dedicated
+ *     output thread owned by the decoder is the only caller of
+ *     dequeueOutputBuffer/releaseOutputBuffer.
+ *   - Async (others): MediaCodec callbacks; the decode thread drains outputs.
  */
 
 #ifndef DROIDSCREEN_DECODER_H
@@ -31,7 +33,22 @@ typedef enum {
  * Used to wake the decode thread from its wait instead of polling.
  */
 typedef void (*decoder_wakeup_fn)(void *userdata);
-typedef void (*decoder_rendered_fn)(void *userdata, int64_t pts_us);
+
+/*
+ * Called for every output buffer the decoder releases, in release order:
+ * rendered = true for the one sent to the surface, false for older outputs
+ * dropped by the render-queue-depth=1 policy. Sync mode: output thread.
+ * Async mode: decode thread.
+ */
+typedef void (*decoder_released_fn)(void *userdata, int64_t pts_us, bool rendered);
+
+/*
+ * MediaCodec onFrameRendered (API 33): the frame with this PTS reached the
+ * display at system_nano (CLOCK_MONOTONIC). Fired on an NDK internal thread;
+ * can be batched, delayed or missing for some frames.
+ */
+typedef void (*decoder_frame_rendered_fn)(void *userdata, int64_t pts_us,
+                                          int64_t system_nano);
 
 typedef struct DecoderContext DecoderContext;
 
@@ -61,14 +78,12 @@ DecoderContext* decoder_create(ANativeWindow *window,
 void decoder_set_wakeup(DecoderContext *ctx, decoder_wakeup_fn fn, void *userdata);
 
 /*
- * Optional low-latency async-output callback. When render_in_callback is true,
- * async MediaCodec output buffers are rendered immediately from the MediaCodec
- * callback thread and this callback receives the rendered PTS.
+ * Output observers. Must be called BEFORE decoder_configure.
  */
-void decoder_set_rendered_callback(DecoderContext *ctx,
-                                   decoder_rendered_fn fn,
-                                   void *userdata,
-                                   bool render_in_callback);
+void decoder_set_output_callbacks(DecoderContext *ctx,
+                                  decoder_released_fn released_fn,
+                                  decoder_frame_rendered_fn frame_rendered_fn,
+                                  void *userdata);
 
 /*
  * Set the render mode (default: RENDER_MODE_LOWEST_LATENCY).
@@ -77,8 +92,8 @@ void decoder_set_rendered_callback(DecoderContext *ctx,
 void decoder_set_render_mode(DecoderContext *ctx, DecoderRenderMode mode);
 
 /*
- * Configure the codec for the given resolution.
- * On API 28+, enables async callbacks if a wakeup function was set.
+ * Configure and start the codec for the given resolution. Async callbacks
+ * for non-Qualcomm codecs; sync mode starts the output thread.
  * Returns 0 on success, -1 on error.
  */
 int decoder_configure(DecoderContext *ctx, int width, int height, int fps);
@@ -89,22 +104,16 @@ int decoder_configure(DecoderContext *ctx, int width, int height, int fps);
 bool decoder_is_async(DecoderContext *ctx);
 
 /*
- * Feed a NAL unit to the decoder (sync mode).
- * Dequeues an input buffer (short timeout), copies data, and queues it.
- * Returns 0 on success, -1 if no buffer available or error.
- */
-int decoder_feed(DecoderContext *ctx, const uint8_t *nal_data, size_t nal_len,
-                 int64_t timestamp_us, uint32_t flags);
-
-/*
- * Dequeue an input buffer without copying/queueing it.
- * Used by low-latency paths that can fall back if no buffer is ready.
+ * Sync mode: dequeue an input buffer, waiting up to timeout_us (the output
+ * thread frees buffers concurrently). Blocking MediaCodec call: never call it
+ * while holding a lock other threads need.
+ * Returns the index, or -1 if none became available.
  */
 int32_t decoder_dequeue_input(DecoderContext *ctx, int64_t timeout_us);
 
 /*
- * Feed a NAL unit using a pre-dequeued input buffer index (async mode).
- * The index comes from the onAsyncInputAvailable callback.
+ * Copy a NAL unit into a dequeued input buffer and queue it (both modes;
+ * async indices come from onAsyncInputAvailable via decoder_pop_input).
  * Returns 0 on success, -1 on error.
  */
 int decoder_feed_index(DecoderContext *ctx, int32_t index,
@@ -118,27 +127,17 @@ int decoder_feed_index(DecoderContext *ctx, int32_t index,
 int32_t decoder_pop_input(DecoderContext *ctx);
 
 /*
- * Drain all available output buffers.
- *
- * Sync mode: polls with dequeueOutputBuffer(timeout=0).
- * Async mode: drains from the internal output queue filled by callbacks.
- *
- * Render queue depth = 1 policy: drops every frame except the newest,
- * renders only that one.  Returns 0 or 1.
+ * Async mode only: drain the output queue filled by the callbacks.
+ * Render queue depth = 1: every output but the newest is released without
+ * rendering, the newest is rendered. Returns 1 if a frame was rendered.
+ * Sync mode returns 0 (the output thread owns the outputs).
  */
-int decoder_drain(DecoderContext *ctx, int64_t *rendered_pts_us);
+int decoder_drain(DecoderContext *ctx);
 
 /*
- * Like decoder_drain, but in sync mode the first dequeueOutputBuffer blocks up
- * to timeout_us so the decode thread wakes the instant a frame is ready (low
- * render latency, no busy-poll). In async mode this is identical to
- * decoder_drain. Returns 0 or 1.
- */
-int decoder_drain_wait(DecoderContext *ctx, int64_t timeout_us,
-                       int64_t *rendered_pts_us);
-
-/*
- * Stop and destroy the decoder. Releases all resources.
+ * Stop and destroy the decoder. Stops, wakes and joins the sync output thread
+ * first, then stops and deletes the codec. The caller must make sure no other
+ * thread is still inside a decoder_* call.
  */
 void decoder_destroy(DecoderContext *ctx);
 

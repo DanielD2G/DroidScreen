@@ -44,9 +44,9 @@ public:
     bool init(uint32_t w, uint32_t h,
               int32_t ox = 0, int32_t oy = 0) override;
 
-    /// Set the target display.  map_to_screen() will query
-    /// CGDisplayBounds at event time for correct coordinates
-    /// regardless of HiDPI, scaling, or resolution changes.
+    /// Set the target display.  map_to_screen() uses its CGDisplayBounds,
+    /// cached and refreshed after every display reconfiguration (HiDPI,
+    /// scaling, resolution or arrangement changes).
     void set_display_id(CGDirectDisplayID did);
 
     bool inject_touch(uint8_t action, uint8_t ptr_id,
@@ -76,6 +76,15 @@ private:
 
     // ------- Display -------
     CGDirectDisplayID display_id_ = 0;
+
+    // CGDisplayBounds of display_id_, read under mutex_. The reconfiguration
+    // callback only clears bounds_valid_; the next event re-reads the bounds.
+    mutable CGRect bounds_cache_ = CGRectZero;
+    mutable std::atomic<bool> bounds_valid_{false};
+    bool reconfig_registered_ = false;
+    static void display_reconfigured(CGDirectDisplayID display,
+                                     CGDisplayChangeSummaryFlags flags,
+                                     void* user_info);
 
     // ------- Finger tracking -------
     // More slots than gestures use, so a 3rd finger is detected and

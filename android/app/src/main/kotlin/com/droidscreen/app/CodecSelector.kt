@@ -78,7 +78,7 @@ object CodecSelector {
 
         for (info in codecs) {
             if (info.isEncoder) continue
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && info.isAlias) continue
+            if (info.isAlias) continue
             if (isSoftwareDecoder(info)) continue
             if (!info.supportedTypes.any { it.equals(mime, ignoreCase = true) }) continue
 
@@ -92,7 +92,7 @@ object CodecSelector {
             if (!sizeAndRateLooksSupported(caps, width, height, fps)) continue
 
             val name = info.name.lowercase()
-            val lowLatency = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            val lowLatency =
                 caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
             val nameLowLatency = name.contains("low_latency") || name.contains("low-latency")
             val isQcomC2 = name.startsWith("c2.qti") || name.startsWith("c2.qcom")
@@ -145,7 +145,7 @@ object CodecSelector {
     }
 
     private fun isSoftwareDecoder(info: MediaCodecInfo): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && info.isSoftwareOnly) {
+        if (info.isSoftwareOnly) {
             return true
         }
         val name = info.name.lowercase()

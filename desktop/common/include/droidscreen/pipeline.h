@@ -1,14 +1,18 @@
 /*
  * DroidScreen Desktop - Pipeline orchestrator
  *
- * True 3-stage pipeline for near-zero latency:
+ * Pipeline for near-zero latency:
  *   Stage 1 (SCK thread):    Capture callback -> push to capture_queue (newest only)
- *   Stage 2 (encode thread): Pop capture_queue -> encoder->encode() (VT fires async)
- *   Stage 3 (VT callback):   Push encoded packet to send_queue
- *   Stage 4 (send thread):   Pop send_queue -> TCP send (can block without stalling encode)
+ *   Stage 2 (encode thread): Take an encode permit, pop the newest frame,
+ *                            encoder->encode() (VT fires async)
+ *   Stage 3 (VT callback):   Push encoded packets to send_queue (never blocks)
+ *   Stage 4 (send thread):   Pop send_queue -> TCP send
  *
- * The VT output callback never touches the socket -- it only enqueues packets.
- * This decouples encode latency from network latency entirely.
+ * Admission control: at most kMaxEncodesInFlight submits exist between the
+ * encoder and the send thread's pop. A submit's permit is released when its
+ * last packet is popped for sending (or the encoder drops it), so the send
+ * queue never holds more than one submit's packets (CONFIG + frame) and newer
+ * captures replace older ones in capture_queue while the link is busy.
  */
 
 #pragma once
@@ -148,6 +152,26 @@ private:
     std::thread capturer_restart_thread_;
     std::mutex capturer_restart_thread_mutex_;
 
+    // --- Encode admission ---
+    // Released (in its destructor) when every holder is gone: the encoder's
+    // per-submit callback and each SendPacket of that submit.
+    struct EncodePermit {
+        Pipeline* owner;
+        ~EncodePermit() { owner->release_encode_permit(); }
+    };
+    static constexpr int kMaxEncodesInFlight = 1;
+    int encodes_in_flight_ = 0;           // guarded by capture_mutex_
+    std::shared_ptr<EncodePermit> acquire_encode_permit_locked();
+    void release_encode_permit();
+    int64_t last_pts_us_ = 0;             // encode thread only: keeps PTS monotonic
+
+    // Called by the encoder for every output packet of a submit.
+    void handle_encoded_packet(const EncodedPacket& pkt,
+                               const std::shared_ptr<EncodePermit>& permit,
+                               int64_t t_enc_start, int64_t submit_pts_us,
+                               int64_t display_time_us, bool is_idle,
+                               float motion_score);
+
     // --- Send queue: encoded packets waiting for TCP send ---
     struct SendPacket {
         std::vector<uint8_t> data;
@@ -155,13 +179,18 @@ private:
         int64_t capture_ts_us;
         int64_t capture_to_encode_us;
         int64_t encode_done_us;   // timestamp when VT callback fired
+        int64_t display_time_us;
         uint64_t sequence;
         bool is_idle;
         float motion_score;
+        std::shared_ptr<EncodePermit> permit;
     };
 
-    static constexpr size_t kMaxSendQueueSize = 4;
     std::deque<SendPacket> send_queue_;
+    // Steady clock when the send thread started writing the current packet;
+    // 0 when no write is in progress. Feeds the sender-delay congestion signal.
+    std::atomic<int64_t> send_started_us_{0};
+    int64_t sender_delay_us() const;
     std::mutex send_mutex_;
     std::condition_variable send_cv_;
 
@@ -209,8 +238,20 @@ private:
     // re-encoded to keep the decoder pipeline warm. Default: 33 ms ≈ 30 fps.
     int64_t max_idle_interval_us_ = 33333;
 
-    // Timestamp of last ping sent, for RTT calculation.
-    std::atomic<int64_t> ping_sent_us_{0};
+    // Desktop<->Android clock offset (android_monotonic - desktop_steady),
+    // taken from the PONG with the lowest RTT in a sliding window.
+    void record_pong(int64_t desktop_send_us, int64_t android_now_us);
+    static constexpr size_t kClockWindowSize = 16;
+    int64_t clock_rtt_window_[kClockWindowSize] = {};
+    int64_t clock_offset_window_[kClockWindowSize] = {};
+    size_t clock_count_ = 0;
+    size_t clock_index_ = 0;              // guarded by rtt_mutex_
+    std::atomic<int64_t> clock_offset_us_{0};
+    std::atomic<uint32_t> clock_uncertainty_us_{0};
+
+    // Receiver backlog reported by Android (DS_CTRL_RECEIVER_BACKLOG).
+    std::atomic<int64_t> receiver_backlog_bytes_{-1};
+    std::atomic<int64_t> receiver_backlog_at_us_{0};
 
     // Liveness watchdog: timestamp of the last successful socket activity
     // (video/control byte sent, or message received). If this stops advancing

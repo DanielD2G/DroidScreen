@@ -117,6 +117,9 @@ private:
     std::atomic<bool> keyframe_pending_{false};
     bool config_sent_ = false;
     int64_t frame_index_ = 0;
+    // Capture timestamp per in-flight PTS (output can lag input).
+    static constexpr int64_t kPtsMapSize = 16;
+    int64_t pts_timestamps_[kPtsMapSize] = {};
 
     std::mutex encode_mutex_;
 };

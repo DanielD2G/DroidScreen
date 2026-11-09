@@ -4,7 +4,7 @@ use warnings;
 use DynaLoader;
 
 my $lib = shift @ARGV or die "Usage: mediaremote-mini.pl <dylib> [symbol]\n";
-my $symbol = shift @ARGV // 'adapter_get_env';
+my $symbol = shift @ARGV // 'adapter_stream';
 
 my $handle = DynaLoader::dl_load_file($lib, 0)
   or die "Failed to load dylib: " . DynaLoader::dl_error() . "\n";

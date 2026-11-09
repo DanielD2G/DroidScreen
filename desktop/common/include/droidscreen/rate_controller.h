@@ -1,12 +1,14 @@
 /*
- * DroidScreen Desktop - Adaptive bitrate controller (AIMD on send-queue depth)
+ * DroidScreen Desktop - Adaptive bitrate controller (AIMD on queueing delay)
  *
- * The send queue depth is a direct congestion signal: it fills only when the
- * encoder is producing faster than the transport + Android decoder can drain.
- * When it stays full we multiplicatively cut the encoder bitrate; when it stays
- * empty we additively ramp back up toward max_kbps (the user-configured cap /
- * "tope"). This lets a heavy scene degrade in quality instead of stalling the
- * pipeline, while idle/easy content runs at full configured quality.
+ * Congestion is measured as time, not queue depth. Two signals:
+ *   - sender delay: age of the oldest video packet that is queued or being
+ *     written to the socket (shows a slow link / blocked writev);
+ *   - receiver backlog: compressed video waiting on the tablet (ring buffer),
+ *     converted to milliseconds at the current bitrate. Over USB the adb
+ *     forward buffers hide the link, so this is the signal that sees it.
+ * When either stays high we multiplicatively cut the encoder bitrate; when both
+ * stay low we additively ramp back toward max_kbps (the user's "tope").
  */
 
 #pragma once
@@ -30,10 +32,12 @@ public:
                    uint32_t min_kbps = 4000,
                    uint32_t max_kbps = 80000);
 
-    /// Feed one periodic sample of the current send-queue depth (and its max
-    /// capacity). Applies bitrate changes via the encoder when warranted.
-    /// Expected to be called at a steady cadence (~2 Hz).
-    void update(size_t send_queue_depth, size_t send_queue_capacity);
+    /// Feed one periodic sample (expected every ~100 ms).
+    /// @param sender_delay_us Age of the oldest queued/in-flight video packet (0 = none).
+    /// @param receiver_backlog_bytes Bytes waiting on the tablet, or -1 if unknown/stale.
+    /// @param frame_interval_us Nominal frame interval at the target fps.
+    void update(int64_t sender_delay_us, int64_t receiver_backlog_bytes,
+                int64_t frame_interval_us);
 
     /// Current bitrate in kbps.
     uint32_t current_bitrate_kbps() const;
@@ -51,8 +55,13 @@ private:
     int clear_run_ = 0;
 
     // Tuning.
-    static constexpr int   kSamplesBeforeDecrease = 2;   // ~1 s of congestion
-    static constexpr int   kSamplesBeforeIncrease = 8;   // ~4 s clear before ramp
+    static constexpr int   kSamplesBeforeDecrease = 3;   // ~300 ms of congestion
+    static constexpr int   kSamplesBeforeIncrease = 40;  // ~4 s clear before ramp
+    // Thresholds. Sender: frames worth of delay. Receiver: milliseconds.
+    static constexpr int64_t kSenderCongestedFrames = 3;
+    static constexpr int64_t kSenderClearFrames     = 1;
+    static constexpr int64_t kReceiverCongestedMs   = 100;
+    static constexpr int64_t kReceiverClearMs       = 20;
     static constexpr double kDecreaseFactor       = 0.75;
     static constexpr uint32_t kIncreaseStepKbps   = 2000;
 

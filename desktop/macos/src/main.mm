@@ -49,7 +49,10 @@ extern "C" {
 #include <unordered_map>
 #include <cmath>
 #include <signal.h>
-#include <sys/select.h>
+#include <spawn.h>
+#include <fcntl.h>
+#include <string>
+#include <vector>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <execinfo.h>
@@ -269,164 +272,170 @@ static NSString* mediaTrackKeyForSnapshot(NSDictionary* snapshot) {
     return [NSString stringWithFormat:@"%@\n%@\n%@", title, artist, album];
 }
 
-static NSDictionary* fetchNowPlayingSnapshot(BOOL* didTimeoutOut = nil) {
-    @autoreleasepool {
-        if (didTimeoutOut) *didTimeoutOut = NO;
-        NSBundle* bundle = [NSBundle mainBundle];
-        NSString* scriptPath = [bundle pathForResource:@"mediaremote-mini" ofType:@"pl"];
-        NSString* dylibPath = [bundle pathForResource:@"MediaRemoteMini" ofType:@"dylib"];
-        if (scriptPath.length == 0 || dylibPath.length == 0) {
-            NSLog(@"[deck] MediaRemote helper resources are missing");
-            return nil;
-        }
+// =============================================================================
+#pragma mark - Long-lived child processes
+// =============================================================================
 
-        int stdoutPipe[2] = {-1, -1};
-        int stderrPipe[2] = {-1, -1};
-        if (pipe(stdoutPipe) != 0 || pipe(stderrPipe) != 0) {
-            NSLog(@"[deck] Failed to create pipes for MediaRemote helper");
-            if (stdoutPipe[0] >= 0) close(stdoutPipe[0]);
-            if (stdoutPipe[1] >= 0) close(stdoutPipe[1]);
-            if (stderrPipe[0] >= 0) close(stderrPipe[0]);
-            if (stderrPipe[1] >= 0) close(stderrPipe[1]);
-            return nil;
-        }
+extern char** environ;
 
-        pid_t pid = fork();
-        if (pid < 0) {
-            NSLog(@"[deck] Failed to fork MediaRemote helper");
-            close(stdoutPipe[0]);
-            close(stdoutPipe[1]);
-            close(stderrPipe[0]);
-            close(stderrPipe[1]);
-            return nil;
-        }
-        if (pid == 0) {
-            dup2(stdoutPipe[1], STDOUT_FILENO);
-            dup2(stderrPipe[1], STDERR_FILENO);
-            close(stdoutPipe[0]);
-            close(stdoutPipe[1]);
-            close(stderrPipe[0]);
-            close(stderrPipe[1]);
-            execl("/usr/bin/perl", "perl",
-                  [scriptPath fileSystemRepresentation],
-                  [dylibPath fileSystemRepresentation],
-                  "adapter_get_env",
-                  (char*)nullptr);
-            _exit(127);
-        }
+/// A child process kept alive for a long time (the MediaRemote helper, `adb
+/// track-devices`). Its stdout is delivered in chunks on `queue`; `onExit`
+/// runs on `queue` when the child exits on its own (not after -terminate).
+@interface DSChildProcess : NSObject
++ (instancetype)spawn:(NSString*)path
+                 args:(NSArray<NSString*>*)args
+            withStdin:(BOOL)withStdin
+          stderrToLog:(BOOL)stderrToLog
+                queue:(dispatch_queue_t)queue
+               onData:(void (^)(NSData* data))onData
+               onExit:(void (^)(int status))onExit;
+/// Writes a line to the child's stdin (only with withStdin). Never raises SIGPIPE.
+- (void)writeLine:(NSString*)line;
+- (void)terminate;
+@end
 
-        close(stdoutPipe[1]);
-        close(stderrPipe[1]);
+@implementation DSChildProcess {
+    pid_t _pid;
+    int _stdinFd;
+    dispatch_source_t _readSource;
+    std::shared_ptr<std::atomic<bool>> _terminated;
+    std::shared_ptr<std::atomic<bool>> _reaped;  // never signal a reaped (reusable) pid
+}
 
-        const NSTimeInterval timeoutSeconds = 1.25;
-        BOOL timedOut = NO;
-        NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutSeconds];
-        std::string stdoutBuf;
-        std::string stderrBuf;
-        bool stdoutOpen = true;
-        bool stderrOpen = true;
-        int childStatus = 0;
-        bool childExited = false;
++ (instancetype)spawn:(NSString*)path
+                 args:(NSArray<NSString*>*)args
+            withStdin:(BOOL)withStdin
+          stderrToLog:(BOOL)stderrToLog
+                queue:(dispatch_queue_t)queue
+               onData:(void (^)(NSData* data))onData
+               onExit:(void (^)(int status))onExit {
+    int outPipe[2] = {-1, -1};
+    int inPipe[2] = {-1, -1};
+    if (pipe(outPipe) != 0) return nil;
+    if (withStdin && pipe(inPipe) != 0) {
+        close(outPipe[0]);
+        close(outPipe[1]);
+        return nil;
+    }
 
-        while (stdoutOpen || stderrOpen || !childExited) {
-            NSTimeInterval remaining = [deadline timeIntervalSinceNow];
-            if (remaining <= 0) {
-                timedOut = YES;
-                break;
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    if (withStdin) {
+        posix_spawn_file_actions_adddup2(&actions, inPipe[0], STDIN_FILENO);
+    } else {
+        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    }
+    posix_spawn_file_actions_adddup2(&actions, outPipe[1], STDOUT_FILENO);
+    if (stderrToLog) {
+        posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO);
+    } else {
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    }
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    // Only stdin/stdout/stderr reach the child (no sockets, no log fd copies).
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+
+    std::vector<std::string> argStorage;
+    argStorage.emplace_back(path.fileSystemRepresentation);
+    for (NSString* arg in args) argStorage.emplace_back(arg.UTF8String ?: "");
+    std::vector<char*> argv;
+    for (auto& arg : argStorage) argv.push_back(arg.data());
+    argv.push_back(nullptr);
+
+    pid_t pid = -1;
+    int rc = posix_spawn(&pid, argStorage[0].c_str(), &actions, &attr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+    close(outPipe[1]);
+    if (withStdin) close(inPipe[0]);
+    if (rc != 0) {
+        NSLog(@"[child] posix_spawn %@ failed: %s", path, strerror(rc));
+        close(outPipe[0]);
+        if (withStdin) close(inPipe[1]);
+        return nil;
+    }
+
+    DSChildProcess* proc = [[DSChildProcess alloc] init];
+    proc->_pid = pid;
+    proc->_stdinFd = withStdin ? inPipe[1] : -1;
+    if (proc->_stdinFd >= 0) {
+        fcntl(proc->_stdinFd, F_SETNOSIGPIPE, 1);
+        fcntl(proc->_stdinFd, F_SETFL, fcntl(proc->_stdinFd, F_GETFL) | O_NONBLOCK);
+    }
+    auto terminated = std::make_shared<std::atomic<bool>>(false);
+    proc->_terminated = terminated;
+    auto reaped = std::make_shared<std::atomic<bool>>(false);
+    proc->_reaped = reaped;
+
+    const int readFd = outPipe[0];
+    fcntl(readFd, F_SETFL, fcntl(readFd, F_GETFL) | O_NONBLOCK);
+    dispatch_source_t source =
+        dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)readFd, 0, queue);
+    __unsafe_unretained dispatch_source_t sourceRef = source;
+    dispatch_source_set_event_handler(source, ^{
+        char buffer[16384];
+        for (;;) {
+            ssize_t count = read(readFd, buffer, sizeof(buffer));
+            if (count > 0) {
+                onData([NSData dataWithBytes:buffer length:(NSUInteger)count]);
+                continue;
             }
-
-            fd_set readfds;
-            FD_ZERO(&readfds);
-            int maxfd = -1;
-            if (stdoutOpen) {
-                FD_SET(stdoutPipe[0], &readfds);
-                maxfd = MAX(maxfd, stdoutPipe[0]);
-            }
-            if (stderrOpen) {
-                FD_SET(stderrPipe[0], &readfds);
-                maxfd = MAX(maxfd, stderrPipe[0]);
-            }
-
-            // With both pipes closed we're only waiting for the child to exit:
-            // poll briefly instead of sleeping until the deadline.
-            NSTimeInterval waitSeconds = maxfd < 0 ? MIN(remaining, 0.01) : remaining;
-            struct timeval tv;
-            tv.tv_sec = (int)waitSeconds;
-            tv.tv_usec = (int)((waitSeconds - tv.tv_sec) * 1000000.0);
-            int selectResult = select(maxfd + 1, &readfds, nullptr, nullptr, &tv);
-            if (selectResult > 0) {
-                char buffer[4096];
-                if (stdoutOpen && FD_ISSET(stdoutPipe[0], &readfds)) {
-                    ssize_t count = read(stdoutPipe[0], buffer, sizeof(buffer));
-                    if (count > 0) stdoutBuf.append(buffer, (size_t)count);
-                    else {
-                        close(stdoutPipe[0]);
-                        stdoutOpen = false;
-                    }
-                }
-                if (stderrOpen && FD_ISSET(stderrPipe[0], &readfds)) {
-                    ssize_t count = read(stderrPipe[0], buffer, sizeof(buffer));
-                    if (count > 0) stderrBuf.append(buffer, (size_t)count);
-                    else {
-                        close(stderrPipe[0]);
-                        stderrOpen = false;
-                    }
-                }
-            } else if (selectResult < 0) {
-                break;
-            }
-
-            pid_t waitResult = waitpid(pid, &childStatus, WNOHANG);
-            if (waitResult == pid) {
-                childExited = true;
-                if (!stdoutOpen && !stderrOpen) break;
-            }
+            if (count < 0 && (errno == EAGAIN || errno == EINTR)) return;
+            dispatch_source_cancel(sourceRef);  // EOF or error: the child is gone
+            return;
         }
+    });
+    dispatch_source_set_cancel_handler(source, ^{
+        close(readFd);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int status = 0;
+            waitpid(pid, &status, 0);
+            reaped->store(true);
+            dispatch_async(queue, ^{
+                if (!terminated->load() && onExit) onExit(status);
+            });
+        });
+    });
+    proc->_readSource = source;
+    dispatch_resume(source);
+    return proc;
+}
 
-        if (timedOut) {
-            timedOut = YES;
-            kill(pid, SIGKILL);
-            waitpid(pid, &childStatus, 0);
-        } else if (!childExited) {
-            waitpid(pid, &childStatus, 0);
-        }
-        if (stdoutOpen) close(stdoutPipe[0]);
-        if (stderrOpen) close(stderrPipe[0]);
+- (void)writeLine:(NSString*)line {
+    if (_stdinFd < 0 || _terminated->load()) return;
+    std::string data = std::string(line.UTF8String ?: "") + "\n";
+    if (write(_stdinFd, data.data(), data.size()) < 0) {
+        NSLog(@"[child] write to pid %d failed: %s", (int)_pid, strerror(errno));
+    }
+}
 
-        NSString* stdoutStr = [[NSString alloc] initWithBytes:stdoutBuf.data()
-                                                       length:stdoutBuf.size()
-                                                     encoding:NSUTF8StringEncoding];
-        NSString* stderrStr = [[NSString alloc] initWithBytes:stderrBuf.data()
-                                                       length:stderrBuf.size()
-                                                     encoding:NSUTF8StringEncoding];
+- (void)terminate {
+    if (_terminated->exchange(true)) return;
+    if (_stdinFd >= 0) {
+        close(_stdinFd);
+        _stdinFd = -1;
+    }
+    if (!_reaped->load()) kill(_pid, SIGTERM);
+    dispatch_source_cancel(_readSource);  // the cancel handler reaps the child
+}
 
-        if (timedOut) {
-            if (didTimeoutOut) *didTimeoutOut = YES;
-            NSLog(@"[deck] MediaRemote helper timed out after %.0fms",
-                  timeoutSeconds * 1000.0);
-        }
+- (void)dealloc {
+    [self terminate];
+}
 
-        if ((timedOut || childStatus != 0) || stdoutStr.length == 0) {
-            if (stderrStr.length > 0) {
-                NSLog(@"[deck] MediaRemote helper failed: %@", stderrStr);
-            }
-            return nil;
-        }
+@end
 
-        NSString* trimmed = [stdoutStr stringByTrimmingCharactersInSet:
-            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (trimmed.length == 0 || [trimmed isEqualToString:@"null"]) return nil;
-
-        NSData* jsonData = [trimmed dataUsingEncoding:NSUTF8StringEncoding];
-        NSError* error = nil;
-        id obj = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&error];
-        if (![obj isKindOfClass:[NSDictionary class]]) {
-            if (error) {
-                NSLog(@"[deck] Failed to parse helper JSON: %@", error);
-            }
-            return nil;
-        }
-        return (NSDictionary*)obj;
+/// Splits `buffer` at newlines, consuming complete lines.
+static void drain_lines(NSMutableData* buffer, void (^onLine)(NSData* line)) {
+    for (;;) {
+        const char* bytes = (const char*)buffer.bytes;
+        const char* newline = (const char*)memchr(bytes, '\n', buffer.length);
+        if (!newline) return;
+        NSUInteger length = (NSUInteger)(newline - bytes);
+        NSData* line = [NSData dataWithBytes:bytes length:length];
+        [buffer replaceBytesInRange:NSMakeRange(0, length + 1) withBytes:NULL length:0];
+        if (length > 0) onLine(line);
     }
 }
 
@@ -954,7 +963,6 @@ static CGSize adb_device_resolution() {
     return CGSizeMake(0, 0);
 }
 
-/// Returns YES if `adb devices` shows at least one device/emulator attached.
 /// adb also lists wireless-debugging devices ("ip:port", "adb-…._adb-tls-connect._tcp").
 /// Those are not a cable: the stream should use the Wi-Fi path for them.
 static BOOL adb_serial_is_usb(NSString* serial) {
@@ -963,18 +971,6 @@ static BOOL adb_serial_is_usb(NSString* serial) {
     NSRange colon = [serial rangeOfString:@":" options:NSBackwardsSearch];
     if (colon.location != NSNotFound) return NO;   // host:port
     return YES;
-}
-
-static BOOL adb_device_connected() {
-    NSString* output = adb_run_output(@[@"devices"]);
-    // Output format: "List of devices attached\n<serial>\tdevice\n"
-    NSArray<NSString*>* lines = [output componentsSeparatedByString:@"\n"];
-    for (NSString* line in lines) {
-        if ([line hasSuffix:@"\tdevice"] && adb_serial_is_usb([line componentsSeparatedByString:@"\t"].firstObject)) {
-            return YES;
-        }
-    }
-    return NO;
 }
 
 /// Serial of the adb-attached device, or nil.
@@ -1015,8 +1011,7 @@ static BOOL adb_droidscreen_running() {
 @property (nonatomic, assign) BOOL isBusy;  // Prevents concurrent connect/disconnect ops.
 @property (nonatomic, assign) BOOL userDisconnected;  // Suppresses auto-connect until device is re-plugged or user clicks Connect.
 
-- (void)pushDeckState;
-- (void)pushDeckVolumeState;
+- (void)pushDeckVolumeStateForce:(BOOL)force;
 - (void)pushDeckMediaState;
 - (void)scheduleDeckMediaRefreshBurst;
 
@@ -1036,8 +1031,14 @@ static BOOL adb_droidscreen_running() {
     // Background queue for streaming operations.
     dispatch_queue_t _streamQueue;
 
-    // ADB device detection timer.
-    NSTimer* _deviceTimer;
+    // USB device detection: one long-lived `adb track-devices` process, its
+    // queue (owns every _adbTrack* field) and the idle auto-connect retry.
+    DSChildProcess* _adbTracker;
+    NSMutableData* _adbTrackBuffer;
+    dispatch_queue_t _adbTrackQueue;
+    BOOL _adbTrackActive;
+    NSString* _adbTrackUsbSerial;
+    NSTimer* _autoConnectTimer;
 
     // Wi-Fi: Bonjour discovery, the transport of the active stream, and the
     // tablet the user picked from the menu (empty = automatic).
@@ -1076,9 +1077,24 @@ static BOOL adb_droidscreen_running() {
     NSWindow* _validationWindow;
     NSTask* _validationTask;
 
-    // GCD timer for pushing volume/media state to Android.
-    dispatch_source_t _deckTimer;
+    // Deck volume/media feed to Android. Everything below runs on
+    // _deckStateQueue: a CoreAudio listener for volume, one persistent
+    // MediaRemote helper for Now Playing, and a 1 s progress tick while
+    // something plays (the tablet does not advance the clock on its own).
     dispatch_queue_t _deckStateQueue;
+    BOOL _deckActive;
+    dispatch_source_t _deckProgressTimer;
+    DSChildProcess* _nowPlayingHelper;
+    NSMutableData* _nowPlayingBuffer;
+    NSDictionary* _nowPlayingSnapshot;
+    CFAbsoluteTime _nowPlayingSnapshotAt;
+    std::string _lastSentMediaJSON;
+    BOOL _lastLoggedPlaying;
+    AudioObjectPropertyListenerBlock _defaultOutputListener;
+    AudioObjectPropertyListenerBlock _outputVolumeListener;
+    AudioDeviceID _observedOutputDevice;
+    int32_t _lastSentVolumeLevel;  // -1 = nothing sent yet
+    int _lastSentVolumeMuted;
 
     // Current streaming parameters (for status display).
     uint32_t _streamWidth;
@@ -1087,11 +1103,10 @@ static BOOL adb_droidscreen_running() {
 
     NSString* _lastMediaArtworkTrackKey;
     BOOL _forceArtworkPush;
-    NSDictionary* _lastNowPlayingSnapshot;
     NSString* _lastObservedTrackKey;
-    // Bumped on every tablet media action; in-flight snapshots older than it are dropped.
+    // Bumped on every tablet media action; helper snapshots stamped with an
+    // older generation (taken before the action) are dropped.
     std::atomic<uint64_t> _mediaActionGen;
-    NSDate* _lastNowPlayingSnapshotAt;
 }
 
 // -----------------------------------------------------------------------------
@@ -1122,7 +1137,7 @@ static BOOL adb_droidscreen_running() {
     [self loadDeckApps];
     _ui = DSUICreateController(self);
     [self pushUIState];
-    [self startDeviceDetectionTimer];
+    [self startDeviceDetection];
     [self startWifiDiscovery];
 
     // Request screen capture permission once at launch.
@@ -1139,7 +1154,7 @@ static BOOL adb_droidscreen_running() {
 }
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
-    [self stopDeviceDetectionTimer];
+    [self stopDeviceDetection];
     if (_wifiDiscovery) _wifiDiscovery->stop();
     [self stopStatsTimer];
 
@@ -2086,12 +2101,14 @@ static void clamp_high_fps(StreamSettings& s) {
             setSystemMuted(muted);
             AppDelegate* strongSelf = weakSelf;
             if (!strongSelf) return;
+            // Forced: echo the Mac's real value even if it did not change
+            // (clamped, or a device without volume control).
             dispatch_async(strongSelf->_deckStateQueue, ^{
-                [strongSelf pushDeckVolumeState];
+                [strongSelf pushDeckVolumeStateForce:YES];
             });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
                            strongSelf->_deckStateQueue, ^{
-                [strongSelf pushDeckVolumeState];
+                [strongSelf pushDeckVolumeStateForce:YES];
             });
         });
 
@@ -2146,12 +2163,10 @@ static void clamp_high_fps(StreamSettings& s) {
             [self startStatsTimer];
         });
 
-        // Start a GCD timer to push volume/media state to Android every 2 seconds.
+        // Feed volume/media state to the tablet Deck while streaming.
         _lastMediaArtworkTrackKey = nil;
         _forceArtworkPush = YES;
-        _lastNowPlayingSnapshot = nil;
-        _lastNowPlayingSnapshotAt = nil;
-        [self startDeckTimer];
+        [self startDeckFeed];
 
         _isBusy = NO;
     }
@@ -2169,11 +2184,9 @@ static void clamp_high_fps(StreamSettings& s) {
             [self stopStatsTimer];
         });
 
-        [self stopDeckTimer];
+        [self stopDeckFeed];
         _lastMediaArtworkTrackKey = nil;
         _forceArtworkPush = YES;
-        _lastNowPlayingSnapshot = nil;
-        _lastNowPlayingSnapshotAt = nil;
 
         uint16_t port = (uint16_t)[[NSUserDefaults standardUserDefaults] integerForKey:kSettingPort];
 
@@ -2250,7 +2263,7 @@ static void clamp_high_fps(StreamSettings& s) {
         // The tablet picked in the menu left the network: back to automatic.
         _wifiTargetId.clear();
     }
-    if (!g_cliForceWifi && adb_device_connected()) {
+    if (!g_cliForceWifi && _usbDevicePresent) {
         target->wifi = false;
         return YES;
     }
@@ -2386,7 +2399,7 @@ static void clamp_high_fps(StreamSettings& s) {
 /// USB device is attached (USB keeps priority). Call off the main thread.
 - (void)autoConnectWifiIfPaired {
     if (_isStreaming || _isBusy || _userDisconnected || !_wifiDiscovery) return;
-    if (!g_cliForceWifi && adb_device_connected()) return;
+    if (!g_cliForceWifi && _usbDevicePresent) return;
     bool candidate = false;
     for (const auto& tablet : _wifiDiscovery->tablets()) {
         if (wifi_tablet_eligible(tablet)) candidate = true;
@@ -2401,130 +2414,295 @@ static void clamp_high_fps(StreamSettings& s) {
 }
 
 // -----------------------------------------------------------------------------
-#pragma mark - Deck Timer (volume/media state push to Android)
+#pragma mark - Deck feed (volume/media state push to Android)
 // -----------------------------------------------------------------------------
 
-- (void)pushDeckVolumeState {
+static const AudioObjectPropertyAddress kDefaultOutputAddress = {
+    kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMain
+};
+static const AudioObjectPropertyAddress kOutputVolumeAddress = {
+    kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+    kAudioObjectPropertyScopeOutput,
+    kAudioObjectPropertyElementMain
+};
+static const AudioObjectPropertyAddress kOutputMuteAddress = {
+    kAudioDevicePropertyMute,
+    kAudioObjectPropertyScopeOutput,
+    kAudioObjectPropertyElementMain
+};
+
+/// Sends volume/mute to the tablet when they differ from what it was last
+/// sent (or always, with force). Deck queue.
+- (void)pushDeckVolumeStateForce:(BOOL)force {
     droidscreen::Pipeline* pl = _pipeline.get();
     if (!pl || !pl->is_running()) return;
 
     float vol = getSystemVolume();
     bool muted = getSystemMuted();
     uint16_t level = (uint16_t)(vol * 65535);
+    if (!force && (int32_t)level == _lastSentVolumeLevel &&
+        (muted ? 1 : 0) == _lastSentVolumeMuted) {
+        return;
+    }
+    _lastSentVolumeLevel = level;
+    _lastSentVolumeMuted = muted ? 1 : 0;
     pl->send_volume_state(level, muted);
 }
 
+/// Moves the volume/mute listeners to the current default output device. Deck queue.
+- (void)bindOutputVolumeListener {
+    if (_observedOutputDevice != kAudioObjectUnknown) {
+        AudioObjectRemovePropertyListenerBlock(_observedOutputDevice, &kOutputVolumeAddress,
+                                               _deckStateQueue, _outputVolumeListener);
+        AudioObjectRemovePropertyListenerBlock(_observedOutputDevice, &kOutputMuteAddress,
+                                               _deckStateQueue, _outputVolumeListener);
+        _observedOutputDevice = kAudioObjectUnknown;
+    }
+    AudioDeviceID device = getDefaultOutputDevice();
+    if (device == kAudioObjectUnknown) return;
+    _observedOutputDevice = device;
+    // Not every device has volume or mute (e.g. some HDMI outputs).
+    if (AudioObjectHasProperty(device, &kOutputVolumeAddress)) {
+        AudioObjectAddPropertyListenerBlock(device, &kOutputVolumeAddress,
+                                            _deckStateQueue, _outputVolumeListener);
+    }
+    if (AudioObjectHasProperty(device, &kOutputMuteAddress)) {
+        AudioObjectAddPropertyListenerBlock(device, &kOutputMuteAddress,
+                                            _deckStateQueue, _outputVolumeListener);
+    }
+}
+
+- (void)startVolumeObserver {
+    __weak AppDelegate* weakSelf = self;
+    _outputVolumeListener = ^(UInt32, const AudioObjectPropertyAddress*) {
+        [weakSelf pushDeckVolumeStateForce:NO];
+    };
+    _defaultOutputListener = ^(UInt32, const AudioObjectPropertyAddress*) {
+        AppDelegate* strongSelf = weakSelf;
+        [strongSelf bindOutputVolumeListener];
+        [strongSelf pushDeckVolumeStateForce:NO];
+    };
+    AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &kDefaultOutputAddress,
+                                        _deckStateQueue, _defaultOutputListener);
+    _observedOutputDevice = kAudioObjectUnknown;
+    [self bindOutputVolumeListener];
+}
+
+- (void)stopVolumeObserver {
+    if (!_defaultOutputListener) return;
+    AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &kDefaultOutputAddress,
+                                           _deckStateQueue, _defaultOutputListener);
+    if (_observedOutputDevice != kAudioObjectUnknown) {
+        AudioObjectRemovePropertyListenerBlock(_observedOutputDevice, &kOutputVolumeAddress,
+                                               _deckStateQueue, _outputVolumeListener);
+        AudioObjectRemovePropertyListenerBlock(_observedOutputDevice, &kOutputMuteAddress,
+                                               _deckStateQueue, _outputVolumeListener);
+        _observedOutputDevice = kAudioObjectUnknown;
+    }
+    _defaultOutputListener = nil;
+    _outputVolumeListener = nil;
+}
+
+/// Starts the persistent MediaRemote helper (perl + MediaRemoteMini.dylib,
+/// adapter_stream): it writes one JSON line per Now Playing change. Deck queue.
+- (void)startNowPlayingHelper {
+    NSBundle* bundle = [NSBundle mainBundle];
+    NSString* scriptPath = [bundle pathForResource:@"mediaremote-mini" ofType:@"pl"];
+    NSString* dylibPath = [bundle pathForResource:@"MediaRemoteMini" ofType:@"dylib"];
+    if (scriptPath.length == 0 || dylibPath.length == 0) {
+        NSLog(@"[deck] MediaRemote helper resources are missing");
+        return;
+    }
+
+    __weak AppDelegate* weakSelf = self;
+    _nowPlayingBuffer = [NSMutableData data];
+    _nowPlayingHelper = [DSChildProcess spawn:@"/usr/bin/perl"
+                                         args:@[scriptPath, dylibPath, @"adapter_stream"]
+                                    withStdin:YES
+                                  stderrToLog:YES
+                                        queue:_deckStateQueue
+                                       onData:^(NSData* data) {
+        AppDelegate* strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_nowPlayingBuffer appendData:data];
+        drain_lines(strongSelf->_nowPlayingBuffer, ^(NSData* line) {
+            [strongSelf handleNowPlayingLine:line];
+        });
+    }
+                                       onExit:^(int status) {
+        AppDelegate* strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf->_deckActive) return;
+        NSLog(@"[deck] MediaRemote helper exited (status %d), restarting in 2 s", status);
+        strongSelf->_nowPlayingHelper = nil;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                       strongSelf->_deckStateQueue, ^{
+            AppDelegate* again = weakSelf;
+            if (again && again->_deckActive && !again->_nowPlayingHelper) {
+                [again startNowPlayingHelper];
+            }
+        });
+    }];
+    if (!_nowPlayingHelper) {
+        NSLog(@"[deck] Failed to start MediaRemote helper");
+        return;
+    }
+    // A (re)started helper begins at generation 0: hand it the current one so
+    // its snapshots are not dropped as stale. This also asks for a snapshot.
+    [_nowPlayingHelper writeLine:[NSString stringWithFormat:@"%llu",
+                                  (unsigned long long)_mediaActionGen.load()]];
+    NSLog(@"[deck] MediaRemote helper started");
+}
+
+/// One JSON line from the helper: the current Now Playing snapshot. Deck queue.
+- (void)handleNowPlayingLine:(NSData*)line {
+    NSError* error = nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:line options:0 error:&error];
+    if (![obj isKindOfClass:[NSDictionary class]]) {
+        NSLog(@"[deck] Failed to parse helper JSON: %@", error);
+        return;
+    }
+    NSMutableDictionary* snapshot = [(NSDictionary*)obj mutableCopy];
+    // A snapshot taken before a tablet media action reflects the old state
+    // (e.g. still playing) and would undo the tablet's toggle.
+    uint64_t gen = [snapshot[@"gen"] unsignedLongLongValue];
+    [snapshot removeObjectForKey:@"gen"];
+    if (gen < _mediaActionGen.load()) {
+        fprintf(stderr, "[deck] Dropping media snapshot taken before a media action\n");
+        return;
+    }
+    _nowPlayingSnapshot = snapshot;
+    _nowPlayingSnapshotAt = CFAbsoluteTimeGetCurrent();
+    [self pushDeckMediaState];
+}
+
+/// Sends the latest Now Playing snapshot to the tablet, with the elapsed time
+/// advanced to now, when it differs from what was sent last. Deck queue.
 - (void)pushDeckMediaState {
     droidscreen::Pipeline* pl = _pipeline.get();
     if (!pl || !pl->is_running()) return;
 
-    @try {
-        // A snapshot that started before a tablet media action reflects the old
-        // state (e.g. still playing) and would undo the tablet's toggle.
-        const uint64_t actionGen = _mediaActionGen.load();
-        BOOL helperTimedOut = NO;
-        NSDictionary* snapshot = fetchNowPlayingSnapshot(&helperTimedOut);
-        if (_mediaActionGen.load() != actionGen) {
-            fprintf(stderr, "[deck] Dropping media snapshot taken before a media action\n");
-            return;
-        }
-        NSString* title = snapshot[@"title"];
-        if (title.length > 0) {
-            _lastNowPlayingSnapshot = [snapshot copy];
-            _lastNowPlayingSnapshotAt = [NSDate date];
-        } else if (helperTimedOut && _lastNowPlayingSnapshot != nil) {
-            NSMutableDictionary* fallback = [_lastNowPlayingSnapshot mutableCopy];
-            NSNumber* elapsedBase = fallback[@"elapsedTimeNow"] ?: fallback[@"elapsedTime"];
-            NSNumber* duration = fallback[@"duration"];
-            NSNumber* playing = fallback[@"playing"];
-            NSDate* lastAt = _lastNowPlayingSnapshotAt ?: [NSDate date];
-            if ([playing boolValue] && [elapsedBase isKindOfClass:[NSNumber class]]) {
-                double elapsed = [elapsedBase doubleValue] +
-                    [[NSDate date] timeIntervalSinceDate:lastAt];
-                if ([duration isKindOfClass:[NSNumber class]] && duration.doubleValue > 0.0) {
-                    elapsed = MIN(elapsed, duration.doubleValue);
-                }
-                fallback[@"elapsedTimeNow"] = @(MAX(0.0, elapsed));
+    NSDictionary* snapshot = _nowPlayingSnapshot;
+    if ([snapshot[@"playing"] boolValue]) {
+        NSNumber* elapsedBase = snapshot[@"elapsedTimeNow"] ?: snapshot[@"elapsedTime"];
+        if ([elapsedBase isKindOfClass:[NSNumber class]]) {
+            NSNumber* rate = snapshot[@"playbackRate"];
+            double speed = [rate isKindOfClass:[NSNumber class]] && rate.doubleValue > 0.0
+                ? rate.doubleValue : 1.0;
+            double elapsed = elapsedBase.doubleValue +
+                (CFAbsoluteTimeGetCurrent() - _nowPlayingSnapshotAt) * speed;
+            NSNumber* duration = snapshot[@"duration"];
+            if ([duration isKindOfClass:[NSNumber class]] && duration.doubleValue > 0.0) {
+                elapsed = MIN(elapsed, duration.doubleValue);
             }
-            snapshot = fallback;
+            NSMutableDictionary* advanced = [snapshot mutableCopy];
+            advanced[@"elapsedTimeNow"] = @(MAX(0.0, elapsed));
+            snapshot = advanced;
         }
-
-        NSString* trackKey = mediaTrackKeyForSnapshot(snapshot);
-        // The tablet drops its artwork whenever the track changes, so forget what
-        // was delivered on every change (A -> artless B -> A must resend A's art).
-        // An empty snapshot (nothing playing) also clears the tablet's art, so
-        // it counts as a change too.
-        NSString* observedKey = trackKey.length > 0 ? trackKey : @"";
-        if (!_lastObservedTrackKey || ![_lastObservedTrackKey isEqualToString:observedKey]) {
-            _lastObservedTrackKey = [observedKey copy];
-            _lastMediaArtworkTrackKey = nil;
-        }
-        bool includeArtwork = _forceArtworkPush;
-        if (!includeArtwork && trackKey.length > 0 &&
-            ![_lastMediaArtworkTrackKey isEqualToString:trackKey]) {
-            includeArtwork = true;
-        }
-
-        std::string json = buildMediaStateJSON(snapshot, includeArtwork);
-        // Only treat the track's artwork as delivered once it actually went out.
-        // MediaRemote often reports a new track before its artwork; marking it
-        // sent then suppressed the artwork until the next forced push.
-        if (includeArtwork && trackKey.length > 0 &&
-            json.find("\"album_art_b64\":") != std::string::npos) {
-            _lastMediaArtworkTrackKey = [trackKey copy];
-            _forceArtworkPush = NO;
-        }
-
-        fprintf(stderr, "[deck] Sending media state: %.80s...\n", json.c_str());
-        pl->send_media_state(json);
-    } @catch (NSException* e) {
-        fprintf(stderr, "[deck] Exception reading media state helper: %s\n",
-                [[e description] UTF8String]);
     }
-}
 
-- (void)pushDeckState {
-    [self pushDeckVolumeState];
-    [self pushDeckMediaState];
+    NSString* trackKey = mediaTrackKeyForSnapshot(snapshot);
+    // The tablet drops its artwork whenever the track changes, so forget what
+    // was delivered on every change (A -> artless B -> A must resend A's art).
+    // An empty snapshot (nothing playing) also clears the tablet's art, so
+    // it counts as a change too.
+    NSString* observedKey = trackKey.length > 0 ? trackKey : @"";
+    BOOL trackChanged = NO;
+    if (!_lastObservedTrackKey || ![_lastObservedTrackKey isEqualToString:observedKey]) {
+        _lastObservedTrackKey = [observedKey copy];
+        _lastMediaArtworkTrackKey = nil;
+        trackChanged = YES;
+    }
+    bool includeArtwork = _forceArtworkPush;
+    if (!includeArtwork && trackKey.length > 0 &&
+        ![_lastMediaArtworkTrackKey isEqualToString:trackKey]) {
+        includeArtwork = true;
+    }
+
+    std::string json = buildMediaStateJSON(snapshot, includeArtwork);
+    // Only treat the track's artwork as delivered once it actually went out.
+    // MediaRemote often reports a new track before its artwork; marking it
+    // sent then suppressed the artwork until the next forced push.
+    if (includeArtwork && trackKey.length > 0 &&
+        json.find("\"album_art_b64\":") != std::string::npos) {
+        _lastMediaArtworkTrackKey = [trackKey copy];
+        _forceArtworkPush = NO;
+    }
+
+    if (json == _lastSentMediaJSON) return;
+    _lastSentMediaJSON = json;
+
+    BOOL playing = [snapshot[@"playing"] boolValue];
+    if (trackChanged || includeArtwork || playing != _lastLoggedPlaying) {
+        _lastLoggedPlaying = playing;
+        fprintf(stderr, "[deck] Sending media state: %.80s...\n", json.c_str());
+    }
+    pl->send_media_state(json);
 }
 
 - (void)scheduleDeckMediaRefreshBurst {
     if (!_deckStateQueue) return;
-    _mediaActionGen.fetch_add(1);
+    const uint64_t gen = _mediaActionGen.fetch_add(1) + 1;
     _forceArtworkPush = YES;
-    dispatch_async(_deckStateQueue, ^{
-        [self pushDeckMediaState];
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
-                   _deckStateQueue, ^{
-        [self pushDeckMediaState];
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC),
-                   _deckStateQueue, ^{
-        [self pushDeckMediaState];
-    });
-}
-
-- (void)startDeckTimer {
-    [self stopDeckTimer];
-    _deckTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                        _deckStateQueue);
-    dispatch_source_set_timer(_deckTimer, DISPATCH_TIME_NOW,
-                              1 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(_deckTimer, ^{
-        fprintf(stderr, "[deck] Timer tick\n");
-        [self pushDeckState];
-    });
-    dispatch_resume(_deckTimer);
-    NSLog(@"[deck] Started deck state timer");
-}
-
-- (void)stopDeckTimer {
-    if (_deckTimer) {
-        dispatch_source_cancel(_deckTimer);
-        _deckTimer = nil;
-        NSLog(@"[deck] Stopped deck state timer");
+    // The helper answers each request with a fresh snapshot stamped with gen;
+    // the later ones catch the player settling after the media key.
+    NSString* request = [NSString stringWithFormat:@"%llu", (unsigned long long)gen];
+    for (int64_t delayMs : {0, 150, 400}) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayMs * (int64_t)NSEC_PER_MSEC),
+                       _deckStateQueue, ^{
+            [self->_nowPlayingHelper writeLine:request];
+        });
     }
+}
+
+/// Called from the stream queue once the pipeline runs.
+- (void)startDeckFeed {
+    [self stopDeckFeed];
+    dispatch_async(_deckStateQueue, ^{
+        self->_deckActive = YES;
+        self->_lastSentVolumeLevel = -1;
+        self->_lastSentVolumeMuted = -1;
+        self->_lastSentMediaJSON.clear();
+        self->_lastLoggedPlaying = NO;
+        self->_nowPlayingSnapshot = nil;
+
+        [self startVolumeObserver];
+        [self pushDeckVolumeStateForce:YES];
+        [self startNowPlayingHelper];
+
+        // The tablet shows elapsed/total but does not advance it: tick the
+        // progress while playing (no process spawn; paused sends nothing).
+        self->_deckProgressTimer =
+            dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self->_deckStateQueue);
+        dispatch_source_set_timer(self->_deckProgressTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                                  NSEC_PER_SEC, 250 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(self->_deckProgressTimer, ^{
+            if ([self->_nowPlayingSnapshot[@"playing"] boolValue]) {
+                [self pushDeckMediaState];
+            }
+        });
+        dispatch_resume(self->_deckProgressTimer);
+        NSLog(@"[deck] Started deck feed");
+    });
+}
+
+/// Never call it on the deck queue.
+- (void)stopDeckFeed {
+    dispatch_sync(_deckStateQueue, ^{
+        if (!self->_deckActive) return;
+        self->_deckActive = NO;
+        if (self->_deckProgressTimer) {
+            dispatch_source_cancel(self->_deckProgressTimer);
+            self->_deckProgressTimer = nil;
+        }
+        [self stopVolumeObserver];
+        [self->_nowPlayingHelper terminate];
+        self->_nowPlayingHelper = nil;
+        self->_nowPlayingSnapshot = nil;
+        NSLog(@"[deck] Stopped deck feed");
+    });
 }
 
 // -----------------------------------------------------------------------------
@@ -2625,73 +2803,180 @@ static void clamp_high_fps(StreamSettings& s) {
 }
 
 // -----------------------------------------------------------------------------
-#pragma mark - ADB Device Detection Timer
+#pragma mark - USB Device Detection (adb track-devices)
 // -----------------------------------------------------------------------------
 
-- (void)startDeviceDetectionTimer {
-    _deviceTimer = [NSTimer scheduledTimerWithTimeInterval:3.0
-                                                    target:self
-                                                  selector:@selector(deviceTimerFired:)
-                                                  userInfo:nil
-                                                   repeats:YES];
+- (void)startDeviceDetection {
+    _adbTrackQueue = dispatch_queue_create("com.droidscreen.adb-track", DISPATCH_QUEUE_SERIAL);
+    if (!g_cliForceWifi) {
+        dispatch_async(_adbTrackQueue, ^{
+            self->_adbTrackActive = YES;
+            [self startAdbTracker];
+        });
+    }
+    // Idle-only retry: the Android app being opened on a plugged-in tablet
+    // and a failed Wi-Fi auto-connect produce no event to react to.
+    _autoConnectTimer = [NSTimer scheduledTimerWithTimeInterval:3.0
+                                                         target:self
+                                                       selector:@selector(autoConnectTimerFired:)
+                                                       userInfo:nil
+                                                        repeats:YES];
+    _autoConnectTimer.tolerance = 1.0;
 }
 
-- (void)stopDeviceDetectionTimer {
-    [_deviceTimer invalidate];
-    _deviceTimer = nil;
+- (void)stopDeviceDetection {
+    [_autoConnectTimer invalidate];
+    _autoConnectTimer = nil;
+    if (!_adbTrackQueue) return;
+    dispatch_sync(_adbTrackQueue, ^{
+        self->_adbTrackActive = NO;
+        [self->_adbTracker terminate];
+        self->_adbTracker = nil;
+    });
 }
 
-- (void)deviceTimerFired:(NSTimer*)timer {
-    // Run device check off the main thread.
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        if (g_cliForceWifi) {
-            [self autoConnectWifiIfPaired];
+/// Starts one `adb track-devices`: adb pushes the full device list on start
+/// and on every change. Restarted if it exits (adb server killed or
+/// restarted). adb track queue.
+- (void)startAdbTracker {
+    if (!_adbTrackActive || _adbTracker) return;
+    __weak AppDelegate* weakSelf = self;
+    auto retryLater = ^(int64_t seconds) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, seconds * (int64_t)NSEC_PER_SEC),
+                       self->_adbTrackQueue, ^{
+            [weakSelf startAdbTracker];
+        });
+    };
+
+    NSString* adbPath = adb_find_path();
+    if (!adbPath) {
+        retryLater(5);
+        return;
+    }
+    _adbTrackBuffer = [NSMutableData data];
+    _adbTracker = [DSChildProcess spawn:adbPath
+                                   args:@[@"track-devices"]
+                              withStdin:NO
+                            stderrToLog:NO
+                                  queue:_adbTrackQueue
+                                 onData:^(NSData* data) {
+        AppDelegate* strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_adbTrackBuffer appendData:data];
+        [strongSelf drainAdbTrackBuffer];
+    }
+                                 onExit:^(int status) {
+        AppDelegate* strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf->_adbTrackActive) return;
+        NSLog(@"[ADB] track-devices exited (status %d), restarting in 1 s", status);
+        strongSelf->_adbTracker = nil;
+        retryLater(1);
+    }];
+    if (!_adbTracker) {
+        retryLater(5);
+        return;
+    }
+    NSLog(@"[ADB] Tracking devices with %@ track-devices", adbPath);
+}
+
+/// track-devices output is a sequence of messages: 4 hex digits with the
+/// payload length, then "serial\tstate\n" lines. adb track queue.
+- (void)drainAdbTrackBuffer {
+    for (;;) {
+        if (_adbTrackBuffer.length < 4) return;
+        char hex[5] = {0};
+        memcpy(hex, _adbTrackBuffer.bytes, 4);
+        char* end = nullptr;
+        unsigned long length = strtoul(hex, &end, 16);
+        if (end != hex + 4) {
+            NSLog(@"[ADB] Unexpected track-devices output, restarting it");
+            [_adbTracker terminate];
+            _adbTracker = nil;
+            [self startAdbTracker];
             return;
         }
-        BOOL connected = adb_device_connected();
-        if (connected != self->_usbDevicePresent) {
-            NSString* serial = connected ? adb_device_serial() : nil;
-            NSString* name = connected ? adb_device_name() : nil;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self->_usbDevicePresent = connected;
-                self->_usbDeviceKey = serial ? [@"usb:" stringByAppendingString:serial] : nil;
-                self->_usbDeviceName = name;
-                [self pushUIState];
-            });
+        if (_adbTrackBuffer.length < 4 + length) return;
+        NSString* payload = [[NSString alloc]
+            initWithBytes:(const char*)_adbTrackBuffer.bytes + 4
+                   length:length
+                 encoding:NSUTF8StringEncoding] ?: @"";
+        [_adbTrackBuffer replaceBytesInRange:NSMakeRange(0, 4 + length) withBytes:NULL length:0];
+        [self handleAdbDeviceList:payload];
+    }
+}
+
+/// A fresh device list from adb. adb track queue.
+- (void)handleAdbDeviceList:(NSString*)list {
+    NSString* usbSerial = nil;
+    for (NSString* line in [list componentsSeparatedByString:@"\n"]) {
+        NSArray<NSString*>* fields = [line componentsSeparatedByString:@"\t"];
+        if (fields.count >= 2 && [fields[1] isEqualToString:@"device"] &&
+            adb_serial_is_usb(fields[0])) {
+            usbSerial = fields[0];
+            break;
         }
+    }
+    BOOL connected = usbSerial != nil;
 
-        if (!connected) {
-            // Wi-Fi streams don't depend on the cable; only offer Wi-Fi auto-connect.
-            if (self->_isStreaming && self->_streamingOverWifi) return;
-            if (!self->_isStreaming) {
-                [self autoConnectWifiIfPaired];
-                return;
-            }
+    if (!(_adbTrackUsbSerial == usbSerial || [_adbTrackUsbSerial isEqualToString:usbSerial])) {
+        _adbTrackUsbSerial = usbSerial;
+        NSString* name = connected ? adb_device_name() : nil;
+        NSLog(@"[ADB] USB device %@", connected ? usbSerial : @"removed");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self->_usbDevicePresent = connected;
+            self->_usbDeviceKey = usbSerial ? [@"usb:" stringByAppendingString:usbSerial] : nil;
+            self->_usbDeviceName = name;
+            [self pushUIState];
+        });
+    }
 
-            // Device physically removed — reset the user-disconnect flag so
-            // auto-connect kicks in when the device is plugged back in.
-            self->_userDisconnected = NO;
+    if (connected) {
+        [self autoConnectUsbIfAppRunning];
+        return;
+    }
+    // Wi-Fi streams don't depend on the cable; only offer Wi-Fi auto-connect.
+    if (!_isStreaming) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [self autoConnectWifiIfPaired];
+        });
+        return;
+    }
+    if (_streamingOverWifi) return;
 
-            if (self->_isStreaming) {
-                NSLog(@"[AutoConnect] Device disconnected, stopping...");
-                dispatch_async(self->_streamQueue, ^{
-                    if (self->_isStreaming) {
-                        [self disconnectSync];
-                    }
-                });
-            }
-        } else if (connected && !self->_isStreaming && !self->_isBusy
-                   && !self->_userDisconnected) {
-            // Device connected but not streaming — check if DroidScreen app is running.
-            if (adb_droidscreen_running()) {
-                NSLog(@"[AutoConnect] DroidScreen detected on device, connecting...");
-                dispatch_async(self->_streamQueue, ^{
-                    if (!self->_isStreaming) {
-                        [self connectSync];
-                    }
-                });
-            }
+    // Device physically removed — reset the user-disconnect flag so
+    // auto-connect kicks in when the device is plugged back in.
+    _userDisconnected = NO;
+    NSLog(@"[AutoConnect] Device disconnected, stopping...");
+    dispatch_async(_streamQueue, ^{
+        if (self->_isStreaming) {
+            [self disconnectSync];
         }
+    });
+}
+
+/// USB device attached but not streaming: connect once the DroidScreen app
+/// runs on it. adb track queue.
+- (void)autoConnectUsbIfAppRunning {
+    if (!_adbTrackUsbSerial || _isStreaming || _isBusy || _userDisconnected) return;
+    if (!adb_droidscreen_running()) return;
+    NSLog(@"[AutoConnect] DroidScreen detected on device, connecting...");
+    dispatch_async(_streamQueue, ^{
+        if (!self->_isStreaming) {
+            [self connectSync];
+        }
+    });
+}
+
+- (void)autoConnectTimerFired:(NSTimer*)timer {
+    if (_isStreaming || _isBusy) return;
+    if (g_cliForceWifi || !_usbDevicePresent) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [self autoConnectWifiIfPaired];
+        });
+        return;
+    }
+    dispatch_async(_adbTrackQueue, ^{
+        [self autoConnectUsbIfAppRunning];
     });
 }
 

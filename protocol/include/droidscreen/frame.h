@@ -43,8 +43,8 @@ size_t ds_frame_wrap(uint8_t *out_buf, size_t out_buf_size,
 void ds_frame_parse_flags(uint8_t flags, int *is_keyframe, int *is_config);
 
 #define DS_VIDEO_TELEMETRY_MAGIC 0x544C5344u /* "DSLT" little-endian */
-#define DS_VIDEO_TELEMETRY_VERSION 2u
-#define DS_VIDEO_TELEMETRY_SIZE 56u
+#define DS_VIDEO_TELEMETRY_VERSION 3u
+#define DS_VIDEO_TELEMETRY_SIZE 80u
 #define DS_VIDEO_TELEMETRY_FLAG_IDLE 0x00000001u
 
 typedef struct {
@@ -54,6 +54,17 @@ typedef struct {
     int64_t capture_to_send_us;
     int64_t rtt_us;
     uint32_t flags;
+    /* Clock-offset uncertainty (best ping RTT / 2); 0 = no offset estimate. */
+    uint32_t clock_uncertainty_us;
+    /* Desktop steady clock (us) when the compositor showed this frame
+     * (SCK DisplayTime / WGC SystemRelativeTime); 0 = unknown. Telemetry only,
+     * never the encoder PTS. */
+    int64_t display_time_us;
+    /* Desktop steady clock (us) when the send thread started writing it. */
+    int64_t desktop_send_us;
+    /* Estimated android_monotonic_us - desktop_steady_us. Valid only when
+     * clock_uncertainty_us > 0. */
+    int64_t clock_offset_us;
 } ds_video_telemetry_t;
 
 size_t ds_frame_write_telemetry(uint8_t *buf, size_t buf_size,

@@ -1,11 +1,9 @@
 /*
- * DroidScreen Desktop - Adaptive bitrate controller (AIMD on send-queue depth)
+ * DroidScreen Desktop - Adaptive bitrate controller (AIMD on queueing delay)
  *
- * See rate_controller.h. The controller reacts to the local send queue, which
- * is the earliest place congestion shows up: it only backs up when the encoder
- * outpaces what the transport + Android decoder can drain. On sustained
- * congestion we cut bitrate multiplicatively (fast relief); on sustained clear
- * we ramp back up additively toward the configured ceiling (the user's "tope").
+ * See rate_controller.h for the two congestion signals (sender delay and
+ * receiver backlog). Sustained congestion cuts bitrate multiplicatively; a
+ * sustained clear link ramps it back additively toward the user's "tope".
  */
 
 #include "droidscreen/rate_controller.h"
@@ -45,21 +43,31 @@ void RateController::apply_locked(uint32_t new_kbps, const char* reason) {
     }
 }
 
-void RateController::update(size_t send_queue_depth, size_t send_queue_capacity) {
+void RateController::update(int64_t sender_delay_us,
+                            int64_t receiver_backlog_bytes,
+                            int64_t frame_interval_us) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Congested when the queue is at/above ~75% of capacity (the encoder is
-    // outrunning the drain). Clear only when it is fully empty.
-    const size_t congested_threshold =
-        send_queue_capacity > 1 ? (send_queue_capacity * 3) / 4 : 1;
-    const bool congested = send_queue_depth >= congested_threshold;
-    const bool clear = send_queue_depth == 0;
+    const int64_t interval = frame_interval_us > 0 ? frame_interval_us : 16667;
+    // bytes -> ms at the current bitrate: bytes * 8 / kbps.
+    const int64_t receiver_ms = receiver_backlog_bytes >= 0 && current_kbps_ > 0
+        ? receiver_backlog_bytes * 8 / static_cast<int64_t>(current_kbps_)
+        : -1;
+
+    const bool congested =
+        sender_delay_us > kSenderCongestedFrames * interval ||
+        receiver_ms > kReceiverCongestedMs;
+    const bool clear =
+        sender_delay_us <= kSenderClearFrames * interval &&
+        receiver_ms >= 0 && receiver_ms < kReceiverClearMs;
 
     if (congested) {
         congested_run_++;
         clear_run_ = 0;
         if (congested_run_ >= kSamplesBeforeDecrease) {
             congested_run_ = 0;
+            fprintf(stderr, "[rate] congestion: sender_delay=%.1fms receiver_backlog=%lldms\n",
+                    sender_delay_us / 1000.0, static_cast<long long>(receiver_ms));
             apply_locked(static_cast<uint32_t>(current_kbps_ * kDecreaseFactor),
                          "congestion, cutting bitrate");
         }
@@ -72,8 +80,7 @@ void RateController::update(size_t send_queue_depth, size_t send_queue_capacity)
                          "link clear, ramping bitrate");
         }
     } else {
-        // Partial occupancy: neither pressure nor fully idle. Decay both runs so
-        // we neither cut nor ramp on borderline load.
+        // Borderline load: neither cut nor ramp.
         if (congested_run_ > 0) congested_run_--;
         if (clear_run_ > 0) clear_run_--;
     }

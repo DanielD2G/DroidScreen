@@ -21,7 +21,10 @@ struct CapturedFrame {
     CapturedFrameReleaseFn release_fn = nullptr;
     uint32_t width;
     uint32_t height;
-    int64_t timestamp_us;
+    int64_t timestamp_us;  // steady clock when the frame reached the app (PTS source)
+    // Steady clock (us) when the compositor showed this frame; 0 = unknown.
+    // Telemetry only: never used as the encoder PTS.
+    int64_t display_time_us = 0;
     bool is_idle;          // true if the frame content hasn't changed
     float motion_score = 0.0f;  // average luma delta vs previous frame (0..255)
 };

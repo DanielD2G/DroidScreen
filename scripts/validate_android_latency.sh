@@ -9,7 +9,10 @@ RUN_SECONDS="${RUN_SECONDS:-30}"
 # tablet already paired with this Mac (adb is still used for logs/screenshots).
 TRANSPORT="${TRANSPORT:-usb}"
 WIFI_TABLET="${WIFI_TABLET:-}"          # name or id; empty = any paired tablet
-MAX_RELEASE_MS="${MAX_RELEASE_MS:-15}"  # fail threshold for release_p50
+# Fail thresholds for desktop compositor -> Android render (real render time
+# from MediaCodec onFrameRendered, clocks aligned with the ping offset).
+MAX_P50_MS="${MAX_P50_MS:-25}"
+MAX_P95_MS="${MAX_P95_MS:-40}"
 VALIDATION_SCENE="${VALIDATION_SCENE:-1}" # 1 = moving window, 0 = static desktop
 # BURST_EVERY=N: move the cursor over the virtual display every N seconds and
 # report the latency of the first frame after each still period ("wake").
@@ -204,61 +207,66 @@ parse_metrics() {
   local log="$1"
   local desktop_log="${2:-}"
   local run_dir="${3:-}"
-  python3 - "$log" "$desktop_log" "$MAX_RELEASE_MS" "$run_dir" <<'PY'
+  python3 - "$log" "$desktop_log" "$MAX_P50_MS" "$MAX_P95_MS" "$run_dir" <<'PY'
 import re
 import statistics
 import sys
 
-lat_pattern = re.compile(
-    r"lat feed=([0-9.]+)ms release=([0-9.]+)ms desk=([0-9.]+)ms android=([0-9.]+)ms rtt=([0-9.]+)ms(?: capenc=([0-9.]+)ms encsend=([0-9.]+)ms)?"
-)
+# One Android line every ~2 s, percentiles over every frame of that window:
+# decode[sync]: fed=N rendered=N err=N | F fed/s R render/s idle=N skip=N |
+#   ring=B bytes N frames Mms dec=N |
+#   comp_render n=N p50=X p95=X p99=X max=X | send_render n=... | recv_render n=... |
+#   clock_unc=Xms rtt=Xms capsend=Xms | cb=N expired=N
 decode_pattern = re.compile(
     r"decode\[[^\]]+\]: fed=(\d+) rendered=(\d+) err=(\d+) \| "
-    r"([0-9.]+) fed/s ([0-9.]+) render/s"
+    r"([0-9.]+) fed/s ([0-9.]+) render/s idle=(\d+) skip=(\d+)"
 )
+def lat_pattern(name):
+    return re.compile(
+        name + r" n=(\d+) p50=(-?[0-9.]+) p95=(-?[0-9.]+) p99=(-?[0-9.]+) max=(-?[0-9.]+)"
+    )
+lat_patterns = {k: lat_pattern(k) for k in ("comp_render", "send_render", "recv_render")}
+ring_pattern = re.compile(r"ring=(\d+) bytes (\d+) frames ([0-9.]+)ms dec=(\d+)")
+clock_pattern = re.compile(r"clock_unc=([0-9.]+)ms rtt=([0-9.]+)ms capsend=([0-9.]+)ms")
 quality_pattern = re.compile(
     r"\[quality\] fps=([0-9.]+) kbps=([0-9.]+) frame=([0-9.]+)kb "
     r"delta=([0-9.]+)kb key=([0-9.]+)kb motion=([0-9.]+) "
     r"bits_per_motion=([0-9.]+)"
 )
-feed = []
-release = []
-desk = []
-android = []
-rtt = []
-capenc = []
-encsend = []
+windows = {k: [] for k in lat_patterns}   # (n, p50, p95, p99, max)
 feed_fps = []
 render_fps = []
 feed_errors = []
 skips = []
-skip_pattern = re.compile(r"skip=(\d+)")
+ring_ms = []
+clock_unc = []
+rtt = []
+capsend = []
 quality_fps = []
 quality_kbps = []
 quality_frame_kb = []
 quality_motion = []
 quality_bits_per_motion = []
 for line in open(sys.argv[1], errors="ignore"):
-    m = lat_pattern.search(line)
-    if m:
-        vals = [float(x) for x in m.groups()[:5]]
-        feed.append(vals[0])
-        release.append(vals[1])
-        desk.append(vals[2])
-        android.append(vals[3])
-        rtt.append(vals[4])
-        if m.group(6) is not None:
-            capenc.append(float(m.group(6)))
-            encsend.append(float(m.group(7)))
-
     d = decode_pattern.search(line)
-    if d:
-        feed_errors.append(int(d.group(3)))
-        sk = skip_pattern.search(line)
-        if sk:
-            skips.append(int(sk.group(1)))
-        feed_fps.append(float(d.group(4)))
-        render_fps.append(float(d.group(5)))
+    if not d:
+        continue
+    feed_errors.append(int(d.group(3)))
+    feed_fps.append(float(d.group(4)))
+    render_fps.append(float(d.group(5)))
+    skips.append(int(d.group(7)))
+    for k, pat in lat_patterns.items():
+        m = pat.search(line)
+        if m and int(m.group(1)) > 0:
+            windows[k].append((int(m.group(1)),) + tuple(float(x) for x in m.groups()[1:]))
+    r = ring_pattern.search(line)
+    if r:
+        ring_ms.append(float(r.group(3)))
+    c = clock_pattern.search(line)
+    if c:
+        clock_unc.append(float(c.group(1)))
+        rtt.append(float(c.group(2)))
+        capsend.append(float(c.group(3)))
 
 stats_pattern = re.compile(r"\[Stats\].*rtt=(\d+) us.*send_q=(\d+)(?: enc_ms=([0-9.]+))?")
 rtt_desktop = []
@@ -290,73 +298,106 @@ if len(sys.argv) > 2 and sys.argv[2]:
             quality_motion.append(float(q.group(6)))
             quality_bits_per_motion.append(float(q.group(7)))
 
-if not release:
-    print("metrics=none")
-    raise SystemExit(2)
-
 def p50(xs):
     return statistics.median(xs)
 
-extra = ""
-if capenc:
-    extra = f" capenc_p50={p50(capenc):.1f} encsend_p50={p50(encsend):.1f}"
-if feed_fps:
-    extra += (
-        f" fed_fps_p50={p50(feed_fps):.1f}"
-        f" render_fps_p50={p50(render_fps):.1f}"
-        f" feed_errors_max={max(feed_errors)}"
-        f" skipped_max={max(skips) if skips else 0}"
+def weighted_median(pairs):
+    """pairs: (weight, value); median of the values weighted by sample count."""
+    pairs = sorted(pairs, key=lambda p: p[1])
+    total = sum(w for w, _ in pairs)
+    acc = 0
+    for w, v in pairs:
+        acc += w
+        if acc * 2 >= total:
+            return v
+    return pairs[-1][1]
+
+def summary(name):
+    ws = windows[name]
+    if not ws:
+        return None
+    return {
+        "n": sum(w[0] for w in ws),
+        "p50": weighted_median([(w[0], w[1]) for w in ws]),
+        "p95": weighted_median([(w[0], w[2]) for w in ws]),
+        "p99_max": max(w[3] for w in ws),
+        "max": max(w[4] for w in ws),
+    }
+
+if not feed_fps:
+    print("metrics=none (no decode[] lines)")
+    raise SystemExit(2)
+
+out = []
+sums = {k: summary(k) for k in windows}
+for k in ("comp_render", "send_render", "recv_render"):
+    s_ = sums[k]
+    if s_:
+        out.append(
+            f"{k}_n={s_['n']} {k}_p50={s_['p50']:.1f} {k}_p95={s_['p95']:.1f} "
+            f"{k}_p99max={s_['p99_max']:.1f} {k}_max={s_['max']:.1f}"
+        )
+    else:
+        out.append(f"{k}_n=0")
+out.append(
+    f"fed_fps_p50={p50(feed_fps):.1f} render_fps_p50={p50(render_fps):.1f}"
+    f" feed_errors_max={max(feed_errors)} skipped_max={max(skips)}"
+)
+if ring_ms:
+    out.append(f"ring_ms_p50={p50(ring_ms):.0f} ring_ms_max={max(ring_ms):.0f}")
+if clock_unc:
+    out.append(
+        f"clock_unc_p50={p50(clock_unc):.2f} rtt_p50={p50(rtt):.1f} capsend_p50={p50(capsend):.1f}"
     )
 if quality_kbps:
-    extra += (
-        f" quality_kbps_p50={p50(quality_kbps):.0f}"
+    out.append(
+        f"quality_kbps_p50={p50(quality_kbps):.0f}"
         f" motion_p50={p50(quality_motion):.2f}"
         f" bits_per_motion_p50={p50(quality_bits_per_motion):.0f}"
         f" qframe_kb_p50={p50(quality_frame_kb):.1f}"
     )
 if rtt_desktop:
-    extra += (
-        f" desk_rtt_p50={p50(rtt_desktop):.1f} desk_rtt_max={max(rtt_desktop):.1f}"
+    out.append(
+        f"desk_rtt_p50={p50(rtt_desktop):.1f} desk_rtt_max={max(rtt_desktop):.1f}"
         f" send_q_max={max(send_q)}"
     )
 if enc_ms:
-    extra += f" vt_enc_ms_p50={p50(enc_ms):.2f}"
+    out.append(f"vt_enc_ms_p50={p50(enc_ms):.2f}")
 
-def p95(xs):
-    ordered = sorted(xs)
-    return ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
-
-extra += f" release_p95={p95(release):.1f} release_max={max(release):.1f}"
 wake = []
-wake_pattern = re.compile(r"wake: gap=\d+ms e2e=([0-9.]+)ms")
+wake_pattern = re.compile(r"wake: gap=\d+ms comp_render=(-?[0-9.]+)ms")
 for line in open(sys.argv[1], errors="ignore"):
     w = wake_pattern.search(line)
-    if w:
+    if w and float(w.group(1)) >= 0:
         wake.append(float(w.group(1)))
 if wake:
-    extra += f" wake_n={len(wake)} wake_p50={p50(wake):.1f} wake_max={max(wake):.1f}"
+    out.append(f"wake_n={len(wake)} wake_p50={p50(wake):.1f} wake_max={max(wake):.1f}")
+
 import os
-if len(sys.argv) > 4 and sys.argv[4]:
+if len(sys.argv) > 5 and sys.argv[5]:
     try:
-        cpu = [float(x) for x in open(os.path.join(sys.argv[4], "cpu.txt")) if x.strip()]
+        cpu = [float(x) for x in open(os.path.join(sys.argv[5], "cpu.txt")) if x.strip()]
         cpu = cpu[3:] or cpu  # skip startup samples
         if cpu:
-            extra += f" mac_cpu_p50={p50(cpu):.1f}% mac_cpu_max={max(cpu):.1f}%"
+            out.append(f"mac_cpu_p50={p50(cpu):.1f}% mac_cpu_max={max(cpu):.1f}%")
     except (OSError, ValueError):
         pass
     try:
-        acpu = open(os.path.join(sys.argv[4], "android-cpu.txt")).read().split()
+        acpu = open(os.path.join(sys.argv[5], "android-cpu.txt")).read().split()
         if acpu:
-            extra += f" android_cpu={acpu[0]}%"
+            out.append(f"android_cpu={acpu[0]}%")
     except OSError:
         pass
-print(
-    f"samples={len(release)} "
-    f"feed_p50={p50(feed):.1f} release_p50={p50(release):.1f} "
-    f"desk_p50={p50(desk):.1f} android_p50={p50(android):.1f} rtt_p50={p50(rtt):.1f}"
-    f"{extra} release_last={release[-1]:.1f}"
-)
-if p50(release) > float(sys.argv[3]) or (feed_errors and max(feed_errors) > 3):
+print(" ".join(out))
+
+# Gate: compositor -> render needs the desktop's display time and a clock
+# offset estimate (telemetry v3). Without them there is nothing to gate on.
+gate = sums["comp_render"]
+if not gate:
+    print("metrics=none (no comp_render samples: desktop sent no display_time/clock offset)")
+    raise SystemExit(2)
+if (gate["p50"] > float(sys.argv[3]) or gate["p95"] > float(sys.argv[4])
+        or max(feed_errors) > 3):
     raise SystemExit(3)
 PY
 }
@@ -438,7 +479,7 @@ for run in $(seq 1 "$RUNS"); do
     echo "[validate] expected a Wi-Fi connection but the tablet saw USB" >&2
     exit 4
   fi
-  wait_for_log "lat feed=" "$RUN_DIR/logcat.txt" 35
+  wait_for_log "decode\[" "$RUN_DIR/logcat.txt" 35
   if [[ "$BURST_EVERY" != "0" ]]; then
     VD_ID="$(grep -aoE 'Virtual display created \(ID=[0-9]+' "$DESKTOP_DEBUG_LOG" | tail -1 | grep -oE '[0-9]+$')"
     swiftc -O "$ROOT_DIR/scripts/tools/burst_cursor.swift" -o "$BUILD_DIR/burst_cursor" 2>/dev/null || true

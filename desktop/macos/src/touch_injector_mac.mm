@@ -145,9 +145,20 @@ bool MacTouchInjector::init(uint32_t /*w*/, uint32_t /*h*/,
     return true;
 }
 
+void MacTouchInjector::display_reconfigured(CGDirectDisplayID /*display*/,
+                                     CGDisplayChangeSummaryFlags /*flags*/,
+                                     void* user_info) {
+    static_cast<MacTouchInjector*>(user_info)->bounds_valid_.store(false, std::memory_order_release);
+}
+
 void MacTouchInjector::set_display_id(CGDirectDisplayID did) {
     std::lock_guard<std::mutex> lock(mutex_);
     display_id_ = did;
+    bounds_valid_.store(false, std::memory_order_release);
+    if (!reconfig_registered_) {
+        CGDisplayRegisterReconfigurationCallback(&MacTouchInjector::display_reconfigured, this);
+        reconfig_registered_ = true;
+    }
 
     CGRect bounds = CGDisplayBounds(did);
     fprintf(stderr, "[touch] display %u bounds: origin=(%.0f,%.0f) size=%.0fx%.0f\n",
@@ -160,9 +171,12 @@ void MacTouchInjector::set_display_id(CGDirectDisplayID did) {
 // ---------------------------------------------------------------------------
 
 CGPoint MacTouchInjector::map_to_screen(uint16_t x_frac, uint16_t y_frac) const {
-    // Query display bounds LIVE so we are always correct regardless of
-    // HiDPI mode, user-selected resolution, or display rearrangement.
-    CGRect bounds = CGDisplayBounds(display_id_);
+    // Cleared by display_reconfigured(); clear the flag before reading so a
+    // reconfiguration landing mid-read forces another read on the next event.
+    if (!bounds_valid_.exchange(true, std::memory_order_acq_rel)) {
+        bounds_cache_ = CGDisplayBounds(display_id_);
+    }
+    const CGRect bounds = bounds_cache_;
 
     double screen_x = bounds.origin.x +
                       (static_cast<double>(x_frac) / 65535.0) * bounds.size.width;
@@ -1035,6 +1049,12 @@ void MacTouchInjector::shutdown() {
 
     std::lock_guard<std::mutex> lock(mutex_);
     worker_stop_ = false;
+
+    if (reconfig_registered_) {
+        CGDisplayRemoveReconfigurationCallback(&MacTouchInjector::display_reconfigured, this);
+        reconfig_registered_ = false;
+        bounds_valid_.store(false, std::memory_order_release);
+    }
 
     if (event_source_) {
         CFRelease(event_source_);

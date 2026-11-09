@@ -169,14 +169,19 @@ bool FFmpegEncoder::try_encoder(const char* encoder_name,
         av_opt_set(ctx->priv_data, "tune",   "ull", 0);
         av_opt_set(ctx->priv_data, "rc",     "cbr", 0);
         av_opt_set(ctx->priv_data, "zerolatency", "1", 0);
+        // A requested keyframe must be an IDR (a clean decoder entry point),
+        // not just an intra frame: the tablet recovers from loss with it.
+        av_opt_set(ctx->priv_data, "forced-idr", "1", 0);
     } else if (strcmp(encoder_name, "h264_qsv") == 0) {
         av_opt_set(ctx->priv_data, "preset",   "veryfast", 0);
         av_opt_set(ctx->priv_data, "scenario", "livestreaming", 0);
+        av_opt_set(ctx->priv_data, "forced_idr", "1", 0);
         ctx->thread_count = 1;
     } else if (strcmp(encoder_name, "h264_amf") == 0) {
         av_opt_set(ctx->priv_data, "usage",   "ultralowlatency", 0);
         av_opt_set(ctx->priv_data, "quality", "speed", 0);
         av_opt_set(ctx->priv_data, "rc",      "cbr", 0);
+        av_opt_set(ctx->priv_data, "forced_idr", "1", 0);
     }
 
     int ret = avcodec_open2(ctx, codec, nullptr);
@@ -400,6 +405,7 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
 
     // Step 3: Set frame properties.
     hw_frame_->pts = frame_index_++;
+    pts_timestamps_[hw_frame_->pts % kPtsMapSize] = timestamp_us;
 
     if (keyframe_pending_.exchange(false)) {
         hw_frame_->pict_type = AV_PICTURE_TYPE_I;
@@ -436,8 +442,13 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
         bool is_keyframe = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
 
         // On the first keyframe, emit SPS/PPS as a config packet.
+        // A packet may belong to an earlier submit: tag it with that frame's
+        // capture timestamp, looked up by its PTS.
+        const int64_t pkt_timestamp_us =
+            pts_timestamps_[pkt_->pts % kPtsMapSize];
+
         if (is_keyframe && !config_sent_) {
-            emit_config(pkt_->data, pkt_->size, timestamp_us, on_packet);
+            emit_config(pkt_->data, pkt_->size, pkt_timestamp_us, on_packet);
         }
 
         // Emit the encoded frame data.
@@ -447,7 +458,7 @@ bool FFmpegEncoder::encode(void* native_frame, int64_t timestamp_us,
             epkt.size         = static_cast<size_t>(pkt_->size);
             epkt.is_keyframe  = is_keyframe;
             epkt.is_config    = false;
-            epkt.timestamp_us = timestamp_us;
+            epkt.timestamp_us = pkt_timestamp_us;
             on_packet(epkt);
         }
 

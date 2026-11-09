@@ -22,6 +22,7 @@ add_library(droidscreen_native SHARED
     mouse_sender.cpp
     deck_sender.cpp
     key_sender.cpp
+    outbound.cpp
 )
 
 target_include_directories(droidscreen_native PRIVATE
@@ -32,5 +33,6 @@ target_link_libraries(droidscreen_native
     droidscreen_protocol
     mediandk
     android
+    nativewindow
     log
 )

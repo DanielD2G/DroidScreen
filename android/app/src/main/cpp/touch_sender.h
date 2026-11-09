@@ -1,28 +1,20 @@
 /*
- * DroidScreen - Touch event sender
+ * DroidScreen - Touch event message builder
  */
 
 #ifndef DROIDSCREEN_TOUCH_SENDER_H
 #define DROIDSCREEN_TOUCH_SENDER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /*
- * Serialize and send a touch event over the TCP connection.
- * Sends DS_HEADER_SIZE + DS_TOUCH_EVENT_SIZE bytes.
- *
- * Returns 0 on success, -1 on error.
+ * Serialize a complete touch message (header + payload) into `out`
+ * (DS_OUTBOUND_MAX_MSG bytes). Stamped now, i.e. at enqueue time.
+ * Returns the message length.
  */
-int touch_sender_send(int fd, int action, int pointer_id,
-                      int x_frac, int y_frac, int pressure,
-                      int touch_major, int touch_minor, int orientation);
-
-#ifdef __cplusplus
-}
-#endif
+size_t touch_build(uint8_t *out, int action, int pointer_id,
+                   int x_frac, int y_frac, int pressure,
+                   int touch_major, int touch_minor, int orientation);
 
 #endif /* DROIDSCREEN_TOUCH_SENDER_H */

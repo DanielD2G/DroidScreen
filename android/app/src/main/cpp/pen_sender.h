@@ -1,23 +1,17 @@
 /*
- * DroidScreen - Pen event sender
+ * DroidScreen - Pen event message builder
  */
 
 #ifndef DROIDSCREEN_PEN_SENDER_H
 #define DROIDSCREEN_PEN_SENDER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int pen_sender_send(int fd, int action, int pointer_id,
-                    int tool_type, int buttons,
-                    int x_frac, int y_frac, int pressure,
-                    int distance, int tilt, int rotation);
-
-#ifdef __cplusplus
-}
-#endif
+/* Complete pen message into `out` (DS_OUTBOUND_MAX_MSG bytes), stamped now. */
+size_t pen_build(uint8_t *out, int action, int pointer_id,
+                 int tool_type, int buttons,
+                 int x_frac, int y_frac, int pressure,
+                 int distance, int tilt, int rotation);
 
 #endif /* DROIDSCREEN_PEN_SENDER_H */

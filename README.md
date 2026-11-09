@@ -172,7 +172,7 @@ DroidScreen uses a custom binary protocol optimized for real-time streaming over
 |---|---|---|
 | **macOS 13+** | Apple Silicon or Intel, Screen Recording permission | VideoToolbox (HEVC / H.264) |
 | **Windows 10+** | GPU with updated drivers | NVENC · QSV · AMF · libx264 (fallback) |
-| **Android 8.0+** (API 26) | USB debugging enabled | MediaCodec (HW decode) |
+| **Android 13+** (API 33) | USB debugging enabled | MediaCodec (HW decode) |
 
 ---
 

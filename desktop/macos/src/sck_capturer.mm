@@ -8,6 +8,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <dispatch/dispatch.h>
+#include <mach/mach_time.h>
 
 #include <algorithm>
 #include <chrono>
@@ -19,6 +20,40 @@ static int64_t steady_now_us() {
     auto tp = std::chrono::steady_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(
         tp.time_since_epoch()).count();
+}
+
+// Converts a mach_absolute_time value (SCK DisplayTime) to the steady clock
+// the pipeline uses, via the current offset between the two clocks.
+static int64_t mach_to_steady_us(uint64_t mach_time) {
+    static mach_timebase_info_data_t timebase = [] {
+        mach_timebase_info_data_t tb{};
+        mach_timebase_info(&tb);
+        return tb;
+    }();
+    const uint64_t now_mach = mach_absolute_time();
+    const int64_t now_steady = steady_now_us();
+    const int64_t delta_ticks = (int64_t)(now_mach - mach_time);
+    const int64_t delta_us =
+        delta_ticks * (int64_t)timebase.numer / (int64_t)timebase.denom / 1000;
+    return now_steady - delta_us;
+}
+
+// The per-frame motion score only feeds the [quality] diagnostic log, and it
+// locks the IOSurface for a CPU read on every frame. Opt in with
+// DROIDSCREEN_MOTION_DIAG=1.
+static bool motion_diagnostics_enabled() {
+    static const bool enabled = getenv("DROIDSCREEN_MOTION_DIAG") != nullptr;
+    return enabled;
+}
+
+// Serial, user-interactive queue for SCK sample delivery: frames are handled
+// one at a time and in order (a global queue is concurrent).
+static dispatch_queue_t sck_output_queue() {
+    static dispatch_queue_t queue = dispatch_queue_create(
+        "com.droidscreen.sck.output",
+        dispatch_queue_attr_make_with_qos_class(
+            DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
+    return queue;
 }
 
 static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) {
@@ -103,12 +138,25 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
     if (type != SCStreamOutputTypeScreen) return;
     if (!_owner) return;
 
+    const int64_t arrival_us = steady_now_us();
+    int64_t displayTimeUs = 0;
+
     // Check frame status -- skip idle frames.
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(
         sampleBuffer, false);
     if (attachments && CFArrayGetCount(attachments) > 0) {
         CFDictionaryRef dict =
             (CFDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+        if (dict) {
+            CFNumberRef displayTimeRef = (CFNumberRef)CFDictionaryGetValue(
+                dict, (__bridge CFStringRef)SCStreamFrameInfoDisplayTime);
+            uint64_t displayMach = 0;
+            if (displayTimeRef &&
+                CFNumberGetValue(displayTimeRef, kCFNumberSInt64Type, &displayMach) &&
+                displayMach > 0) {
+                displayTimeUs = mach_to_steady_us(displayMach);
+            }
+        }
         CFTypeRef statusRef = nullptr;
         if (dict) {
             statusRef = CFDictionaryGetValue(
@@ -144,7 +192,8 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
 
     CVPixelBufferRef pixelBuf = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!pixelBuf) return;
-    float motionScore = [self measureMotionScore:pixelBuf];
+    float motionScore = motion_diagnostics_enabled()
+        ? [self measureMotionScore:pixelBuf] : 0.0f;
 
     if (_sampleCount < 5) {
         CVReturn lockStatus =
@@ -196,7 +245,10 @@ static void release_cv_pixel_buffer(void* /*release_ctx*/, void* native_handle) 
     frame.release_fn = release_cv_pixel_buffer;
     frame.width  = (uint32_t)CVPixelBufferGetWidth(pixelBuf);
     frame.height = (uint32_t)CVPixelBufferGetHeight(pixelBuf);
-    frame.timestamp_us = steady_now_us();
+    // Arrival time (taken before any per-frame work) is the PTS source;
+    // the compositor's DisplayTime goes to telemetry only.
+    frame.timestamp_us = arrival_us;
+    frame.display_time_us = displayTimeUs;
     frame.is_idle = false;
     frame.motion_score = motionScore;
 
@@ -339,8 +391,7 @@ bool SCKCapturer::init_with_display_id(uint32_t cg_display_id,
     NSError* addErr = nil;
     [stream_ addStreamOutput:delegate_
                         type:SCStreamOutputTypeScreen
-              sampleHandlerQueue:dispatch_get_global_queue(
-                  QOS_CLASS_USER_INTERACTIVE, 0)
+              sampleHandlerQueue:sck_output_queue()
                        error:&addErr];
     if (addErr) {
         fprintf(stderr, "[sck] addStreamOutput failed: %s\n",
@@ -440,8 +491,7 @@ bool SCKCapturer::init(uint32_t display_index) {
     NSError* addErr = nil;
     [stream_ addStreamOutput:delegate_
                         type:SCStreamOutputTypeScreen
-              sampleHandlerQueue:dispatch_get_global_queue(
-                  QOS_CLASS_USER_INTERACTIVE, 0)
+              sampleHandlerQueue:sck_output_queue()
                        error:&addErr];
     if (addErr) {
         fprintf(stderr, "[sck] addStreamOutput failed: %s\n",

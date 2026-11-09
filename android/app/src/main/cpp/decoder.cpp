@@ -4,9 +4,14 @@
  * Uses the Android NDK AMediaCodec API to decode H.264 NAL units
  * and render directly to an ANativeWindow (SurfaceView).
  *
- * Two operation modes:
- *   - Sync (API 26+): polling with dequeueInputBuffer/dequeueOutputBuffer
- *   - Async (API 28+): AMediaCodec async callbacks, event-driven
+ * Two operation modes (never mixed on one codec):
+ *   - Sync (Qualcomm): the feed thread dequeues input buffers; a dedicated
+ *     output thread (owned here) is the single consumer of
+ *     dequeueOutputBuffer/releaseOutputBuffer.
+ *   - Async (others): AMediaCodec async callbacks, event-driven
+ *
+ * Both modes report real render times via AMediaCodec_setOnFrameRenderedCallback
+ * (API 33), which works with sync dequeue too.
  *
  * Vendor-specific low-latency flags sourced from Moonlight's
  * MediaCodecHelper.java — unrecognized keys are silently ignored.
@@ -18,46 +23,13 @@
 #include <media/NdkMediaFormat.h>
 #include <android/log.h>
 #include <android/api-level.h>
-#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <sys/resource.h>
+#include <atomic>
 #include <mutex>
-
-/* ---- Runtime binding for API 28+ async callback ----
- * We dlsym() the function so we can compile against minSdk 26
- * while using async callbacks on API 28+ devices at runtime. */
-typedef media_status_t (*PFN_setAsyncNotifyCallback)(
-    AMediaCodec*, AMediaCodecOnAsyncNotifyCallback, void*);
-
-static PFN_setAsyncNotifyCallback g_pfn_setAsync = nullptr;
-static bool g_async_resolved = false;
-
-typedef int32_t (*PFN_setFrameRate)(ANativeWindow*, float, int8_t);
-static PFN_setFrameRate g_pfn_setFrameRate = nullptr;
-static bool g_frame_rate_resolved = false;
-
-static PFN_setAsyncNotifyCallback resolve_async_callback() {
-    if (!g_async_resolved) {
-        g_async_resolved = true;
-        if (android_get_device_api_level() >= 28) {
-            g_pfn_setAsync = (PFN_setAsyncNotifyCallback)
-                dlsym(RTLD_DEFAULT, "AMediaCodec_setAsyncNotifyCallback");
-        }
-    }
-    return g_pfn_setAsync;
-}
-
-static PFN_setFrameRate resolve_set_frame_rate() {
-    if (!g_frame_rate_resolved) {
-        g_frame_rate_resolved = true;
-        if (android_get_device_api_level() >= 30) {
-            g_pfn_setFrameRate = (PFN_setFrameRate)
-                dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate");
-        }
-    }
-    return g_pfn_setFrameRate;
-}
 
 #define TAG "DroidScreen"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
@@ -65,12 +37,10 @@ static PFN_setFrameRate resolve_set_frame_rate() {
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-/* Input buffer dequeue timeout (sync mode only).
- * A small wait dramatically reduces dropped NALs under load without
- * adding noticeable end-to-end latency. */
-#define INPUT_TIMEOUT_US  1000
-/* Output buffer dequeue timeout (0 = non-blocking poll, sync mode only) */
-#define OUTPUT_TIMEOUT_US 0
+/* Sync output thread: how long one dequeueOutputBuffer may block. It is also
+ * the bound on how long decoder_destroy waits for the thread to notice the
+ * stop flag (MediaCodec has no way to interrupt a blocked dequeue). */
+#define OUTPUT_WAIT_US 10000
 
 /* Max entries in the lock-free input/output ring queues (must be power of 2) */
 #define ASYNC_QUEUE_CAP  32
@@ -96,9 +66,16 @@ struct DecoderContext {
     /* Wakeup callback — invoked from MediaCodec's internal thread */
     decoder_wakeup_fn wakeup_fn;
     void             *wakeup_userdata;
-    decoder_rendered_fn rendered_fn;
-    void               *rendered_userdata;
-    bool                render_in_callback;
+
+    /* Output observers */
+    decoder_released_fn       released_fn;
+    decoder_frame_rendered_fn frame_rendered_fn;
+    void                     *output_userdata;
+
+    /* Sync mode output thread */
+    pthread_t         output_thread;
+    bool              output_thread_started;
+    std::atomic<bool> output_running;
 
     /* Async mode: lock-free SPSC queues (producer = codec thread,
      * consumer = decode thread).  Atomic indices, fixed-size arrays. */
@@ -113,7 +90,8 @@ struct DecoderContext {
     std::mutex        output_mutex;
 };
 
-static void render_frame(DecoderContext *ctx, size_t index);
+static void release_output(DecoderContext *ctx, size_t index,
+                           int64_t pts_us, bool render);
 
 /* ---- Async queue helpers (single-producer, single-consumer) ---- */
 
@@ -166,15 +144,6 @@ static void on_async_output(AMediaCodec *codec, void *userdata,
                             int32_t index, AMediaCodecBufferInfo *bufferInfo) {
     (void)codec;
     DecoderContext *ctx = static_cast<DecoderContext*>(userdata);
-    if (ctx->render_in_callback &&
-            ctx->render_mode == RENDER_MODE_LOWEST_LATENCY) {
-        render_frame(ctx, (size_t)index);
-        if (ctx->rendered_fn) {
-            ctx->rendered_fn(ctx->rendered_userdata,
-                             bufferInfo->presentationTimeUs);
-        }
-        return;
-    }
     output_queue_push(ctx, index, bufferInfo);
     if (ctx->wakeup_fn) ctx->wakeup_fn(ctx->wakeup_userdata);
 }
@@ -191,6 +160,83 @@ static void on_async_error(AMediaCodec *codec, void *userdata,
                            const char *detail) {
     (void)codec; (void)userdata; (void)actionCode;
     LOGE("decoder_async: error %d: %s", (int)error, detail ? detail : "unknown");
+}
+
+static void on_frame_rendered(AMediaCodec *codec, void *userdata,
+                              int64_t media_time_us, int64_t system_nano) {
+    (void)codec;
+    DecoderContext *ctx = static_cast<DecoderContext*>(userdata);
+    if (ctx->frame_rendered_fn) {
+        ctx->frame_rendered_fn(ctx->output_userdata, media_time_us, system_nano);
+    }
+}
+
+/* ---- Sync output thread ----
+ * The only caller of dequeueOutputBuffer/releaseOutputBuffer in sync mode.
+ * Blocks in dequeueOutputBuffer (no locks held), then takes every other
+ * output that is already ready and keeps render-queue-depth = 1: older
+ * outputs are released without rendering, the newest one is rendered. */
+static void log_output_format(DecoderContext *ctx) {
+    AMediaFormat *fmt = AMediaCodec_getOutputFormat(ctx->codec);
+    if (fmt) {
+        LOGI("decoder_output: output format changed: %s", AMediaFormat_toString(fmt));
+        AMediaFormat_delete(fmt);
+    }
+}
+
+static void* output_thread_func(void *arg) {
+    DecoderContext *ctx = static_cast<DecoderContext*>(arg);
+    setpriority(PRIO_PROCESS, 0, -8);
+    LOGI("decoder_output: thread started");
+
+    while (ctx->output_running.load(std::memory_order_acquire)) {
+        AMediaCodecBufferInfo info;
+        ssize_t idx = AMediaCodec_dequeueOutputBuffer(ctx->codec, &info,
+                                                      OUTPUT_WAIT_US);
+        if (idx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+            log_output_format(ctx);
+            continue;
+        }
+        if (idx < 0) continue;  /* TRY_AGAIN_LATER / BUFFERS_CHANGED */
+
+        size_t last_idx = (size_t)idx;
+        int64_t last_pts = info.presentationTimeUs;
+        for (;;) {
+            ssize_t next = AMediaCodec_dequeueOutputBuffer(ctx->codec, &info, 0);
+            if (next == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+                log_output_format(ctx);
+                continue;
+            }
+            if (next == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
+            if (next < 0) break;
+            release_output(ctx, last_idx, last_pts, false);
+            last_idx = (size_t)next;
+            last_pts = info.presentationTimeUs;
+        }
+        release_output(ctx, last_idx, last_pts, true);
+    }
+
+    LOGI("decoder_output: thread exiting");
+    return nullptr;
+}
+
+static void start_output_thread(DecoderContext *ctx) {
+    ctx->output_running.store(true, std::memory_order_release);
+    if (pthread_create(&ctx->output_thread, nullptr, output_thread_func, ctx) == 0) {
+        ctx->output_thread_started = true;
+    } else {
+        ctx->output_running.store(false, std::memory_order_release);
+        LOGE("decoder_configure: failed to start output thread");
+    }
+}
+
+/* Stop flag, then join: the thread wakes from its bounded dequeue
+ * (OUTPUT_WAIT_US) and exits. It takes no lock, so callers may hold theirs. */
+static void stop_output_thread(DecoderContext *ctx) {
+    if (!ctx->output_thread_started) return;
+    ctx->output_running.store(false, std::memory_order_release);
+    pthread_join(ctx->output_thread, nullptr);
+    ctx->output_thread_started = false;
 }
 
 /* ---- Public API ---- */
@@ -240,9 +286,7 @@ static bool enable_async_callbacks(DecoderContext *ctx) {
         LOGI("decoder_configure: using sync polling for Qualcomm decoder");
         return false;
     }
-    PFN_setAsyncNotifyCallback pfn = ctx->wakeup_fn ? resolve_async_callback()
-                                                     : nullptr;
-    if (!pfn) return false;
+    if (!ctx->wakeup_fn) return false;
 
     AMediaCodecOnAsyncNotifyCallback cb;
     cb.onAsyncInputAvailable  = on_async_input;
@@ -250,7 +294,7 @@ static bool enable_async_callbacks(DecoderContext *ctx) {
     cb.onAsyncFormatChanged   = on_async_format;
     cb.onAsyncError           = on_async_error;
 
-    media_status_t s = pfn(ctx->codec, cb, ctx);
+    media_status_t s = AMediaCodec_setAsyncNotifyCallback(ctx->codec, cb, ctx);
     if (s == AMEDIA_OK) {
         ctx->async_mode = true;
         LOGI("decoder_configure: async callbacks enabled (API %d)",
@@ -276,8 +320,11 @@ DecoderContext* decoder_create(ANativeWindow *window,
     ctx->async_mode  = false;
     ctx->render_mode = RENDER_MODE_LOWEST_LATENCY;
     ctx->wakeup_fn   = nullptr;
-    ctx->rendered_fn = nullptr;
-    ctx->render_in_callback = false;
+    ctx->released_fn = nullptr;
+    ctx->frame_rendered_fn = nullptr;
+    ctx->output_userdata = nullptr;
+    ctx->output_thread_started = false;
+    ctx->output_running.store(false, std::memory_order_relaxed);
     ctx->hints       = hints ? *hints : DecoderVendorHints{};
     snprintf(ctx->mime, sizeof(ctx->mime), "%s", mime);
     snprintf(ctx->codec_name, sizeof(ctx->codec_name), "%s",
@@ -305,16 +352,14 @@ void decoder_set_wakeup(DecoderContext *ctx, decoder_wakeup_fn fn, void *userdat
     }
 }
 
-void decoder_set_rendered_callback(DecoderContext *ctx,
-                                   decoder_rendered_fn fn,
-                                   void *userdata,
-                                   bool render_in_callback) {
+void decoder_set_output_callbacks(DecoderContext *ctx,
+                                  decoder_released_fn released_fn,
+                                  decoder_frame_rendered_fn frame_rendered_fn,
+                                  void *userdata) {
     if (ctx) {
-        ctx->rendered_fn = fn;
-        ctx->rendered_userdata = userdata;
-        ctx->render_in_callback = render_in_callback;
-        LOGI("decoder_set_rendered_callback: render_in_callback=%d",
-             render_in_callback ? 1 : 0);
+        ctx->released_fn = released_fn;
+        ctx->frame_rendered_fn = frame_rendered_fn;
+        ctx->output_userdata = userdata;
     }
 }
 
@@ -352,9 +397,10 @@ int decoder_configure(DecoderContext *ctx, int width, int height, int fps) {
         AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, height);
         if (fps > 0) {
             AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_FRAME_RATE, fps);
-            PFN_setFrameRate set_frame_rate = resolve_set_frame_rate();
-            if (set_frame_rate && ctx->window) {
-                int32_t fr_status = set_frame_rate(ctx->window, (float)fps, 1);
+            if (ctx->window) {
+                int32_t fr_status = ANativeWindow_setFrameRate(
+                    ctx->window, (float)fps,
+                    ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
                 LOGI("decoder_configure: surface frame rate hint %d -> %d",
                      fps, (int)fr_status);
             }
@@ -401,6 +447,14 @@ int decoder_configure(DecoderContext *ctx, int width, int height, int fps) {
             continue;
         }
 
+        /* Real render timestamps (API 33). Purely informational: a codec that
+         * refuses it still decodes, it just reports no render samples. */
+        media_status_t fr = AMediaCodec_setOnFrameRenderedCallback(
+            ctx->codec, on_frame_rendered, ctx);
+        if (fr != AMEDIA_OK) {
+            LOGW("decoder_configure: setOnFrameRenderedCallback failed (%d)", (int)fr);
+        }
+
         status = AMediaCodec_start(ctx->codec);
         if (status != AMEDIA_OK) {
             LOGW("decoder_configure: start failed attempt=%d status=%d",
@@ -408,7 +462,7 @@ int decoder_configure(DecoderContext *ctx, int width, int height, int fps) {
             continue;
         }
 
-        if (android_get_device_api_level() >= 30 && attempt <= 2) {
+        if (attempt <= 2) {
             AMediaFormat *params = AMediaFormat_new();
             if (params) {
                 AMediaFormat_setInt32(params, "low-latency", 1);
@@ -426,6 +480,9 @@ int decoder_configure(DecoderContext *ctx, int width, int height, int fps) {
         }
 
         ctx->configured = true;
+        if (!ctx->async_mode) {
+            start_output_thread(ctx);
+        }
         LOGI("decoder_configure: configured %dx%d@%d mime=%s name=%s attempt=%d mode=%s",
              width, height, fps, ctx->mime, ctx->codec_name, attempt,
              ctx->async_mode ? "ASYNC" : "SYNC");
@@ -438,20 +495,6 @@ int decoder_configure(DecoderContext *ctx, int width, int height, int fps) {
 
 bool decoder_is_async(DecoderContext *ctx) {
     return ctx && ctx->async_mode;
-}
-
-int decoder_feed(DecoderContext *ctx, const uint8_t *nal_data, size_t nal_len,
-                 int64_t timestamp_us, uint32_t flags) {
-    if (!ctx || !ctx->configured) {
-        return -1;
-    }
-
-    int32_t idx = decoder_dequeue_input(ctx, INPUT_TIMEOUT_US);
-    if (idx < 0) {
-        return -1;
-    }
-
-    return decoder_feed_index(ctx, idx, nal_data, nal_len, timestamp_us, flags);
 }
 
 int32_t decoder_dequeue_input(DecoderContext *ctx, int64_t timeout_us) {
@@ -504,139 +547,54 @@ int32_t decoder_pop_input(DecoderContext *ctx) {
     return input_queue_pop(ctx);
 }
 
-/* ---- Drain: render queue depth = 1 (Moonlight strategy) ---- */
+/* ---- Output release: render queue depth = 1 (Moonlight strategy) ---- */
 
-static void render_frame(DecoderContext *ctx, size_t index) {
-    if (ctx->render_mode == RENDER_MODE_LOWEST_LATENCY) {
-        AMediaCodec_releaseOutputBuffer(ctx->codec, index, true);
+static void release_output(DecoderContext *ctx, size_t index,
+                           int64_t pts_us, bool render) {
+    /* Rendered frames are released with an explicit timestamp of "now"
+     * (present as soon as possible, same as render=true with our synthetic,
+     * always-past PTS). It also matters for measurement: with plain
+     * releaseOutputBuffer(true) Codec2 (POCO Pad, c2.qti) reports
+     * onFrameRendered systemNano = presentationTimeUs * 1000, i.e. the
+     * requested time, not the real one. With an explicit CLOCK_MONOTONIC
+     * timestamp it reports the actual presentation (VSync-aligned).
+     * RENDER_MODE_SMOOTH would present at the next VSync; both modes render
+     * immediately today. */
+    if (render) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        AMediaCodec_releaseOutputBufferAtTime(ctx->codec, index,
+            (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec);
     } else {
-        /* RENDER_MODE_SMOOTH: present at next VSync via releaseOutputBuffer. */
-        AMediaCodec_releaseOutputBuffer(ctx->codec, index, true);
+        AMediaCodec_releaseOutputBuffer(ctx->codec, index, false);
+    }
+    if (ctx->released_fn) {
+        ctx->released_fn(ctx->output_userdata, pts_us, render);
     }
 }
 
-int decoder_drain(DecoderContext *ctx, int64_t *rendered_pts_us) {
-    if (!ctx || !ctx->configured) {
-        return 0;
-    }
-    if (rendered_pts_us) {
-        *rendered_pts_us = -1;
-    }
-
-    if (ctx->async_mode) {
-        /* ---- Async path: drain from the output queue ---- */
-        OutputEntry entry;
-        int32_t last_idx = -1;
-
-        while (output_queue_pop(ctx, &entry)) {
-            if (last_idx >= 0) {
-                AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, false);
-            }
-            last_idx = entry.index;
-            if (rendered_pts_us) {
-                *rendered_pts_us = entry.info.presentationTimeUs;
-            }
-        }
-
-        if (last_idx >= 0) {
-            render_frame(ctx, (size_t)last_idx);
-            return 1;
-        }
+int decoder_drain(DecoderContext *ctx) {
+    if (!ctx || !ctx->configured || !ctx->async_mode) {
         return 0;
     }
 
-    /* ---- Sync path: poll with dequeueOutputBuffer ---- */
-    AMediaCodecBufferInfo info;
-    ssize_t last_idx = -1;
+    OutputEntry entry;
+    bool have_last = false;
+    OutputEntry last;
 
-    for (;;) {
-        ssize_t idx = AMediaCodec_dequeueOutputBuffer(
-            ctx->codec, &info, OUTPUT_TIMEOUT_US);
-
-        if (idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER)       break;
-        if (idx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-            AMediaFormat *fmt = AMediaCodec_getOutputFormat(ctx->codec);
-            if (fmt) {
-                LOGI("decoder_drain: output format changed: %s",
-                     AMediaFormat_toString(fmt));
-                AMediaFormat_delete(fmt);
-            }
-            continue;
+    while (output_queue_pop(ctx, &entry)) {
+        if (have_last) {
+            release_output(ctx, (size_t)last.index,
+                           last.info.presentationTimeUs, false);
         }
-        if (idx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
-        if (idx < 0) break;
-
-        if (last_idx >= 0) {
-            AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, false);
-        }
-        last_idx = idx;
+        last = entry;
+        have_last = true;
     }
 
-    if (last_idx >= 0) {
-        if (rendered_pts_us) {
-            *rendered_pts_us = info.presentationTimeUs;
-        }
-        render_frame(ctx, (size_t)last_idx);
+    if (have_last) {
+        release_output(ctx, (size_t)last.index, last.info.presentationTimeUs, true);
         return 1;
     }
-
-    return 0;
-}
-
-int decoder_drain_wait(DecoderContext *ctx, int64_t timeout_us,
-                       int64_t *rendered_pts_us) {
-    if (!ctx || !ctx->configured) {
-        return 0;
-    }
-    if (rendered_pts_us) {
-        *rendered_pts_us = -1;
-    }
-
-    /* Async output is delivered via callbacks; just drain the queue. */
-    if (ctx->async_mode) {
-        return decoder_drain(ctx, rendered_pts_us);
-    }
-
-    /* Sync path: the FIRST dequeue blocks up to timeout_us so the decode thread
-     * sleeps in the kernel and wakes the instant a decoded frame is ready —
-     * near-zero render latency without busy-polling. Remaining buffers are
-     * drained non-blocking so we still keep render-queue-depth = 1. */
-    AMediaCodecBufferInfo info;
-    ssize_t last_idx = -1;
-    bool first = true;
-
-    for (;;) {
-        ssize_t idx = AMediaCodec_dequeueOutputBuffer(
-            ctx->codec, &info, first ? timeout_us : 0);
-        first = false;
-
-        if (idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER)       break;
-        if (idx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-            AMediaFormat *fmt = AMediaCodec_getOutputFormat(ctx->codec);
-            if (fmt) {
-                LOGI("decoder_drain_wait: output format changed: %s",
-                     AMediaFormat_toString(fmt));
-                AMediaFormat_delete(fmt);
-            }
-            continue;
-        }
-        if (idx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
-        if (idx < 0) break;
-
-        if (last_idx >= 0) {
-            AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, false);
-        }
-        last_idx = idx;
-    }
-
-    if (last_idx >= 0) {
-        if (rendered_pts_us) {
-            *rendered_pts_us = info.presentationTimeUs;
-        }
-        render_frame(ctx, (size_t)last_idx);
-        return 1;
-    }
-
     return 0;
 }
 
@@ -644,6 +602,9 @@ void decoder_destroy(DecoderContext *ctx) {
     if (!ctx) {
         return;
     }
+
+    /* The output thread uses ctx->codec: it must be gone before stop/delete. */
+    stop_output_thread(ctx);
 
     if (ctx->codec) {
         if (ctx->configured) {

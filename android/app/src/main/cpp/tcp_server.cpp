@@ -16,8 +16,9 @@
 
 #include <mutex>
 
-/* Several threads write to the desktop socket (UI thread: touch, pen, mouse,
- * Deck, volume, keyboard; native thread: pong, keyframe requests). send() can
+/* Several threads write to the desktop socket (outbound sender thread: input,
+ * Deck, volume, backlog reports; recv thread: pong; decode thread: keyframe
+ * requests). send() can
  * write a message partially when the socket buffer is full, so without this
  * lock another thread's message could land in the middle and corrupt the
  * framing. Every caller passes one complete message per call. */
@@ -131,7 +132,7 @@ void tcp_set_nodelay(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
     /* Bound every send: with g_send_mutex a stalled send() would otherwise
-     * block all senders (UI thread, recv thread's pong, keyframe requests). */
+     * block all senders (outbound thread, recv thread's pong, keyframe requests). */
     struct timeval snd_timeout;
     snd_timeout.tv_sec = 2;
     snd_timeout.tv_usec = 0;

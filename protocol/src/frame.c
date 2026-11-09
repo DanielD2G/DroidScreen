@@ -100,7 +100,10 @@ size_t ds_frame_write_telemetry(uint8_t *buf, size_t buf_size,
     write_le64(buf + 32, (uint64_t)telemetry->capture_to_send_us);
     write_le64(buf + 40, (uint64_t)telemetry->rtt_us);
     write_le32(buf + 48, telemetry->flags);
-    write_le32(buf + 52, 0);
+    write_le32(buf + 52, telemetry->clock_uncertainty_us);
+    write_le64(buf + 56, (uint64_t)telemetry->display_time_us);
+    write_le64(buf + 64, (uint64_t)telemetry->desktop_send_us);
+    write_le64(buf + 72, (uint64_t)telemetry->clock_offset_us);
     return DS_VIDEO_TELEMETRY_SIZE;
 }
 
@@ -133,6 +136,10 @@ int ds_frame_read_telemetry(const uint8_t *buf, size_t len,
         telemetry->capture_to_send_us = (int64_t)read_le64(buf + 32);
         telemetry->rtt_us = (int64_t)read_le64(buf + 40);
         telemetry->flags = read_le32(buf + 48);
+        telemetry->clock_uncertainty_us = read_le32(buf + 52);
+        telemetry->display_time_us = (int64_t)read_le64(buf + 56);
+        telemetry->desktop_send_us = (int64_t)read_le64(buf + 64);
+        telemetry->clock_offset_us = (int64_t)read_le64(buf + 72);
     }
     if (header_size) {
         *header_size = size;

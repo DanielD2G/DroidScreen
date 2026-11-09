@@ -1,7 +1,6 @@
 package com.droidscreen.app
 
 import android.app.Activity
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -49,6 +48,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         const val STATUS_CONNECTED = 1
         const val STATUS_DISCONNECTED = 2
         const val STATUS_ERROR = 3
+
+        // nativeGetStats() indices — must match native_bridge.cpp
+        private const val STAT_JITTER_US = 4
+        private const val STAT_SKIPPED = 6
+        private const val STAT_COMP_RENDER_P50_US = 7
+        private const val STAT_RECV_RENDER_P50_US = 10
+        private const val STAT_CLOCK_UNCERTAINTY_US = 11
+        private const val STAT_RTT_US = 12
 
         init {
             System.loadLibrary("droidscreen_native")
@@ -149,9 +156,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false)
-        }
+        window.setDecorFitsSystemWindows(false)
         setContentView(R.layout.activity_main)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -262,30 +267,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun setImmersiveMode() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false)
-            window.insetsController?.let { controller ->
-                controller.hide(
-                    WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars()
-                )
-                controller.systemBarsBehavior =
-                    WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = (
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    or View.SYSTEM_UI_FLAG_FULLSCREEN
-                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+        window.setDecorFitsSystemWindows(false)
+        window.insetsController?.let { controller ->
+            controller.hide(
+                WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars()
             )
+            controller.systemBarsBehavior =
+                WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
     }
 
     private fun requestSurfaceFrameRate(surface: Surface) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && surface.isValid) {
+        if (surface.isValid) {
             surface.setFrameRate(120.0f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
             android.util.Log.i(TAG, "Requested Surface frame rate: 120Hz fixed source")
         }
@@ -390,17 +383,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             imm.restartInput(keyboardCapture)
         }
         keyboardButton.setOnClickListener {
-            // Below Android 11 the IME's own hide key can't be observed, so a tap
-            // there always opens the keyboard (re-opening is harmless).
-            if (keyboardOpen && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) hideKeyboard()
+            if (keyboardOpen) hideKeyboard()
             else showKeyboard()
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Follow the real IME state (it can also be closed with Back or its own key).
-            keyboardCapture.setOnApplyWindowInsetsListener { _, insets ->
-                setKeyboardOpen(insets.isVisible(WindowInsets.Type.ime()))
-                insets
-            }
+        // Follow the real IME state (it can also be closed with Back or its own key).
+        keyboardCapture.setOnApplyWindowInsetsListener { _, insets ->
+            setKeyboardOpen(insets.isVisible(WindowInsets.Type.ime()))
+            insets
         }
     }
 
@@ -523,23 +512,28 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             val fps = deltaFrames / elapsed
             statsFps.text = String.format("FPS: %.1f", fps)
 
-            val jitterUs = stats[4]
+            val jitterUs = stats[STAT_JITTER_US]
             val jitterMs = jitterUs / 1000.0
-            val latencyReleaseMs = if (stats.size > 8) stats[8] / 1000.0 else 0.0
-            val desktopMs = if (stats.size > 9) stats[9] / 1000.0 else 0.0
-            val androidMs = if (stats.size > 11) stats[11] / 1000.0 else 0.0
-            val rttMs = if (stats.size > 12) stats[12] / 1000.0 else 0.0
-            statsPacing.text = String.format(
-                "Latency: %.1fms active (desk %.1f / and %.1f / rtt %.1f)",
-                latencyReleaseMs,
-                desktopMs,
-                androidMs,
-                rttMs
-            )
+            // p50 of the last ~2 s of rendered frames (real render time).
+            val compRenderMs = stats[STAT_COMP_RENDER_P50_US] / 1000.0
+            val recvRenderMs = stats[STAT_RECV_RENDER_P50_US] / 1000.0
+            val rttMs = stats[STAT_RTT_US] / 1000.0
+            val clockUncMs = stats[STAT_CLOCK_UNCERTAINTY_US] / 1000.0
+            statsPacing.text = if (compRenderMs > 0.0) {
+                String.format(
+                    "Latency p50: %.1fms screen→tablet (±%.1f) · and %.1f · rtt %.1f",
+                    compRenderMs, clockUncMs, recvRenderMs, rttMs
+                )
+            } else {
+                String.format(
+                    "Latency p50: -- screen→tablet · and %.1f · rtt %.1f",
+                    recvRenderMs, rttMs
+                )
+            }
 
             val totalFed = stats[2]
             val errors = stats[3]
-            val skipped = if (stats.size > 6) stats[6] else 0L
+            val skipped = stats[STAT_SKIPPED]
             val stability = if (totalFed > 0) {
                 ((1.0 - (errors.toDouble() / totalFed)).coerceIn(0.0, 1.0) * 100).toInt()
             } else 100
@@ -563,7 +557,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val elapsed = (now - chipTime) / 1_000_000_000.0
         if (chipTime != 0L && elapsed > 0.1) {
             val fps = (stats[1] - chipFrames) / elapsed
-            val latencyMs = if (stats.size > 8) stats[8] / 1000.0 else 0.0
+            val latencyMs = stats[STAT_COMP_RENDER_P50_US] / 1000.0
             val latency = if (latencyMs > 0.0) String.format("%.0f", latencyMs) else "--"
             deckOverlay?.setStats(String.format("%s ms · %.0f fps ·", latency, fps), streamOverWifi)
         } else {

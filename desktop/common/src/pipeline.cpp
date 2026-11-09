@@ -1,18 +1,17 @@
 /*
  * DroidScreen Desktop - Pipeline implementation (near-zero latency)
  *
- * True 3-stage pipeline:
+ * Pipeline:
  *   Stage 1 (SCK thread):    Capture callback -> capture_queue (newest only)
- *   Stage 2 (encode thread): Pop capture_queue -> encoder->encode() (async VT)
- *   Stage 3 (VT callback):   Push encoded packet to send_queue
+ *   Stage 2 (encode thread): Encode permit + pop capture_queue -> encoder->encode()
+ *   Stage 3 (VT callback):   Push encoded packets to send_queue (never blocks)
  *   Stage 4 (send thread):   Pop send_queue -> TCP send
  *
- * The VT output callback never touches the socket. This decouples
- * encode latency from send latency: a slow TCP write cannot block
- * Apple's internal VideoToolbox encode thread.
- *
- * Capture queue is newest-frame-wins: we always encode the freshest
- * frame and skip stale ones to keep pipeline latency minimal.
+ * The VT output callback never touches the socket and never waits: the
+ * encode permit (see pipeline.h) bounds what can be queued, so a slow TCP
+ * write cannot block Apple's VideoToolbox thread, and while the link is busy
+ * newer captures replace older ones before encoding instead of piling up
+ * as encoded packets.
  */
 
 #include "droidscreen/pipeline.h"
@@ -24,6 +23,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 extern "C" {
 #include "droidscreen/deck.h"
@@ -259,6 +262,21 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   last_send_activity_us_.store(now_us());
   next_video_sequence_.store(1);
   capturer_restarting_.store(false);
+  {
+    std::lock_guard<std::mutex> lock(capture_mutex_);
+    encodes_in_flight_ = 0;
+  }
+  last_pts_us_ = 0;
+  send_started_us_.store(0);
+  {
+    std::lock_guard<std::mutex> lock(rtt_mutex_);
+    clock_count_ = 0;
+    clock_index_ = 0;
+  }
+  clock_offset_us_.store(0);
+  clock_uncertainty_us_.store(0);
+  receiver_backlog_bytes_.store(-1);
+  receiver_backlog_at_us_.store(0);
 
   capturer_->set_error_callback([this](const char *reason) {
     handle_capturer_error(reason ? reason : "capturer error");
@@ -318,7 +336,7 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
     send_deck_config();
   }
 
-  fprintf(stderr, "[pipeline] started (4 threads: encode, send, recv, ping)\n");
+  fprintf(stderr, "[pipeline] started (threads: encode, send, recv, ping, watchdog)\n");
   return true;
 }
 
@@ -398,8 +416,17 @@ void Pipeline::stop() {
     }
   }
 
-  // Shut down encoder and touch.
+  // Shut down the encoder: flushes in-flight VT callbacks (they see
+  // running_ == false and drop their packets, releasing their permits).
   encoder_->shutdown();
+
+  // Drop packets that never got sent (releases their permits).
+  std::deque<SendPacket> unsent;
+  {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    unsent.swap(send_queue_);
+  }
+  unsent.clear();
   touch_->shutdown();
   mouse_->shutdown();
   capture_callback_ = nullptr;
@@ -414,136 +441,176 @@ void Pipeline::stop() {
 }
 
 // --------------------------------------------------------------------------
+// Encode admission
+// --------------------------------------------------------------------------
+std::shared_ptr<Pipeline::EncodePermit> Pipeline::acquire_encode_permit_locked() {
+  encodes_in_flight_++;
+  return std::shared_ptr<EncodePermit>(new EncodePermit{this});
+}
+
+void Pipeline::release_encode_permit() {
+  std::lock_guard<std::mutex> lock(capture_mutex_);
+  if (encodes_in_flight_ > 0)
+    encodes_in_flight_--;
+  capture_cv_.notify_all();
+}
+
+// Runs on the encoder's output thread (VT callback) or, for synchronous
+// encoders, inside encode(). Never blocks: the permit already reserved room.
+void Pipeline::handle_encoded_packet(const EncodedPacket &pkt,
+                                     const std::shared_ptr<EncodePermit> &permit,
+                                     int64_t t_enc_start, int64_t submit_pts_us,
+                                     int64_t display_time_us, bool is_idle,
+                                     float motion_score) {
+  int64_t t_enc_end = now_us();
+  // The packet's own timestamp (the PTS it was encoded with) is its capture
+  // time. A synchronous encoder may hand back an earlier frame's packet from
+  // this submit's callback; then this submit's DisplayTime doesn't apply.
+  const int64_t capture_ts_us = pkt.timestamp_us;
+  if (pkt.timestamp_us != submit_pts_us)
+    display_time_us = 0;
+  last_encode_us_.store(t_enc_end - t_enc_start);
+  if (!pkt.is_config) {
+    encode_us_sum_.fetch_add(static_cast<uint64_t>(t_enc_end - t_enc_start));
+    encode_samples_.fetch_add(1);
+  }
+
+  uint8_t flags = 0;
+  if (pkt.is_keyframe)
+    flags |= DS_FLAG_KEYFRAME;
+  if (pkt.is_config)
+    flags |= DS_FLAG_CONFIG;
+
+  SendPacket sp;
+  sp.data.assign(pkt.data, pkt.data + pkt.size);
+  sp.flags = flags;
+  sp.capture_ts_us = capture_ts_us;
+  sp.capture_to_encode_us = t_enc_end - capture_ts_us;
+  sp.encode_done_us = t_enc_end;
+  sp.display_time_us = display_time_us;
+  sp.sequence = next_video_sequence_.fetch_add(1);
+  sp.is_idle = is_idle;
+  sp.motion_score = pkt.is_config ? 0.0f : motion_score;
+  sp.permit = permit;
+
+  {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    if (!running_.load())
+      return;
+    send_queue_.push_back(std::move(sp));
+    send_cv_.notify_one();
+  }
+
+  frames_encoded_.fetch_add(1);
+}
+
+// --------------------------------------------------------------------------
 // Stage 2: encode thread
-// Pops the newest frame from capture_queue_ and submits to encoder.
-// The VT output callback fires asynchronously and pushes to send_queue_.
+// Takes an encode permit, pops the newest frame from capture_queue_ and
+// submits it to the encoder. While the permit is busy, new captures keep
+// replacing the waiting one (newest-frame-wins), so the frame that finally
+// gets encoded is the freshest -- and the last change is never dropped.
 // We NEVER do TCP I/O here.
 //
-// Idle frame re-sending: when no new frame arrives within max_idle_interval_us_,
-// the last captured frame is re-encoded to keep the decoder pipeline warm.
-// This prevents the "cold decoder" lag that occurs after idle periods
-// (e.g., when typing in a mostly-static text editor).
+// Idle frame re-sending: when no new frame arrives within max_idle_interval_us_
+// and a permit is free, the last captured frame is re-encoded to keep the
+// decoder pipeline warm ("cold decoder" lag after idle periods). Under
+// congestion (no permit) the idle re-send is skipped.
 // --------------------------------------------------------------------------
 void Pipeline::encode_loop() {
+#ifdef __APPLE__
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
   fprintf(stderr, "[encode] thread started\n");
 
   // Retained copy of the last non-idle frame for idle re-sending.
-  // Kept alive until the next non-idle frame arrives or the pipeline stops.
   CapturedFrame last_frame{};
   last_frame.native_handle = nullptr;
   last_frame.release_fn = nullptr;
 
-  auto on_packet = [this](const EncodedPacket &pkt, int64_t t_enc_start,
-                          bool is_idle, float motion_score) {
-    int64_t t_enc_end = now_us();
-    last_encode_us_.store(t_enc_end - t_enc_start);
-    if (!pkt.is_config) {
-      encode_us_sum_.fetch_add(static_cast<uint64_t>(t_enc_end - t_enc_start));
-      encode_samples_.fetch_add(1);
-    }
-
-    uint8_t flags = 0;
-    if (pkt.is_keyframe)
-      flags |= DS_FLAG_KEYFRAME;
-    if (pkt.is_config)
-      flags |= DS_FLAG_CONFIG;
-
-    SendPacket sp;
-    sp.data.assign(pkt.data, pkt.data + pkt.size);
-    sp.flags = flags;
-    sp.capture_ts_us = pkt.timestamp_us;
-    sp.capture_to_encode_us = t_enc_end - pkt.timestamp_us;
-    sp.encode_done_us = t_enc_end;
-    sp.sequence = next_video_sequence_.fetch_add(1);
-    sp.is_idle = is_idle;
-    sp.motion_score = pkt.is_config ? 0.0f : motion_score;
-
-    {
-      std::unique_lock<std::mutex> lock(send_mutex_);
-      send_cv_.wait(lock, [this] {
-        return send_queue_.size() < kMaxSendQueueSize || !running_.load();
-      });
-      if (!running_.load())
-        return;
-      send_queue_.push_back(std::move(sp));
-      send_cv_.notify_one();
-    }
-
-    frames_encoded_.fetch_add(1);
-  };
-
   while (running_.load()) {
     CapturedFrame frame;
     bool got_new_frame = false;
+    bool do_idle = false;
+    std::shared_ptr<EncodePermit> permit;
 
-    // Timed wait: wake on a new frame or after max_idle_interval_us_.
     {
       std::unique_lock<std::mutex> lock(capture_mutex_);
       const auto idle_interval = std::chrono::microseconds(max_idle_interval_us_);
-      got_new_frame = capture_cv_.wait_for(
-          lock, idle_interval,
-          [this] { return !capture_queue_.empty() || !running_.load(); });
+      const bool woke = capture_cv_.wait_for(lock, idle_interval, [this] {
+        return !running_.load() ||
+               (!capture_queue_.empty() &&
+                encodes_in_flight_ < kMaxEncodesInFlight);
+      });
 
       if (!running_.load())
         break;
 
-      if (!capture_queue_.empty()) {
+      const bool permit_free = encodes_in_flight_ < kMaxEncodesInFlight;
+      if (!capture_queue_.empty() && permit_free) {
         got_new_frame = true;
         frame = capture_queue_.back();
         capture_queue_.pop_back();
-
         while (!capture_queue_.empty()) {
           auto &old = capture_queue_.front();
           release_captured_frame(old);
           capture_queue_.pop_front();
           frames_dropped_.fetch_add(1);
         }
-      } else {
-        got_new_frame = false;
+        permit = acquire_encode_permit_locked();
+      } else if (!woke && capture_queue_.empty() && permit_free &&
+                 last_frame.native_handle) {
+        do_idle = true;
+        permit = acquire_encode_permit_locked();
+      }
+      // Otherwise a frame is waiting for the permit (we'll be notified when
+      // it frees up) or the link is busy: skip the idle re-send.
+    }
+
+    if (!got_new_frame && capturer_->emits_idle_frames()) {
+      const int64_t now = now_us();
+      const int64_t last_callback = last_capture_callback_us_.load();
+      if (last_callback > 0 && now - last_callback > 5000000) {
+        mark_failed("capturer stopped delivering frames for 5s");
+        break;
       }
     }
 
     if (got_new_frame) {
-      // ---- Normal path: encode the new frame ----
-      int64_t t_enc_start = now_us();
+      const int64_t t_enc_start = now_us();
+      const int64_t pts = std::max(frame.timestamp_us, last_pts_us_ + 1);
+      last_pts_us_ = pts;
       bool ok = encoder_->encode(
-          frame.native_handle, frame.timestamp_us,
-          [&on_packet, t_enc_start, motion_score = frame.motion_score](
-              const EncodedPacket &pkt) {
-            on_packet(pkt, t_enc_start, false, motion_score);
+          frame.native_handle, pts,
+          [this, permit, t_enc_start, pts,
+           display_ts = frame.display_time_us,
+           motion = frame.motion_score](const EncodedPacket &pkt) {
+            handle_encoded_packet(pkt, permit, t_enc_start, pts,
+                                  display_ts, false, motion);
           });
+      permit.reset();  // only the encoder's callback (and its packets) hold it now
       if (!ok) {
         fprintf(stderr, "[encode] encode submit failed\n");
       }
 
       // Keep this frame alive for future idle re-sends.
-      // Release the previous last_frame, then take ownership of the new one.
       release_captured_frame(last_frame);
       last_frame = frame;
-      // Do NOT release frame — it lives on as last_frame.
-    } else {
-      if (capturer_->emits_idle_frames()) {
-        const int64_t now = now_us();
-        const int64_t last_callback = last_capture_callback_us_.load();
-        if (last_callback > 0 && now - last_callback > 5000000) {
-          mark_failed("capturer stopped delivering frames for 5s");
-          break;
-        }
+    } else if (do_idle) {
+      const int64_t t_enc_start = now_us();
+      const int64_t pts = std::max(t_enc_start, last_pts_us_ + 1);
+      last_pts_us_ = pts;
+      bool ok = encoder_->encode(
+          last_frame.native_handle, pts,
+          [this, permit, t_enc_start, pts](const EncodedPacket &pkt) {
+            handle_encoded_packet(pkt, permit, t_enc_start, pts, 0,
+                                  true, 0.0f);
+          });
+      permit.reset();
+      if (!ok) {
+        fprintf(stderr, "[encode] idle re-encode failed\n");
       }
-
-      // ---- Idle path: re-encode the last frame to keep decoder warm ----
-      if (last_frame.native_handle) {
-        int64_t t_enc_start = now_us();
-        bool ok = encoder_->encode(
-            last_frame.native_handle, t_enc_start,
-            [&on_packet, t_enc_start](const EncodedPacket &pkt) {
-              on_packet(pkt, t_enc_start, true, 0.0f);
-            });
-        if (!ok) {
-          fprintf(stderr, "[encode] idle re-encode failed\n");
-        }
-        frames_idle_resent_.fetch_add(1);
-      }
+      frames_idle_resent_.fetch_add(1);
     }
   }
 
@@ -560,6 +627,9 @@ void Pipeline::encode_loop() {
 // affects this thread -- encode and VT callback continue at full speed.
 // --------------------------------------------------------------------------
 void Pipeline::send_loop() {
+#ifdef __APPLE__
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
   fprintf(stderr, "[send] thread started\n");
 
   while (running_.load()) {
@@ -577,8 +647,11 @@ void Pipeline::send_loop() {
 
       pkt = std::move(send_queue_.front());
       send_queue_.pop_front();
-      send_cv_.notify_one();
+      send_started_us_.store(now_us());
     }
+    // Popped for sending: this submit no longer occupies the queue, so the
+    // encoder may start the next one while we write this packet.
+    pkt.permit.reset();
 
     int64_t t_send_start = now_us();
     const int64_t encode_to_send_us = t_send_start - pkt.encode_done_us;
@@ -592,6 +665,10 @@ void Pipeline::send_loop() {
     telemetry.capture_to_send_us = capture_to_send_us;
     telemetry.rtt_us = last_rtt_us_.load();
     telemetry.flags = pkt.is_idle ? DS_VIDEO_TELEMETRY_FLAG_IDLE : 0;
+    telemetry.display_time_us = pkt.display_time_us;
+    telemetry.desktop_send_us = t_send_start;
+    telemetry.clock_uncertainty_us = clock_uncertainty_us_.load();
+    telemetry.clock_offset_us = clock_offset_us_.load();
 
     std::vector<uint8_t> wire_payload;
     wire_payload.resize(DS_VIDEO_TELEMETRY_SIZE + pkt.data.size());
@@ -604,6 +681,7 @@ void Pipeline::send_loop() {
       if (client_->send_message(DS_MSG_VIDEO_FRAME, pkt.flags,
                                 wire_payload.data(), wire_payload.size())) {
         int64_t t_send_end = now_us();
+        send_started_us_.store(0);
         last_send_us_.store(t_send_end - t_send_start);
         bytes_sent_.fetch_add(DS_HEADER_SIZE + wire_payload.size());
         last_send_activity_us_.store(t_send_end);
@@ -679,6 +757,9 @@ void Pipeline::send_loop() {
 }
 
 void Pipeline::recv_loop() {
+#ifdef __APPLE__
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
   fprintf(stderr, "[recv] thread started\n");
 
   while (running_.load()) {
@@ -707,10 +788,16 @@ void Pipeline::recv_loop() {
 
     switch (hdr.type) {
     case DS_MSG_PONG: {
+      if (hdr.length < DS_PONG_PAYLOAD_SIZE)
+        break;
       int64_t now = now_us();
-      int64_t sent = ping_sent_us_.load();
+      int64_t sent = 0;
+      int64_t android_now = 0;
+      memcpy(&sent, payload.data(), sizeof(sent));          // little-endian hosts
+      memcpy(&android_now, payload.data() + 8, sizeof(android_now));
       int64_t rtt = now - sent;
       last_rtt_us_.store(rtt);
+      record_pong(sent, android_now);
 
       // Track RTT for stats (no bitrate adjustment on USB).
       {
@@ -795,18 +882,25 @@ void Pipeline::recv_loop() {
 void Pipeline::ping_loop() {
   fprintf(stderr, "[ping] thread started\n");
 
+  int pings_sent = 0;
   while (running_.load()) {
-    // Sleep 2 seconds between pings.
-    for (int i = 0; i < 20 && running_.load(); i++) {
+    // Ping fast at first so the clock offset converges quickly, then 1 Hz.
+    const int steps = pings_sent < 8 ? 2 : 10;
+    for (int i = 0; i < steps && running_.load(); i++) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (!running_.load())
       break;
 
-    ping_sent_us_.store(now_us());
     {
       std::lock_guard<std::mutex> wlock(write_mutex_);
-      if (!client_->send_message(DS_MSG_PING, 0, nullptr, 0)) {
+      // Stamp after taking the write lock so RTT excludes the wait for it.
+      int64_t send_us = now_us();
+      uint8_t ping_payload[DS_PING_PAYLOAD_SIZE];
+      memcpy(ping_payload, &send_us, sizeof(send_us));       // little-endian hosts
+      pings_sent++;
+      if (!client_->send_message(DS_MSG_PING, 0, ping_payload,
+                                 sizeof(ping_payload))) {
         if (running_.load()) {
           fprintf(stderr, "[ping] send failed\n");
         }
@@ -830,10 +924,7 @@ void Pipeline::watchdog_loop() {
   fprintf(stderr, "[watchdog] thread started\n");
 
   while (running_.load()) {
-    // Poll in small steps so stop() joins us quickly.
-    for (int i = 0; i < 5 && running_.load(); i++) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (!running_.load())
       break;
 
@@ -847,12 +938,56 @@ void Pipeline::watchdog_loop() {
       break;
     }
 
-    // Adaptive bitrate: sample send-queue congestion at this ~2 Hz cadence.
-    if (rate_controller_)
-      rate_controller_->update(send_queue_depth(), kMaxSendQueueSize);
+    // Adaptive bitrate: sample queueing delay on both ends at ~10 Hz.
+    if (rate_controller_) {
+      int64_t backlog = receiver_backlog_bytes_.load();
+      if (now_us() - receiver_backlog_at_us_.load() > 1000000)
+        backlog = -1;  // stale report: unknown
+      rate_controller_->update(sender_delay_us(), backlog,
+                               idle_interval_us_for_fps(target_fps_));
+    }
   }
 
   fprintf(stderr, "[watchdog] thread exiting\n");
+}
+
+int64_t Pipeline::sender_delay_us() const {
+  const int64_t now = now_us();
+  int64_t delay = 0;
+  const int64_t started = send_started_us_.load();
+  if (started > 0)
+    delay = now - started;
+  {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex &>(send_mutex_));
+    if (!send_queue_.empty())
+      delay = std::max(delay, now - send_queue_.front().encode_done_us);
+  }
+  return delay;
+}
+
+void Pipeline::record_pong(int64_t desktop_send_us, int64_t android_now_us) {
+  const int64_t now = now_us();
+  const int64_t rtt = now - desktop_send_us;
+  if (rtt <= 0 || android_now_us <= 0)
+    return;
+  // Assume a symmetric path: Android answered at the RTT midpoint.
+  const int64_t offset = android_now_us - (desktop_send_us + rtt / 2);
+
+  std::lock_guard<std::mutex> lock(rtt_mutex_);
+  clock_rtt_window_[clock_index_] = rtt;
+  clock_offset_window_[clock_index_] = offset;
+  clock_index_ = (clock_index_ + 1) % kClockWindowSize;
+  if (clock_count_ < kClockWindowSize)
+    clock_count_++;
+
+  size_t best = 0;
+  for (size_t i = 1; i < clock_count_; i++) {
+    if (clock_rtt_window_[i] < clock_rtt_window_[best])
+      best = i;
+  }
+  clock_offset_us_.store(clock_offset_window_[best]);
+  clock_uncertainty_us_.store(static_cast<uint32_t>(
+      std::max<int64_t>(1, clock_rtt_window_[best] / 2)));
 }
 
 void Pipeline::handle_control(const uint8_t *data, size_t len) {
@@ -889,6 +1024,17 @@ void Pipeline::handle_control(const uint8_t *data, size_t len) {
 
   case DS_CTRL_DISPLAY_ON:
     fprintf(stderr, "[ctrl] display on (ignoring on desktop)\n");
+    break;
+
+  case DS_CTRL_RECEIVER_BACKLOG:
+    if (len >= DS_BACKLOG_PAYLOAD_SIZE) {
+      uint32_t ring_bytes = static_cast<uint32_t>(data[1]) |
+                            (static_cast<uint32_t>(data[2]) << 8) |
+                            (static_cast<uint32_t>(data[3]) << 16) |
+                            (static_cast<uint32_t>(data[4]) << 24);
+      receiver_backlog_bytes_.store(static_cast<int64_t>(ring_bytes));
+      receiver_backlog_at_us_.store(now_us());
+    }
     break;
 
   default:
@@ -941,9 +1087,6 @@ void Pipeline::send_volume_state(uint16_t level, bool muted) {
   if (!client_->send_message(DS_MSG_VOLUME_STATE, 0, buf,
                              DS_VOLUME_STATE_SIZE)) {
     fprintf(stderr, "[pipeline] failed to send volume state\n");
-  } else {
-    fprintf(stderr, "[pipeline] sent volume state: level=%u muted=%d\n", level,
-            muted);
   }
 }
 
@@ -956,8 +1099,6 @@ void Pipeline::send_media_state(const std::string &json) {
                              reinterpret_cast<const uint8_t *>(json.data()),
                              json.size())) {
     fprintf(stderr, "[pipeline] failed to send media state\n");
-  } else {
-    fprintf(stderr, "[pipeline] sent media state (%zu bytes)\n", json.size());
   }
 }
 

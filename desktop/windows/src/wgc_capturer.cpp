@@ -621,6 +621,9 @@ void WGCCapturer::on_frame_arrived() {
     captured.width         = src_box.right;
     captured.height        = src_box.bottom;
     captured.timestamp_us  = timestamp_us;
+    // SystemRelativeTime is when the compositor produced the frame, on the
+    // same QPC timeline as the pipeline's steady clock.
+    captured.display_time_us = timestamp_us;
     captured.is_idle       = false;
 
     if (on_frame_) {
