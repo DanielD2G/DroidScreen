@@ -16,6 +16,8 @@ import android.view.Surface
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
+import android.widget.ImageButton
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -25,6 +27,7 @@ import com.droidscreen.app.deck.DeckEdgeView
 import com.droidscreen.app.deck.DeckOverlayView
 import com.droidscreen.app.deck.MediaState
 import com.droidscreen.app.deck.SegmentedControlView
+import com.droidscreen.app.input.KeyboardCaptureView
 import com.droidscreen.app.ui.LinkHeroView
 import com.droidscreen.app.ui.LinkLine
 import com.droidscreen.app.ui.LinkMarkView
@@ -76,6 +79,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var approvalDotEnd: View
     private lateinit var deckOverlayContainer: FrameLayout
     private lateinit var deckEdge: DeckEdgeView
+    private lateinit var keyboardButton: ImageButton
+    private lateinit var keyboardCapture: KeyboardCaptureView
+    /** The soft keyboard is up (typing goes to the Mac). */
+    private var keyboardOpen = false
     private var deckOverlay: DeckOverlayView? = null
     /** A finger is down on the Deck; auto-hide waits for it to lift. */
     private var deckGestureActive = false
@@ -196,6 +203,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         deckOverlayContainer = findViewById(R.id.deck_overlay_container)
         deckEdge = findViewById(R.id.deck_edge)
         deckEdge.onOpenDeck = { showDeckAndControls() }
+        bindKeyboard()
         bindWaitingScreen()
 
         // Show initial waiting state
@@ -362,6 +370,69 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             source == InputDevice.SOURCE_MOUSE_RELATIVE
     }
 
+    // ------------------------------------------------------------------
+    // Soft keyboard -> Mac typing
+    // ------------------------------------------------------------------
+
+    private fun bindKeyboard() {
+        keyboardButton = findViewById(R.id.keyboard_button)
+        keyboardCapture = findViewById(R.id.keyboard_capture)
+        keyboardCapture.onText = { text -> nativeSendKeyText(text.toByteArray(Charsets.UTF_8)) }
+        keyboardCapture.onKey = { key -> nativeSendKey(key, 0) }
+        // Back closes the keyboard on every Android version; on 11+ the IME insets
+        // below also catch its own hide key.
+        keyboardCapture.onImeDismissed = {
+            setKeyboardOpen(false)
+            // The Mac's cursor may move before the keyboard is used again:
+            // restart the input session so the IME and our model start fresh
+            // together (the old connection's late calls are ignored).
+            val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.restartInput(keyboardCapture)
+        }
+        keyboardButton.setOnClickListener {
+            // Below Android 11 the IME's own hide key can't be observed, so a tap
+            // there always opens the keyboard (re-opening is harmless).
+            if (keyboardOpen && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) hideKeyboard()
+            else showKeyboard()
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Follow the real IME state (it can also be closed with Back or its own key).
+            keyboardCapture.setOnApplyWindowInsetsListener { _, insets ->
+                setKeyboardOpen(insets.isVisible(WindowInsets.Type.ime()))
+                insets
+            }
+        }
+    }
+
+    private fun showKeyboard() {
+        // Only a fresh input session starts a fresh model (onCreateInputConnection
+        // resets it); re-showing a live session must keep the composing baseline.
+        keyboardCapture.requestFocus()
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.showSoftInput(keyboardCapture, 0)
+        setKeyboardOpen(true)
+    }
+
+    private fun hideKeyboard() {
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(keyboardCapture.windowToken, 0)
+        keyboardCapture.clearFocus()
+        keyboardCapture.resetComposition()
+        setKeyboardOpen(false)
+    }
+
+    private fun setKeyboardOpen(open: Boolean) {
+        keyboardOpen = open
+        keyboardButton.isActivated = open
+    }
+
+    /** The button shows only while streaming and when enabled in the Deck. */
+    private fun updateKeyboardButton() {
+        val show = currentStatus == STATUS_CONNECTED && inputSettings.showKeyboardButton
+        keyboardButton.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show && keyboardOpen) hideKeyboard()
+    }
+
     private fun persistInputSettings() {
         InputSettingsStore.save(this, inputSettings)
     }
@@ -397,6 +468,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         overlay.onStylusModeSelected = { index ->
             inputSettings = inputSettings.copy(stylusInputMode = StylusInputMode.values()[index])
             persistInputSettings()
+            scheduleDeckAutoHide()
+        }
+        overlay.bindKeyboardButton(inputSettings.showKeyboardButton)
+        overlay.onKeysModeSelected = { index ->
+            inputSettings = inputSettings.copy(showKeyboardButton = index == 0)
+            persistInputSettings()
+            updateKeyboardButton()
             scheduleDeckAutoHide()
         }
         overlay.onUnknownModeSelected = { index ->
@@ -635,6 +713,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 statusHintRow.visibility = View.GONE
             }
         }
+        updateKeyboardButton()
     }
 
     /** One-time setup of the static parts of the waiting screen. */
@@ -885,4 +964,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativeGetStats(): LongArray
     external fun nativeSendDeckAction(actionType: Int, slotIndex: Int)
     external fun nativeSendVolumeChange(volume: Int, muted: Int)
+    external fun nativeSendKeyText(utf8: ByteArray)
+    external fun nativeSendKey(key: Int, modifiers: Int)
 }

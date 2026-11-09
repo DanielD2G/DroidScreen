@@ -193,16 +193,20 @@ struct Segmented<T: Hashable>: View {
     @Binding var selection: T
     var mono = true
     var height: CGFloat = 28
+    /// Options shown but not selectable.
+    var disabled: Set<T> = []
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(options.indices, id: \.self) { i in
                 let (value, label) = options[i]
                 let on = value == selection
-                Button { selection = value } label: {
+                let off = disabled.contains(value)
+                Button { if !off { selection = value } } label: {
                     Text(label)
                         .font(mono ? DSFont.mono(12, on ? .medium : .regular) : DSFont.ui(13, .medium))
-                        .foregroundColor(on ? DS.ink : DS.text2)
+                        .foregroundColor(on ? DS.ink : (off ? DS.text3.opacity(0.6) : DS.text2))
+                        .strikethrough(off && !on, color: DS.text3.opacity(0.6))
                         .padding(.horizontal, 10)
                         .frame(minHeight: height - 6)
                         .background(Capsule().fill(on ? DS.cable : Color.clear))

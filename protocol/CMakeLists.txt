@@ -11,6 +11,7 @@ add_library(droidscreen_protocol STATIC
     src/touch.c
     src/pen.c
     src/mouse.c
+    src/keyboard.c
     src/deck.c
     src/hello.c
 )

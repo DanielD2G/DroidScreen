@@ -259,7 +259,8 @@ struct DisplayPane: View {
                 CableToggle(isOn: $settings.retina)
             }
             FormRow(label: "Frame rate", help: fpsHelp) {
-                Segmented(options: [(30, "30"), (60, "60"), (120, "120")], selection: $settings.fps)
+                Segmented(options: [(30, "30"), (60, "60"), (120, "120")], selection: $settings.fps,
+                          disabled: allow120 ? [] : [120])
             }
             FormRow(label: "Still-screen refresh", help: "Keeps the tablet responsive while saving battery") {
                 Segmented(options: SettingsStore.idleOptions.map { ($0, "\($0)") }, selection: $settings.idleFps)
@@ -269,14 +270,25 @@ struct DisplayPane: View {
                            labels: [5, 20, 40, 60, 80], unit: "Mbps")
             }
         }
+        .onChange(of: allow120) { _ in enforce120() }
+        .onChange(of: settings.deviceKey) { _ in enforce120() }
     }
 
+    /// The Mac's encoder can't do 120 fps at 2560 × 1600 (~11 ms per frame);
+    /// it can with Retina off at 1920 × 1200 or below.
+    private var allow120: Bool { !settings.retina && settings.resolution >= 1 }
+
     private var fpsHelp: String {
+        if !allow120 { return "120 fps needs Retina off and 1920 × 1200 or lower" }
         switch settings.fps {
-        case 120: return "120 fps works best over USB"
+        case 120: return "Smoothest motion; best over USB"
         case 30: return "Smoothest on crowded networks"
         default: return "60 fps recommended over Wi-Fi"
         }
+    }
+
+    private func enforce120() {
+        if !allow120 && settings.fps == 120 { settings.fps = 60 }
     }
 }
 

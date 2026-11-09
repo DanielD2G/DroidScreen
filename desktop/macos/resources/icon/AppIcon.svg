@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- DroidScreen app icon: one signal-yellow line draws the Mac screen, dips as the
+       cable and draws the tablet. Squircle body on Apple's 824px grid (100..924). -->
+  <defs>
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1A1D24"/><stop offset="1" stop-color="#0B0D11"/>
+    </linearGradient>
+    <radialGradient id="disc" cx=".5" cy=".45" r=".55">
+      <stop offset="0" stop-color="#20242D"/><stop offset="1" stop-color="#14171D"/>
+    </radialGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity=".35"/>
+    </filter>
+    <clipPath id="sq"><path d="M512 100c278 0 412 134 412 412s-134 412-412 412-412-134-412-412 134-412 412-412z"/></clipPath>
+  </defs>
+  <g filter="url(#shadow)">
+    <path d="M512 100c278 0 412 134 412 412s-134 412-412 412-412-134-412-412 134-412 412-412z" fill="url(#ink)"/>
+  </g>
+  <g clip-path="url(#sq)">
+    <circle cx="512" cy="512" r="380" fill="url(#disc)"/>
+    <path d="M512 100c278 0 412 134 412 412s-134 412-412 412-412-134-412-412 134-412 412-412z" fill="none" stroke="#fff" stroke-opacity=".07" stroke-width="3"/>
+  </g>
+  <g transform="translate(512 512) scale(0.86) translate(-500 -505)">
+    <path d="M300 600 H170 a26 26 0 0 1 -26 -26 V376 a26 26 0 0 1 26 -26 H430 a26 26 0 0 1 26 26 V520 C 456 560, 520 560, 560 520 V396 a26 26 0 0 1 26 -26 H854 a26 26 0 0 1 26 26 V584 a26 26 0 0 1 -26 26 H586 a26 26 0 0 1 -26 -26"
+          fill="none" stroke="#F2D13A" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M120 660h400" stroke="#F3F1EA" stroke-width="28" stroke-linecap="round" opacity=".92"/>
+  </g>
+</svg>

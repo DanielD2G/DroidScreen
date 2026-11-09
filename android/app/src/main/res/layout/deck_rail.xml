@@ -181,6 +181,21 @@
         </LinearLayout>
 
         <LinearLayout
+            style="@style/DsDeckControlRow"
+            android:layout_marginTop="8dp">
+
+            <TextView
+                style="@style/DsDeckControlLabel"
+                android:text="Keys" />
+
+            <com.droidscreen.app.deck.SegmentedControlView
+                android:id="@+id/deck_keys_mode"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1" />
+        </LinearLayout>
+
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"

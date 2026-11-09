@@ -15,4 +15,5 @@
     <color name="ds_warn">#F2994A</color>
     <color name="ds_error">#EB5757</color>
     <color name="ds_scrim">#B80F1115</color>
+    <color name="ic_launcher_background">#14171D</color>
 </resources>

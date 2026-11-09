@@ -1057,6 +1057,7 @@ static BOOL adb_droidscreen_running() {
     NSString* _usbDeviceName;
     BOOL _uiPending;
     BOOL _activeHiDPI;
+    uint32_t _activeBitrateKbps;
     BOOL _usbDevicePresent;
     unsigned _statsTick;
 
@@ -1582,9 +1583,26 @@ struct StreamSettings {
 
 /// Global settings overlaid with what the user chose for this tablet.
 /// Command-line overrides (-DroidScreenFPS 60, ...) still win, for tests.
+/// 120 fps only where the encoder keeps up. Measured on Apple silicon: a
+/// 2560x1600 frame takes ~11 ms in VideoToolbox (> the 8.3 ms budget), so
+/// ~10% of frames were dropped and motion stuttered; 1920x1200 takes ~7 ms
+/// with no drops. Retina doubles the encoded size, so it rules 120 out.
+/// An explicit -DroidScreenFPS on the command line is left alone (tests).
+static void clamp_high_fps(StreamSettings& s) {
+    if (s.fps <= 60) return;
+    NSDictionary* args = [[NSUserDefaults standardUserDefaults] volatileDomainForName:NSArgumentDomain];
+    if (args[kSettingFPS] != nil) return;
+    const uint64_t pixels = (uint64_t)s.width * s.height * (s.hidpi ? 4 : 1);
+    if (s.hidpi || pixels > 1920ull * 1200ull) {
+        NSLog(@"[Stream] %u fps needs Retina off and <= 1920x1200 (encoder can't keep up); using 60 fps",
+              s.fps);
+        s.fps = 60;
+    }
+}
+
 - (StreamSettings)settingsForDeviceKey:(NSString*)key name:(NSString*)name {
     StreamSettings s = [self currentSettings];
-    if (!key.length) return s;
+    if (!key.length) { clamp_high_fps(s); return s; }
 
     NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
     NSMutableDictionary* all = [[defaults dictionaryForKey:kSettingDeviceSettings] mutableCopy]
@@ -1616,6 +1634,7 @@ struct StreamSettings {
     if (pick(@"hidpi", kSettingScale)) s.hidpi = [dev[@"hidpi"] boolValue];
     if (s.fps != 30 && s.fps != 60 && s.fps != 120) s.fps = 60;
     if (s.bitrate_kbps < 1000) s.bitrate_kbps = 15000;
+    clamp_high_fps(s);
     return s;
 }
 
@@ -1939,6 +1958,7 @@ struct StreamSettings {
         _streamHeight = _capturer->height();
         _streamFPS    = settings.fps;
         _activeHiDPI  = settings.hidpi;
+        _activeBitrateKbps = settings.bitrate_kbps;
 
         NSLog(@"[Stream] Capture resolution: %ux%u", _streamWidth, _streamHeight);
 
@@ -2571,13 +2591,13 @@ struct StreamSettings {
         // this side plus half the measured round trip.
         double rttMs = rtt > 0 ? rtt / 1000.0 : 0.0;
         double c2sMs = pl->last_capture_to_send_us() > 0 ? pl->last_capture_to_send_us() / 1000.0 : encMs;
-        NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
         [_ui updateStats:@{
             @"latencyMs": @(c2sMs + rttMs / 2.0),
             @"fps":       @(encFps),
             @"targetFps": @(_streamFPS),
             @"mbps":      @(mbps),
-            @"capMbps":   @([defaults integerForKey:kSettingBitrate] / 1000.0),
+            // The cap this stream was started with (per-tablet setting), not the global default.
+            @"capMbps":   @(_activeBitrateKbps / 1000.0),
         }];
 
         if ((_statsTick++ % 2) == 0)

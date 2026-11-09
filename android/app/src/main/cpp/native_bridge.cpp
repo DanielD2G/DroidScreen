@@ -29,6 +29,7 @@
 #include "pen_sender.h"
 #include "touch_sender.h"
 #include "deck_sender.h"
+#include "key_sender.h"
 #include "sps_patch.h"
 
 extern "C" {
@@ -1833,6 +1834,35 @@ Java_com_droidscreen_app_MainActivity_nativeSendVolumeChange(
     }
 
     volume_change_send(g_client_fd, volume, muted);
+}
+
+/* Soft keyboard text. Kotlin passes UTF-8 bytes (not jstring: JNI's modified
+ * UTF-8 would mangle emoji/supplementary characters). */
+JNIEXPORT void JNICALL
+Java_com_droidscreen_app_MainActivity_nativeSendKeyText(
+        JNIEnv* env, jobject /*thiz*/, jbyteArray utf8) {
+    if (g_client_fd < 0 || utf8 == nullptr) {
+        return;
+    }
+    jsize len = env->GetArrayLength(utf8);
+    if (len <= 0) {
+        return;
+    }
+    jbyte* bytes = env->GetByteArrayElements(utf8, nullptr);
+    if (bytes == nullptr) {
+        return;
+    }
+    key_text_send(g_client_fd, reinterpret_cast<const char*>(bytes), (size_t)len);
+    env->ReleaseByteArrayElements(utf8, bytes, JNI_ABORT);
+}
+
+JNIEXPORT void JNICALL
+Java_com_droidscreen_app_MainActivity_nativeSendKey(
+        JNIEnv* /*env*/, jobject /*thiz*/, jint key, jint modifiers) {
+    if (g_client_fd < 0) {
+        return;
+    }
+    key_special_send(g_client_fd, key, modifiers);
 }
 
 } /* extern "C" */

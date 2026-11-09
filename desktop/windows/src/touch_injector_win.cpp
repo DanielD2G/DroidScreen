@@ -100,7 +100,8 @@ bool WinTouchInjector::init(uint32_t w, uint32_t h, int32_t ox, int32_t oy) {
 bool WinTouchInjector::inject_touch(uint8_t action, uint8_t ptr_id,
                                     uint16_t x, uint16_t y, uint16_t pressure,
                                     uint16_t touch_major, uint16_t touch_minor,
-                                    uint16_t orientation) {
+                                    uint16_t orientation,
+                                    uint32_t /*timestamp_ms*/) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!touch_device_) {
         return false;

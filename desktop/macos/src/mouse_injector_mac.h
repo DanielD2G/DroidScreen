@@ -34,6 +34,11 @@ public:
                       uint16_t x, uint16_t y) override;
     void shutdown() override;
 
+    /// Types text (as Unicode keyboard events) or presses a special key into
+    /// whatever app has keyboard focus. Needs Accessibility permission.
+    bool inject_key(uint8_t kind, uint8_t modifiers, uint16_t key,
+                    const char* text, size_t text_len) override;
+
 private:
     CGDirectDisplayID display_id_ = 0;
 

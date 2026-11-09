@@ -29,6 +29,7 @@ extern "C" {
 #include "droidscreen/deck.h"
 #include "droidscreen/frame.h"
 #include "droidscreen/handshake.h"
+#include "droidscreen/keyboard.h"
 #include "droidscreen/mouse.h"
 #include "droidscreen/pen.h"
 #include "droidscreen/protocol.h"
@@ -728,7 +729,7 @@ void Pipeline::recv_loop() {
         ds_touch_deserialize(payload.data(), &ev);
         touch_->inject_touch(ev.action, ev.pointer_id, ev.x_frac, ev.y_frac,
                              ev.pressure, ev.touch_major, ev.touch_minor,
-                             ev.orientation);
+                             ev.orientation, ev.timestamp_ms);
       }
       break;
     }
@@ -749,6 +750,14 @@ void Pipeline::recv_loop() {
         ds_mouse_event_t ev;
         ds_mouse_deserialize(payload.data(), &ev);
         mouse_->inject_mouse(ev.action, ev.buttons, ev.x_frac, ev.y_frac);
+      }
+      break;
+    }
+
+    case DS_MSG_KEY_EVENT: {
+      ds_key_event_t ev;
+      if (ds_key_event_deserialize(payload.data(), payload.size(), &ev) > 0) {
+        mouse_->inject_key(ev.kind, ev.modifiers, ev.key, ev.text, ev.text_len);
       }
       break;
     }

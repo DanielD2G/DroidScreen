@@ -21,6 +21,7 @@ add_library(droidscreen_native SHARED
     pen_sender.cpp
     mouse_sender.cpp
     deck_sender.cpp
+    key_sender.cpp
 )
 
 target_include_directories(droidscreen_native PRIVATE

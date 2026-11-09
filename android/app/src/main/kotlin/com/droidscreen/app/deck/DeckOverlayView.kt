@@ -35,6 +35,8 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
     var onFingerModeSelected: ((Int) -> Unit)? = null
     var onStylusModeSelected: ((Int) -> Unit)? = null
     var onUnknownModeSelected: ((Int) -> Unit)? = null
+    /** Keys row: 0 = show the keyboard button, 1 = hide it. */
+    var onKeysModeSelected: ((Int) -> Unit)? = null
     var onLockToggle: (() -> Unit)? = null
     var onHide: (() -> Unit)? = null
     var onStatsChipClick: (() -> Unit)? = null
@@ -59,6 +61,7 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
     private val fingerMode: SegmentedControlView = rail.findViewById(R.id.deck_finger_mode)
     private val stylusMode: SegmentedControlView = rail.findViewById(R.id.deck_stylus_mode)
     private val unknownMode: SegmentedControlView = rail.findViewById(R.id.deck_unknown_mode)
+    private val keysMode: SegmentedControlView = rail.findViewById(R.id.deck_keys_mode)
     private val lockButton: View = rail.findViewById(R.id.deck_lock)
     private val lockIcon: ImageView = rail.findViewById(R.id.deck_lock_icon)
     private val lockText: TextView = rail.findViewById(R.id.deck_lock_text)
@@ -83,6 +86,7 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
         fingerMode.onSelected = { onFingerModeSelected?.invoke(it) }
         stylusMode.onSelected = { onStylusModeSelected?.invoke(it) }
         unknownMode.onSelected = { onUnknownModeSelected?.invoke(it) }
+        keysMode.onSelected = { onKeysModeSelected?.invoke(it) }
     }
 
     private fun railWidthFor(screenWidth: Int): Int =
@@ -163,6 +167,17 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
         fingerMode.setOptions(finger, fingerSelected)
         stylusMode.setOptions(stylus, stylusSelected)
         unknownMode.setOptions(unknown, unknownSelected)
+    }
+
+    /** Keys row state: whether the floating keyboard button is shown. */
+    fun bindKeyboardButton(shown: Boolean) {
+        keysMode.setOptions(
+            listOf(
+                SegmentedControlView.Option("Button", R.drawable.ic_ph_keyboard),
+                SegmentedControlView.Option("Off")
+            ),
+            if (shown) 0 else 1
+        )
     }
 
     /** Shows the Lock button as pressed (yellow) while the Deck is pinned open. */

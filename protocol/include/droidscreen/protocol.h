@@ -37,6 +37,7 @@ typedef enum {
     DS_MSG_TOUCH_EVENT    = 0x20,
     DS_MSG_PEN_EVENT      = 0x21,
     DS_MSG_MOUSE_EVENT    = 0x22,
+    DS_MSG_KEY_EVENT      = 0x23,  /* soft keyboard text/keys, see keyboard.h */
     DS_MSG_CONTROL        = 0x30,
     DS_MSG_DECK_CONFIG    = 0x40,
     DS_MSG_DECK_ACTION    = 0x41,

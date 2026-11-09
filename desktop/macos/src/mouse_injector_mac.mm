@@ -13,9 +13,14 @@
 
 extern "C" {
 #include "droidscreen/touch.h"
+#include "droidscreen/keyboard.h"
+
+#import <Carbon/Carbon.h>
+#import <Foundation/Foundation.h>
 }
 
 #include <algorithm>
+#include <vector>
 #include <cstdio>
 
 static constexpr uint8_t kTouchDown       = 0;
@@ -164,6 +169,87 @@ void MacMouseInjector::shutdown() {
         event_source_ = nullptr;
         fprintf(stderr, "[mouse] injector shut down\n");
     }
+}
+
+// -----------------------------------------------------------------------------
+// Keyboard (tablet soft keyboard)
+// -----------------------------------------------------------------------------
+
+static CGKeyCode mac_keycode_for(uint16_t key, bool* ok) {
+    *ok = true;
+    switch (key) {
+        case DS_KEY_BACKSPACE:   return kVK_Delete;
+        case DS_KEY_ENTER:       return kVK_Return;
+        case DS_KEY_TAB:         return kVK_Tab;
+        case DS_KEY_ESCAPE:      return kVK_Escape;
+        case DS_KEY_LEFT:        return kVK_LeftArrow;
+        case DS_KEY_RIGHT:       return kVK_RightArrow;
+        case DS_KEY_UP:          return kVK_UpArrow;
+        case DS_KEY_DOWN:        return kVK_DownArrow;
+        case DS_KEY_FORWARD_DEL: return kVK_ForwardDelete;
+        case DS_KEY_HOME:        return kVK_Home;
+        case DS_KEY_END:         return kVK_End;
+        default: *ok = false;    return 0;
+    }
+}
+
+static CGEventFlags mac_flags_for(uint8_t modifiers) {
+    CGEventFlags flags = 0;
+    if (modifiers & DS_KEY_MOD_SHIFT)   flags |= kCGEventFlagMaskShift;
+    if (modifiers & DS_KEY_MOD_CONTROL) flags |= kCGEventFlagMaskControl;
+    if (modifiers & DS_KEY_MOD_OPTION)  flags |= kCGEventFlagMaskAlternate;
+    if (modifiers & DS_KEY_MOD_COMMAND) flags |= kCGEventFlagMaskCommand;
+    return flags;
+}
+
+bool MacMouseInjector::inject_key(uint8_t kind, uint8_t modifiers, uint16_t key,
+                                  const char* text, size_t text_len) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Explicit flags on every event so a modifier held on the Mac's own
+    // keyboard doesn't turn tablet typing into shortcuts.
+    const CGEventFlags flags = mac_flags_for(modifiers);
+
+    if (kind == DS_KEY_KIND_SPECIAL) {
+        bool ok = false;
+        CGKeyCode code = mac_keycode_for(key, &ok);
+        if (!ok) return false;
+        for (bool down : {true, false}) {
+            CGEventRef ev = CGEventCreateKeyboardEvent(event_source_, code, down);
+            if (!ev) return false;
+            CGEventSetFlags(ev, flags);
+            CGEventPost(kCGHIDEventTap, ev);
+            CFRelease(ev);
+        }
+        return true;
+    }
+
+    if (kind != DS_KEY_KIND_TEXT || !text || text_len == 0) return false;
+    @autoreleasepool {
+        NSString* str = [[NSString alloc] initWithBytes:text length:text_len
+                                               encoding:NSUTF8StringEncoding];
+        if (str.length == 0) return false;
+        // CGEventKeyboardSetUnicodeString is only reliable for short strings;
+        // send small chunks, never splitting a composed character (emoji, accents).
+        NSUInteger i = 0;
+        while (i < str.length) {
+            NSRange r = [str rangeOfComposedCharacterSequencesForRange:
+                             NSMakeRange(i, MIN((NSUInteger)16, str.length - i))];
+            // The whole composed range, however long (many combining marks).
+            std::vector<unichar> buf(r.length);
+            const NSUInteger n = r.length;
+            [str getCharacters:buf.data() range:r];
+            for (bool down : {true, false}) {
+                CGEventRef ev = CGEventCreateKeyboardEvent(event_source_, 0, down);
+                if (!ev) return false;
+                CGEventSetFlags(ev, flags);
+                CGEventKeyboardSetUnicodeString(ev, (UniCharCount)n, buf.data());
+                CGEventPost(kCGHIDEventTap, ev);
+                CFRelease(ev);
+            }
+            i = NSMaxRange(r);
+        }
+    }
+    return true;
 }
 
 } // namespace droidscreen

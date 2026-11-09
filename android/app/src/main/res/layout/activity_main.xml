@@ -11,6 +11,28 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <!-- Receives the soft keyboard; typing is forwarded to the Mac. -->
+    <com.droidscreen.app.input.KeyboardCaptureView
+        android:id="@+id/keyboard_capture"
+        android:layout_width="1dp"
+        android:layout_height="1dp" />
+
+    <!-- Translucent keyboard button, bottom-left; shown/hidden from the Deck ("Keys"). -->
+    <ImageButton
+        android:id="@+id/keyboard_button"
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:layout_gravity="bottom|start"
+        android:layout_marginStart="44dp"
+        android:layout_marginBottom="20dp"
+        android:background="@drawable/ds_keyboard_fab"
+        android:contentDescription="Keyboard"
+        android:padding="13dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_ph_keyboard"
+        android:tint="#F3F1EA"
+        android:visibility="gone" />
+
     <!-- Deck rail overlay (DeckOverlayView), docked to the left edge -->
     <FrameLayout
         android:id="@+id/deck_overlay_container"

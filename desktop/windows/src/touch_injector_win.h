@@ -39,7 +39,8 @@ public:
     bool inject_touch(uint8_t action, uint8_t ptr_id,
                       uint16_t x, uint16_t y, uint16_t pressure,
                       uint16_t touch_major, uint16_t touch_minor,
-                      uint16_t orientation) override;
+                      uint16_t orientation,
+                      uint32_t timestamp_ms) override;
     bool inject_pen(uint8_t action, uint8_t ptr_id,
                     uint8_t tool_type, uint32_t buttons,
                     uint16_t x, uint16_t y, uint16_t pressure,
