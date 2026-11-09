@@ -5,14 +5,25 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${PORT:-38271}"
 RUNS="${RUNS:-3}"
 RUN_SECONDS="${RUN_SECONDS:-30}"
+# usb: stream through the adb forward tunnel. wifi: stream over the LAN to a
+# tablet already paired with this Mac (adb is still used for logs/screenshots).
+TRANSPORT="${TRANSPORT:-usb}"
+WIFI_TABLET="${WIFI_TABLET:-}"          # name or id; empty = any paired tablet
+MAX_RELEASE_MS="${MAX_RELEASE_MS:-15}"  # fail threshold for release_p50
+VALIDATION_SCENE="${VALIDATION_SCENE:-1}" # 1 = moving window, 0 = static desktop
+# BURST_EVERY=N: move the cursor over the virtual display every N seconds and
+# report the latency of the first frame after each still period ("wake").
+BURST_EVERY="${BURST_EVERY:-0}"
 OUT_ROOT="${OUT_ROOT:-/tmp/droidscreen-validation}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT_DIR="$OUT_ROOT/moonlight-port-$STAMP"
+OUT_DIR="$OUT_ROOT/$TRANSPORT-$STAMP"
 APK="$ROOT_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
-BUILT_DESKTOP_APP="$ROOT_DIR/build-macos/desktop/macos/droidscreen_desktop.app"
+BUILD_DIR="${DROIDSCREEN_BUILD_DIR:-$ROOT_DIR/build-macos}"
+export DROIDSCREEN_BUILD_DIR="$BUILD_DIR"
+BUILT_DESKTOP_APP="$BUILD_DIR/desktop/macos/droidscreen_desktop.app"
 DESKTOP_APP="${DESKTOP_APP:-/Applications/DroidScreen.app}"
 DESKTOP_BIN="$DESKTOP_APP/Contents/MacOS/droidscreen_desktop"
-VALIDATION_HELPER_BIN="$ROOT_DIR/build-macos/desktop/macos/droidscreen_validation_scene_helper"
+VALIDATION_HELPER_BIN="$BUILD_DIR/desktop/macos/droidscreen_validation_scene_helper"
 DESKTOP_DEBUG_LOG="$HOME/Library/Logs/DroidScreen/droidscreen.log"
 
 mkdir -p "$OUT_DIR"
@@ -31,6 +42,9 @@ trap cleanup EXIT
 
 echo "[validate] output: $OUT_DIR"
 
+if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+  echo "[validate] skipping builds"
+else
 echo "[validate] building Android"
 (
   cd "$ROOT_DIR/android"
@@ -42,6 +56,7 @@ echo "[validate] building Android"
 
 echo "[validate] building macOS"
 "$ROOT_DIR/scripts/build_macos.sh"
+fi
 
 if [[ "${SKIP_MACOS_INSTALL:-0}" == "1" ]]; then
   echo "[validate] skipping macOS app install; using built app"
@@ -188,7 +203,8 @@ PY
 parse_metrics() {
   local log="$1"
   local desktop_log="${2:-}"
-  python3 - "$log" "$desktop_log" <<'PY'
+  local run_dir="${3:-}"
+  python3 - "$log" "$desktop_log" "$MAX_RELEASE_MS" "$run_dir" <<'PY'
 import re
 import statistics
 import sys
@@ -215,6 +231,8 @@ encsend = []
 feed_fps = []
 render_fps = []
 feed_errors = []
+skips = []
+skip_pattern = re.compile(r"skip=(\d+)")
 quality_fps = []
 quality_kbps = []
 quality_frame_kb = []
@@ -236,8 +254,27 @@ for line in open(sys.argv[1], errors="ignore"):
     d = decode_pattern.search(line)
     if d:
         feed_errors.append(int(d.group(3)))
+        sk = skip_pattern.search(line)
+        if sk:
+            skips.append(int(sk.group(1)))
         feed_fps.append(float(d.group(4)))
         render_fps.append(float(d.group(5)))
+
+stats_pattern = re.compile(r"\[Stats\].*rtt=(\d+) us.*send_q=(\d+)(?: enc_ms=([0-9.]+))?")
+rtt_desktop = []
+send_q = []
+enc_ms = []
+if len(sys.argv) > 2 and sys.argv[2]:
+    try:
+        for line in open(sys.argv[2], errors="ignore"):
+            st = stats_pattern.search(line)
+            if st:
+                rtt_desktop.append(int(st.group(1)) / 1000.0)
+                send_q.append(int(st.group(2)))
+                if st.group(3) and float(st.group(3)) > 0:
+                    enc_ms.append(float(st.group(3)))
+    except OSError:
+        pass
 
 if len(sys.argv) > 2 and sys.argv[2]:
     try:
@@ -268,6 +305,7 @@ if feed_fps:
         f" fed_fps_p50={p50(feed_fps):.1f}"
         f" render_fps_p50={p50(render_fps):.1f}"
         f" feed_errors_max={max(feed_errors)}"
+        f" skipped_max={max(skips) if skips else 0}"
     )
 if quality_kbps:
     extra += (
@@ -276,13 +314,49 @@ if quality_kbps:
         f" bits_per_motion_p50={p50(quality_bits_per_motion):.0f}"
         f" qframe_kb_p50={p50(quality_frame_kb):.1f}"
     )
+if rtt_desktop:
+    extra += (
+        f" desk_rtt_p50={p50(rtt_desktop):.1f} desk_rtt_max={max(rtt_desktop):.1f}"
+        f" send_q_max={max(send_q)}"
+    )
+if enc_ms:
+    extra += f" vt_enc_ms_p50={p50(enc_ms):.2f}"
+
+def p95(xs):
+    ordered = sorted(xs)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+
+extra += f" release_p95={p95(release):.1f} release_max={max(release):.1f}"
+wake = []
+wake_pattern = re.compile(r"wake: gap=\d+ms e2e=([0-9.]+)ms")
+for line in open(sys.argv[1], errors="ignore"):
+    w = wake_pattern.search(line)
+    if w:
+        wake.append(float(w.group(1)))
+if wake:
+    extra += f" wake_n={len(wake)} wake_p50={p50(wake):.1f} wake_max={max(wake):.1f}"
+import os
+if len(sys.argv) > 4 and sys.argv[4]:
+    try:
+        cpu = [float(x) for x in open(os.path.join(sys.argv[4], "cpu.txt")) if x.strip()]
+        cpu = cpu[3:] or cpu  # skip startup samples
+        if cpu:
+            extra += f" mac_cpu_p50={p50(cpu):.1f}% mac_cpu_max={max(cpu):.1f}%"
+    except (OSError, ValueError):
+        pass
+    try:
+        acpu = open(os.path.join(sys.argv[4], "android-cpu.txt")).read().split()
+        if acpu:
+            extra += f" android_cpu={acpu[0]}%"
+    except OSError:
+        pass
 print(
     f"samples={len(release)} "
     f"feed_p50={p50(feed):.1f} release_p50={p50(release):.1f} "
     f"desk_p50={p50(desk):.1f} android_p50={p50(android):.1f} rtt_p50={p50(rtt):.1f}"
     f"{extra} release_last={release[-1]:.1f}"
 )
-if p50(release) > 15.0 or (feed_errors and max(feed_errors) > 3):
+if p50(release) > float(sys.argv[3]) or (feed_errors and max(feed_errors) > 3):
     raise SystemExit(3)
 PY
 }
@@ -313,7 +387,21 @@ for run in $(seq 1 "$RUNS"); do
   echo "[validate] run $run/$RUNS"
 
   adb forward --remove "tcp:$PORT" >/dev/null 2>&1 || true
-  adb forward "tcp:$PORT" "tcp:$PORT"
+  DESKTOP_ARGS=(--port "$PORT")
+  # Extra args, e.g. "-DroidScreenFPS 60 -DroidScreenBitrate 20000": NSUserDefaults
+  # reads "-Key value" pairs as overrides without touching saved settings.
+  if [[ -n "${EXTRA_DESKTOP_ARGS:-}" ]]; then
+    read -r -a extra_args <<< "$EXTRA_DESKTOP_ARGS"
+    DESKTOP_ARGS+=("${extra_args[@]}")
+  fi
+  if [[ "$TRANSPORT" == "wifi" ]]; then
+    DESKTOP_ARGS+=(--wifi)
+    if [[ -n "$WIFI_TABLET" ]]; then
+      DESKTOP_ARGS+=("$WIFI_TABLET")
+    fi
+  else
+    adb forward "tcp:$PORT" "tcp:$PORT"
+  fi
   adb logcat -c
   adb logcat -v time > "$RUN_DIR/logcat.txt" &
   LOGCAT_PID=$!
@@ -334,13 +422,29 @@ for run in $(seq 1 "$RUNS"); do
   sleep 2
   adb exec-out screencap -p > "$RUN_DIR/01-waiting.png"
 
-  DROIDSCREEN_VALIDATION_SCENE=1 \
+  DROIDSCREEN_VALIDATION_SCENE="$VALIDATION_SCENE" \
   DROIDSCREEN_VALIDATION_HELPER_PATH="$VALIDATION_HELPER_BIN" \
-    "$DESKTOP_BIN" --port "$PORT" > "$RUN_DIR/desktop.log" 2>&1 &
+    "$DESKTOP_BIN" "${DESKTOP_ARGS[@]}" > "$RUN_DIR/desktop.log" 2>&1 &
   DESKTOP_PID=$!
+  # Sample desktop CPU (% of one core) every 2 s for the cost report.
+  ( while kill -0 "$DESKTOP_PID" 2>/dev/null; do
+      ps -o %cpu= -p "$DESKTOP_PID" 2>/dev/null | tr -d ' '
+      sleep 2
+    done ) > "$RUN_DIR/cpu.txt" &
+  CPU_PID=$!
 
   wait_for_log "handshake complete" "$RUN_DIR/logcat.txt" 35
+  if [[ "$TRANSPORT" == "wifi" ]] && ! grep -q "connected (wifi)" "$RUN_DIR/logcat.txt"; then
+    echo "[validate] expected a Wi-Fi connection but the tablet saw USB" >&2
+    exit 4
+  fi
   wait_for_log "lat feed=" "$RUN_DIR/logcat.txt" 35
+  if [[ "$BURST_EVERY" != "0" ]]; then
+    VD_ID="$(grep -aoE 'Virtual display created \(ID=[0-9]+' "$DESKTOP_DEBUG_LOG" | tail -1 | grep -oE '[0-9]+$')"
+    swiftc -O "$ROOT_DIR/scripts/tools/burst_cursor.swift" -o "$BUILD_DIR/burst_cursor" 2>/dev/null || true
+    "$BUILD_DIR/burst_cursor" "$VD_ID" "$BURST_EVERY" "$RUN_SECONDS" &
+    BURST_PID=$!
+  fi
   sleep 2
   adb exec-out screencap -p > "$RUN_DIR/02-active-5s.png"
   analyze_png "$RUN_DIR/02-active-5s.png" > "$RUN_DIR/02-active-5s.analysis"
@@ -357,9 +461,20 @@ for run in $(seq 1 "$RUNS"); do
   adb exec-out screencap -p > "$RUN_DIR/04-active-final.png"
   analyze_png "$RUN_DIR/04-active-final.png" > "$RUN_DIR/04-active-final.analysis"
 
+  # Tablet-side CPU of the app at the end of the run (% of one core).
+  ANDROID_PID="$(adb shell pidof com.droidscreen.app 2>/dev/null | tr -d '\r')"
+  if [[ -n "$ANDROID_PID" ]]; then
+    adb shell top -b -n 1 -p "$ANDROID_PID" 2>/dev/null | awk -v p="$ANDROID_PID" '$1==p {print $9}' > "$RUN_DIR/android-cpu.txt"
+  fi
+
   kill "$DESKTOP_PID" 2>/dev/null || true
   wait "$DESKTOP_PID" 2>/dev/null || true
   unset DESKTOP_PID
+  kill "$CPU_PID" 2>/dev/null || true
+  if [[ -n "${BURST_PID:-}" ]]; then
+    kill "$BURST_PID" 2>/dev/null || true
+    unset BURST_PID
+  fi
   if [[ -f "$DESKTOP_DEBUG_LOG" ]]; then
     cp "$DESKTOP_DEBUG_LOG" "$RUN_DIR/desktop-debug.log"
   fi
@@ -369,7 +484,7 @@ for run in $(seq 1 "$RUNS"); do
   unset LOGCAT_PID
 
   set +e
-  parse_metrics "$RUN_DIR/logcat.txt" "$RUN_DIR/desktop-debug.log" | tee "$RUN_DIR/metrics.txt"
+  parse_metrics "$RUN_DIR/logcat.txt" "$RUN_DIR/desktop-debug.log" "$RUN_DIR" | tee "$RUN_DIR/metrics.txt"
   metrics_status=${PIPESTATUS[0]}
   set -e
   if (( metrics_status != 0 )); then

@@ -316,6 +316,7 @@ object InputRouter {
             PointerSource.FINGER -> when (settings.fingerInputMode) {
                 FingerInputMode.NATIVE_TOUCH -> InputTarget.TOUCH
                 FingerInputMode.MOUSE_CURSOR -> InputTarget.MOUSE
+                FingerInputMode.OFF -> InputTarget.IGNORE
             }
 
             PointerSource.STYLUS,

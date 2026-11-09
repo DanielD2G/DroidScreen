@@ -7,16 +7,18 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
-import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.text.TextUtils
 import android.view.MotionEvent
 import android.view.View
+import com.droidscreen.app.R
+import com.droidscreen.app.ui.LinkLine
 
 /**
- * Horizontal media bar for the compact Stream Deck panel.
- * Layout: [AlbumArt 40x40] [Title / Artist] [<<] [>||] [>>]
- * With a thin 2dp progress bar running along the bottom.
- * No glass background — sits inside the panel which provides that.
+ * "Now playing" card for the Deck rail (Link Line): ink card with a 1dp line
+ * border, title and artist on one line, a thin progress bar with elapsed /
+ * total time in mono, and prev / play-pause / next buttons (play-pause filled).
+ * Album art, when the desktop sends it, sits to the left of the title.
  */
 class MediaTileView(
     context: Context,
@@ -31,7 +33,8 @@ class MediaTileView(
     private val artSize = ART_SIZE_DP * density
     private val artCorner = ART_CORNER_DP * density
     private val btnSize = BTN_SIZE_DP * density
-    private val innerPad = INNER_PAD_DP * density
+    private val padH = PAD_H_DP * density
+    private val padV = PAD_V_DP * density
     private val progressHeight = PROGRESS_HEIGHT_DP * density
     private val tileCorner = TILE_CORNER_DP * density
 
@@ -42,65 +45,60 @@ class MediaTileView(
     private var artist = ""
     private var albumArt: Bitmap? = null
     private var progress = 0f // 0..1
+    private var durationSec = 0
 
     // -- Paints -----------------------------------------------------------
 
     private val tileBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x7A, 0x08, 0x09, 0x12)
+        color = LinkLine.INK
         style = Paint.Style.FILL
     }
 
     private val tileBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x30, 0xFF, 0xFF, 0xFF)
+        color = LinkLine.LINE
         style = Paint.Style.STROKE
-        strokeWidth = 0.5f * density
-    }
-
-    private val separatorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x28, 0xFF, 0xFF, 0xFF)
-        style = Paint.Style.STROKE
-        strokeWidth = 0.5f * density
+        strokeWidth = 1f * density
     }
 
     private val artPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
-    private val artPlaceholderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x20, 0xFF, 0xFF, 0xFF)
-        style = Paint.Style.FILL
-    }
-
     private val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0xEE, 0xFF, 0xFF, 0xFF)
+        color = LinkLine.TEXT
         textSize = TITLE_SP * sp
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        letterSpacing = 0.01f
+        typeface = LinkLine.sans(context, 600)
     }
 
     private val artistPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#AAAAAA")
+        color = LinkLine.TEXT_2
         textSize = ARTIST_SP * sp
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+        typeface = LinkLine.sans(context)
+    }
+
+    private val timePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = LinkLine.TEXT_3
+        textSize = TIME_SP * sp
+        typeface = LinkLine.mono(context)
     }
 
     private val progressBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x18, 0xFF, 0xFF, 0xFF)
+        color = LinkLine.LINE_2
         style = Paint.Style.FILL
     }
 
     private val progressFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#8B5CF6")
+        color = LinkLine.TEXT
         style = Paint.Style.FILL
     }
 
-    private val btnPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0xDD, 0xFF, 0xFF, 0xFF)
+    private val playBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = LinkLine.TEXT
         style = Paint.Style.FILL
     }
 
-    private val btnDimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x88, 0xFF, 0xFF, 0xFF)
-        style = Paint.Style.FILL
-    }
+    private val prevIcon: Drawable? = context.getDrawable(R.drawable.ic_ph_skip_back_fill)?.mutate()
+    private val nextIcon: Drawable? = context.getDrawable(R.drawable.ic_ph_skip_forward_fill)?.mutate()
+    private val playIcon: Drawable? = context.getDrawable(R.drawable.ic_ph_play_fill)?.mutate()
+    private val pauseIcon: Drawable? = context.getDrawable(R.drawable.ic_ph_pause_fill)?.mutate()
 
     // -- Hit test regions (computed in onDraw) ----------------------------
 
@@ -112,6 +110,18 @@ class MediaTileView(
     init {
         isClickable = true
         isFocusable = true
+    }
+
+    private fun headerHeight(): Float =
+        if (albumArt != null) artSize else titlePaint.fontSpacing
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val h = padV + headerHeight() + PROGRESS_TOP_DP * density + progressHeight +
+            TIME_TOP_DP * density + timePaint.fontSpacing + BTN_TOP_DP * density + btnSize + padV
+        setMeasuredDimension(
+            MeasureSpec.getSize(widthMeasureSpec),
+            resolveSize(h.toInt(), heightMeasureSpec)
+        )
     }
 
     // ------------------------------------------------------------------
@@ -126,168 +136,94 @@ class MediaTileView(
 
         val w = width.toFloat()
         val h = height.toFloat()
-        val bgRect = RectF(0f, 0f, w, h)
-
+        val inset = tileBorderPaint.strokeWidth / 2f
+        val bgRect = RectF(inset, inset, w - inset, h - inset)
         canvas.drawRoundRect(bgRect, tileCorner, tileCorner, tileBgPaint)
         canvas.drawRoundRect(bgRect, tileCorner, tileCorner, tileBorderPaint)
 
-        // 0. Top separator line
-        canvas.drawLine(innerPad, 0f, w - innerPad, 0f, separatorPaint)
-
-        // Content area (vertically centered, leaving room for progress bar at bottom)
-        val contentH = h - progressHeight
-        val cy = contentH / 2f
-
-        // 1. Album art (left side, centered vertically)
-        val artLeft = innerPad
-        val artTop = cy - artSize / 2f
-        val artRect = RectF(artLeft, artTop, artLeft + artSize, artTop + artSize)
-
+        // 1. Header: [art] title  artist
+        var y = padV
+        var textLeft = padH
         val art = albumArt
+        val titleStr = title.ifBlank { "Nothing playing" }
         if (art != null) {
+            val artRect = RectF(padH, y, padH + artSize, y + artSize)
             canvas.save()
             val clipPath = Path()
             clipPath.addRoundRect(artRect, artCorner, artCorner, Path.Direction.CW)
             canvas.clipPath(clipPath)
             canvas.drawBitmap(art, null, artRect, artPaint)
             canvas.restore()
+            textLeft = artRect.right + 10f * density
+            val maxW = w - padH - textLeft
+            val titleBase = y + artSize / 2f - 2f * density
+            canvas.drawText(ellipsize(titleStr, titlePaint, maxW), textLeft, titleBase, titlePaint)
+            if (artist.isNotBlank()) {
+                canvas.drawText(
+                    ellipsize(artist, artistPaint, maxW), textLeft,
+                    titleBase - artistPaint.ascent() + 2f * density, artistPaint
+                )
+            }
         } else {
-            canvas.drawRoundRect(artRect, artCorner, artCorner, artPlaceholderPaint)
-            drawMusicNote(canvas, artRect)
+            val baseline = y - titlePaint.ascent()
+            val maxW = w - 2 * padH
+            val titleText = ellipsize(titleStr, titlePaint, maxW)
+            canvas.drawText(titleText, textLeft, baseline, titlePaint)
+            val artistLeft = textLeft + titlePaint.measureText(titleText) + 8f * density
+            val artistMax = w - padH - artistLeft
+            if (artist.isNotBlank() && artistMax > 24f * density) {
+                canvas.drawText(ellipsize(artist, artistPaint, artistMax), artistLeft, baseline, artistPaint)
+            }
         }
+        y += headerHeight() + PROGRESS_TOP_DP * density
 
-        // 2. Playback buttons (right side): prev, play/pause, next
-        val btnSpacing = btnSize * 1.2f
-        val buttonsRight = w - innerPad
-        nextBtnCx = buttonsRight - btnSize / 2f
-        playBtnCx = nextBtnCx - btnSpacing
-        prevBtnCx = playBtnCx - btnSpacing
-        btnCy = cy
-
-        drawPrevIcon(canvas, prevBtnCx, btnCy, btnSize * 0.35f)
-        if (playing) {
-            drawPauseIcon(canvas, playBtnCx, btnCy, btnSize * 0.4f)
-        } else {
-            drawPlayIcon(canvas, playBtnCx, btnCy, btnSize * 0.4f)
-        }
-        drawNextIcon(canvas, nextBtnCx, btnCy, btnSize * 0.35f)
-
-        // 3. Text area (between art and buttons)
-        val textLeft = artRect.right + innerPad
-        val textRight = prevBtnCx - btnSize / 2f - innerPad * 0.5f
-        val textMaxWidth = textRight - textLeft
-
-        if (textMaxWidth > 0f) {
-            val titleStr = title.ifBlank { "No media" }
-            val artistStr = artist.ifBlank { "---" }
-
-            val titleY = cy - 1f * density
-            val ellipsizedTitle = ellipsize(titleStr, titlePaint, textMaxWidth)
-            canvas.drawText(ellipsizedTitle, textLeft, titleY, titlePaint)
-
-            val artistY = titleY + ARTIST_SP * sp * 1.5f
-            val ellipsizedArtist = ellipsize(artistStr, artistPaint, textMaxWidth)
-            canvas.drawText(ellipsizedArtist, textLeft, artistY, artistPaint)
-        }
-
-        // 4. Progress bar (thin strip at the very bottom)
-        val barTop = h - progressHeight
-        val barRect = RectF(0f, barTop, w, h)
+        // 2. Progress bar
         val barRadius = progressHeight / 2f
+        val barRect = RectF(padH, y, w - padH, y + progressHeight)
         canvas.drawRoundRect(barRect, barRadius, barRadius, progressBgPaint)
-        val filledRight = w * progress.coerceIn(0f, 1f)
-        if (filledRight > 1f) {
+        val filledRight = barRect.left + barRect.width() * progress.coerceIn(0f, 1f)
+        if (filledRight > barRect.left + 1f) {
             canvas.drawRoundRect(
-                RectF(0f, barTop, filledRight, h),
+                RectF(barRect.left, barRect.top, filledRight, barRect.bottom),
                 barRadius, barRadius, progressFillPaint
             )
         }
-    }
+        y += progressHeight + TIME_TOP_DP * density
 
-    // ------------------------------------------------------------------
-    // Icon drawing helpers
-    // ------------------------------------------------------------------
-
-    private fun drawPlayIcon(canvas: Canvas, cx: Float, cy: Float, size: Float) {
-        val path = Path()
-        path.moveTo(cx - size * 0.35f, cy - size * 0.5f)
-        path.lineTo(cx + size * 0.5f, cy)
-        path.lineTo(cx - size * 0.35f, cy + size * 0.5f)
-        path.close()
-        canvas.drawPath(path, btnPaint)
-    }
-
-    private fun drawPauseIcon(canvas: Canvas, cx: Float, cy: Float, size: Float) {
-        val barW = size * 0.26f
-        val halfGap = size * 0.1f
-        val halfH = size * 0.45f
-        val r = barW * 0.25f
-        canvas.drawRoundRect(
-            cx - halfGap - barW, cy - halfH,
-            cx - halfGap, cy + halfH,
-            r, r, btnPaint
-        )
-        canvas.drawRoundRect(
-            cx + halfGap, cy - halfH,
-            cx + halfGap + barW, cy + halfH,
-            r, r, btnPaint
-        )
-    }
-
-    private fun drawPrevIcon(canvas: Canvas, cx: Float, cy: Float, size: Float) {
-        // Two left-pointing triangles (<<)
-        val path = Path()
-        // First triangle
-        path.moveTo(cx + size * 0.1f, cy - size * 0.4f)
-        path.lineTo(cx - size * 0.35f, cy)
-        path.lineTo(cx + size * 0.1f, cy + size * 0.4f)
-        path.close()
-        // Second triangle
-        path.moveTo(cx + size * 0.5f, cy - size * 0.4f)
-        path.lineTo(cx + size * 0.05f, cy)
-        path.lineTo(cx + size * 0.5f, cy + size * 0.4f)
-        path.close()
-        canvas.drawPath(path, btnDimPaint)
-    }
-
-    private fun drawNextIcon(canvas: Canvas, cx: Float, cy: Float, size: Float) {
-        // Two right-pointing triangles (>>)
-        val path = Path()
-        path.moveTo(cx - size * 0.5f, cy - size * 0.4f)
-        path.lineTo(cx - size * 0.05f, cy)
-        path.lineTo(cx - size * 0.5f, cy + size * 0.4f)
-        path.close()
-        path.moveTo(cx - size * 0.1f, cy - size * 0.4f)
-        path.lineTo(cx + size * 0.35f, cy)
-        path.lineTo(cx - size * 0.1f, cy + size * 0.4f)
-        path.close()
-        canvas.drawPath(path, btnDimPaint)
-    }
-
-    private fun drawMusicNote(canvas: Canvas, rect: RectF) {
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(0x40, 0xFF, 0xFF, 0xFF)
-            style = Paint.Style.FILL
+        // 3. Elapsed / total
+        val timeBase = y - timePaint.ascent()
+        if (durationSec > 0) {
+            val elapsed = (durationSec * progress.coerceIn(0f, 1f)).toInt()
+            timePaint.textAlign = Paint.Align.LEFT
+            canvas.drawText(formatTime(elapsed), padH, timeBase, timePaint)
+            timePaint.textAlign = Paint.Align.RIGHT
+            canvas.drawText(formatTime(durationSec), w - padH, timeBase, timePaint)
+            timePaint.textAlign = Paint.Align.LEFT
         }
-        val cx = rect.centerX()
-        val cy = rect.centerY()
-        val r = rect.width() * 0.1f
-        canvas.drawCircle(cx - r * 0.5f, cy + r * 1.2f, r, paint)
-        val stemPaint = Paint(paint).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = 1f * density
-        }
-        canvas.drawLine(
-            cx - r * 0.5f + r, cy + r * 1.2f,
-            cx - r * 0.5f + r, cy - r * 1.5f,
-            stemPaint
-        )
-        canvas.drawLine(
-            cx - r * 0.5f + r, cy - r * 1.5f,
-            cx + r * 1.2f, cy - r * 0.5f,
-            stemPaint
-        )
+        y += timePaint.fontSpacing + BTN_TOP_DP * density
+
+        // 4. Transport: prev, play/pause (filled), next
+        btnCy = y + btnSize / 2f
+        val spacing = btnSize + BTN_GAP_DP * density
+        playBtnCx = w / 2f
+        prevBtnCx = playBtnCx - spacing
+        nextBtnCx = playBtnCx + spacing
+
+        canvas.drawCircle(playBtnCx, btnCy, btnSize / 2f, playBgPaint)
+        drawIcon(canvas, prevIcon, prevBtnCx, btnCy, LinkLine.TEXT)
+        drawIcon(canvas, if (playing) pauseIcon else playIcon, playBtnCx, btnCy, LinkLine.INK)
+        drawIcon(canvas, nextIcon, nextBtnCx, btnCy, LinkLine.TEXT)
     }
+
+    private fun drawIcon(canvas: Canvas, icon: Drawable?, cx: Float, cy: Float, color: Int) {
+        icon ?: return
+        val half = ICON_DP * density / 2f
+        icon.setTint(color)
+        icon.setBounds((cx - half).toInt(), (cy - half).toInt(), (cx + half).toInt(), (cy + half).toInt())
+        icon.draw(canvas)
+    }
+
+    private fun formatTime(totalSec: Int): String = "%d:%02d".format(totalSec / 60, totalSec % 60)
 
     private fun ellipsize(text: String, paint: Paint, maxWidth: Float): String {
         if (maxWidth <= 0f) return ""
@@ -305,14 +241,15 @@ class MediaTileView(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                parent?.requestDisallowInterceptTouchEvent(true)
+                // Don't block the rail's ScrollView: a vertical drag that starts
+                // here should scroll (we then get CANCEL and do nothing).
                 return true
             }
             MotionEvent.ACTION_UP -> {
                 val x = event.x
                 val y = event.y
                 if (y < 0 || y > height) return true
-                val hitRadius = btnSize * 0.7f
+                val hitRadius = btnSize * 0.6f
 
                 when {
                     distSq(x, y, prevBtnCx, btnCy) < hitRadius * hitRadius -> {
@@ -347,8 +284,11 @@ class MediaTileView(
         playing = state.playing
         title = state.title
         artist = state.artist
+        val hadArt = albumArt != null
         albumArt = state.albumArtBitmap
         progress = state.progress
+        durationSec = state.durationSec
+        if (hadArt != (albumArt != null)) requestLayout()
         invalidate()
     }
 
@@ -361,13 +301,20 @@ class MediaTileView(
         const val ACTION_PREV = 2
         const val ACTION_NEXT = 3
 
-        private const val ART_SIZE_DP = 52f
-        private const val ART_CORNER_DP = 8f
-        private const val INNER_PAD_DP = 14f
+        private const val ART_SIZE_DP = 40f
+        private const val ART_CORNER_DP = 6f
+        private const val PAD_H_DP = 14f
+        private const val PAD_V_DP = 12f
         private const val TITLE_SP = 15f
-        private const val ARTIST_SP = 12f
+        private const val ARTIST_SP = 13f
+        private const val TIME_SP = 11f
+        private const val PROGRESS_TOP_DP = 10f
         private const val PROGRESS_HEIGHT_DP = 3f
-        private const val BTN_SIZE_DP = 34f
-        private const val TILE_CORNER_DP = 18f
+        private const val TIME_TOP_DP = 5f
+        private const val BTN_TOP_DP = 6f
+        private const val BTN_SIZE_DP = 48f
+        private const val BTN_GAP_DP = 14f
+        private const val ICON_DP = 20f
+        private const val TILE_CORNER_DP = 14f
     }
 }

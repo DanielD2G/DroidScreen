@@ -2,9 +2,10 @@ package com.droidscreen.app
 
 import android.content.Context
 
-enum class FingerInputMode(val storageValue: String, val label: String) {
-    NATIVE_TOUCH("native_touch", "Native touch"),
-    MOUSE_CURSOR("mouse_cursor", "Mouse cursor");
+enum class FingerInputMode(val storageValue: String, val label: String, val shortLabel: String) {
+    NATIVE_TOUCH("native_touch", "Native touch", "Touch"),
+    MOUSE_CURSOR("mouse_cursor", "Mouse cursor", "Mouse"),
+    OFF("off", "Off", "Off");
 
     companion object {
         fun fromStorage(value: String?): FingerInputMode =
@@ -12,10 +13,10 @@ enum class FingerInputMode(val storageValue: String, val label: String) {
     }
 }
 
-enum class StylusInputMode(val storageValue: String, val label: String) {
-    NATIVE_PEN("native_pen", "Native pen"),
-    NATIVE_TOUCH("native_touch", "Native touch"),
-    MOUSE_CURSOR("mouse_cursor", "Mouse cursor");
+enum class StylusInputMode(val storageValue: String, val label: String, val shortLabel: String) {
+    NATIVE_PEN("native_pen", "Native pen", "Native"),
+    NATIVE_TOUCH("native_touch", "Native touch", "Touch"),
+    MOUSE_CURSOR("mouse_cursor", "Mouse cursor", "Mouse");
 
     companion object {
         fun fromStorage(value: String?): StylusInputMode =
@@ -23,9 +24,9 @@ enum class StylusInputMode(val storageValue: String, val label: String) {
     }
 }
 
-enum class UnknownPointerFallback(val storageValue: String, val label: String) {
-    TREAT_AS_FINGER("treat_as_finger", "Treat as finger"),
-    IGNORE("ignore", "Ignore");
+enum class UnknownPointerFallback(val storageValue: String, val label: String, val shortLabel: String) {
+    TREAT_AS_FINGER("treat_as_finger", "Treat as finger", "Finger"),
+    IGNORE("ignore", "Ignore", "Ignore");
 
     companion object {
         fun fromStorage(value: String?): UnknownPointerFallback =

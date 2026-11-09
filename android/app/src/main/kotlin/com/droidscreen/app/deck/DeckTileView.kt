@@ -5,14 +5,15 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
-import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.View
 import android.view.animation.OvershootInterpolator
+import com.droidscreen.app.ui.LinkLine
 
 /**
- * A compact app-icon tile (64x76dp) for the floating Stream Deck panel.
- * Shows a small rounded icon (or letter placeholder) with a tiny label below.
+ * An app-shortcut tile for the Deck rail (Link Line): raised surface with a
+ * 1dp line border, the app icon (or a letter placeholder) above a small
+ * label. While pressed the tile fills with the cable yellow.
  */
 class DeckTileView(
     context: Context,
@@ -31,36 +32,38 @@ class DeckTileView(
     // -- Paints -----------------------------------------------------------
 
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x66, 0x08, 0x0A, 0x12)
+        color = LinkLine.RAISED
         style = Paint.Style.FILL
     }
 
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 0.5f * density
-        color = Color.argb(0x38, 0xFF, 0xFF, 0xFF)
+        strokeWidth = 1f * density
+        color = LinkLine.LINE
     }
 
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
     private val placeholderBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x44, 0x18, 0x1C, 0x28)
-        style = Paint.Style.FILL
+        style = Paint.Style.STROKE
+        strokeWidth = 1.5f * density
+        color = LinkLine.TEXT
     }
 
     private val letterPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0xDD, 0xFF, 0xFF, 0xFF)
+        color = LinkLine.TEXT
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        typeface = LinkLine.sans(context, 600)
     }
 
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0xBB, 0xFF, 0xFF, 0xFF)
+        color = LinkLine.TEXT_2
         textSize = labelTextSize
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
-        letterSpacing = 0.01f
+        typeface = LinkLine.sans(context)
     }
+
+    private var pressedState = false
 
     // -- Rects (lazily sized) ---------------------------------------------
 
@@ -77,7 +80,8 @@ class DeckTileView(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        outerRect.set(0f, 0f, w.toFloat(), h.toFloat())
+        val inset = borderPaint.strokeWidth / 2f
+        outerRect.set(inset, inset, w - inset, h - inset)
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -90,12 +94,19 @@ class DeckTileView(
         val h = height.toFloat()
         val cx = w / 2f
 
-        // 1. Background pill
+        // 1. Tile background (yellow while pressed)
+        bgPaint.color = if (pressedState) LinkLine.CABLE else LinkLine.RAISED
+        borderPaint.color = if (pressedState) LinkLine.CABLE else LinkLine.LINE
+        val inkOnPress = if (pressedState) LinkLine.INK else LinkLine.TEXT
+        letterPaint.color = inkOnPress
+        placeholderBgPaint.color = inkOnPress
+        labelPaint.color = if (pressedState) LinkLine.INK else LinkLine.TEXT_2
         canvas.drawRoundRect(outerRect, cornerRadius, cornerRadius, bgPaint)
         canvas.drawRoundRect(outerRect, cornerRadius, cornerRadius, borderPaint)
 
-        // 2. Icon area — centered horizontally, near the top
-        val iconTop = ICON_TOP_PAD_DP * density
+        // 2. Icon + label block, centered vertically
+        val blockH = iconSize + LABEL_TOP_GAP_DP * density + labelTextSize
+        val iconTop = (h - blockH) / 2f
         val iconLeft = cx - iconSize / 2f
         val iconRect = RectF(iconLeft, iconTop, iconLeft + iconSize, iconTop + iconSize)
 
@@ -106,8 +117,8 @@ class DeckTileView(
             // Placeholder: rounded rect with first letter
             canvas.drawRoundRect(iconRect, iconCorner, iconCorner, placeholderBgPaint)
             if (tileConfig.label.isNotEmpty()) {
-                letterPaint.textSize = iconSize * 0.45f
-                val letterY = iconRect.centerY() + iconSize * 0.16f
+                letterPaint.textSize = iconSize * 0.5f
+                val letterY = iconRect.centerY() - (letterPaint.ascent() + letterPaint.descent()) / 2f
                 canvas.drawText(
                     tileConfig.label.first().uppercase(),
                     cx, letterY, letterPaint
@@ -117,7 +128,7 @@ class DeckTileView(
 
         // 3. Label below icon (single line, ellipsized)
         if (tileConfig.label.isNotBlank()) {
-            val labelY = iconRect.bottom + LABEL_TOP_GAP_DP * density + labelTextSize
+            val labelY = iconRect.bottom + LABEL_TOP_GAP_DP * density - labelPaint.ascent()
             val maxLabelW = w - 4f * density
             val ellipsized = ellipsize(tileConfig.label, labelPaint, maxLabelW)
             canvas.drawText(ellipsized, cx, labelY, labelPaint)
@@ -140,11 +151,14 @@ class DeckTileView(
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                setPressedState(true)
                 animate().scaleX(PRESS_SCALE).scaleY(PRESS_SCALE)
                     .setDuration(PRESS_ANIM_MS).setInterpolator(null).start()
-                parent?.requestDisallowInterceptTouchEvent(true)
+                // No requestDisallowInterceptTouchEvent: a vertical drag from a
+                // tile scrolls the rail (CANCEL resets the press state).
             }
             MotionEvent.ACTION_UP -> {
+                setPressedState(false)
                 animate().scaleX(1f).scaleY(1f)
                     .setDuration(RELEASE_ANIM_MS)
                     .setInterpolator(OvershootInterpolator(2f)).start()
@@ -153,12 +167,20 @@ class DeckTileView(
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
+                setPressedState(false)
                 animate().scaleX(1f).scaleY(1f)
                     .setDuration(RELEASE_ANIM_MS)
                     .setInterpolator(OvershootInterpolator(2f)).start()
             }
         }
         return true
+    }
+
+    private fun setPressedState(pressed: Boolean) {
+        if (pressedState != pressed) {
+            pressedState = pressed
+            invalidate()
+        }
     }
 
     private fun isPointInsideView(x: Float, y: Float): Boolean {
@@ -172,13 +194,12 @@ class DeckTileView(
     companion object {
         const val ACTION_TAP = 0
 
-        private const val CORNER_RADIUS_DP = 14f
-        private const val ICON_SIZE_DP = 52f
-        private const val ICON_CORNER_DP = 12f
-        private const val ICON_TOP_PAD_DP = 12f
+        private const val CORNER_RADIUS_DP = 10f
+        private const val ICON_SIZE_DP = 32f
+        private const val ICON_CORNER_DP = 8f
         private const val LABEL_TOP_GAP_DP = 6f
         private const val LABEL_SP = 11f
-        private const val PRESS_SCALE = 0.95f
+        private const val PRESS_SCALE = 0.97f
         private const val PRESS_ANIM_MS = 80L
         private const val RELEASE_ANIM_MS = 150L
     }

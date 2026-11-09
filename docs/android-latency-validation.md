@@ -112,6 +112,53 @@ Archivos importantes:
 - `desktop-debug.log`: log persistente de DroidScreen desktop.
 - `metrics.txt`: resumen parseado.
 
+## Validacion por Wi-Fi
+
+La tablet se anuncia por mDNS (`_droidscreen._tcp`) y la Mac la encuentra sola.
+La primera vez hay que emparejarlas: menu de DroidScreen -> "Wi-Fi tablets" ->
+"<tablet> (pair)" y tocar "Allow" en la tablet. Despues la app se conecta sola.
+
+Para pruebas automatizadas, la app de Mac acepta:
+
+```bash
+droidscreen_desktop --wifi [nombre|id]     # solo Wi-Fi, aunque haya cable
+droidscreen_desktop --wifi -DroidScreenFPS 60   # -Clave valor pisa NSUserDefaults sin guardarlo
+```
+
+El cable puede quedar conectado: el stream va por Wi-Fi y `adb` solo se usa
+para logs y capturas. Variables del script:
+
+| Variable | Default | Uso |
+|---|---|---|
+| `TRANSPORT` | `usb` | `wifi` para streamear por la red (requiere tablet emparejada) |
+| `WIFI_TABLET` | vacio | nombre o id de la tablet; vacio = cualquiera emparejada |
+| `EXTRA_DESKTOP_ARGS` | vacio | p. ej. `"-DroidScreenFPS 60 -DroidScreenMinIdleFPS 10"` |
+| `VALIDATION_SCENE` | `1` | `0` = escritorio quieto (mide costo en reposo) |
+| `BURST_EVERY` | `0` | mueve el cursor cada N s y mide la latencia de "despertar" |
+| `MAX_RELEASE_MS` | `15` | umbral de `release_p50` para fallar |
+| `SKIP_BUILD` | `0` | `1` = no recompilar (iteraciones rapidas) |
+| `DROIDSCREEN_BUILD_DIR` | `build-macos` | directorio de build de macOS |
+
+Ejemplo:
+
+```bash
+DROIDSCREEN_BUILD_DIR=$PWD/build-macos-wireless SKIP_BUILD=1 SKIP_INSTALL=1 \
+SKIP_MACOS_INSTALL=1 TRANSPORT=wifi RUNS=3 RUN_SECONDS=30 \
+EXTRA_DESKTOP_ARGS="-DroidScreenFPS 60" ./scripts/validate_android_latency.sh
+```
+
+Metricas nuevas en `metrics.txt`: `release_p95`/`release_max`, `skipped_max`
+(frames salteados esperando keyframe tras una perdida), `desk_rtt_max`,
+`vt_enc_ms_p50` (encode puro de VideoToolbox), `mac_cpu_p50` y `android_cpu`
+(% de un nucleo), y `wake_p50`/`wake_max` con `BURST_EVERY`.
+
+Referencia medida (POCO Pad, Wi-Fi 6 a 5 GHz, M3 Pro, 2560x1600 HiDPI, 60 fps HEVC):
+
+```text
+release_p50=30.5 release_p95=33.0 release_max=34.2 render_fps_p50=56.8
+feed_errors_max=0 mac_cpu_p50=5% android_cpu=50% (movimiento) / 19% (quieta)
+```
+
 ## Flujo Manual Equivalente
 
 Usar este flujo cuando se quiera depurar paso a paso.

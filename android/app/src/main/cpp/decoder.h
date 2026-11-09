@@ -129,6 +129,15 @@ int32_t decoder_pop_input(DecoderContext *ctx);
 int decoder_drain(DecoderContext *ctx, int64_t *rendered_pts_us);
 
 /*
+ * Like decoder_drain, but in sync mode the first dequeueOutputBuffer blocks up
+ * to timeout_us so the decode thread wakes the instant a frame is ready (low
+ * render latency, no busy-poll). In async mode this is identical to
+ * decoder_drain. Returns 0 or 1.
+ */
+int decoder_drain_wait(DecoderContext *ctx, int64_t timeout_us,
+                       int64_t *rendered_pts_us);
+
+/*
  * Stop and destroy the decoder. Releases all resources.
  */
 void decoder_destroy(DecoderContext *ctx);

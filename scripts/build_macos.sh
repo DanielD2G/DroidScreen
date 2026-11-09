@@ -4,7 +4,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="$PROJECT_DIR/build-macos"
+BUILD_DIR="${DROIDSCREEN_BUILD_DIR:-$PROJECT_DIR/build-macos}"
 APP_BUNDLE="$BUILD_DIR/desktop/macos/droidscreen_desktop.app"
 ENTITLEMENTS="$PROJECT_DIR/desktop/macos/DroidScreen.entitlements"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/droidscreen"

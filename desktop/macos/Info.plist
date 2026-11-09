@@ -12,6 +12,12 @@
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>DroidScreen finds your tablet on the local network and streams your second screen to it over Wi-Fi.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_droidscreen._tcp</string>
+    </array>
     <key>LSUIElement</key>
     <true/>
     <key>CFBundleIconFile</key>

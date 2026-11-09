@@ -4,18 +4,19 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.RectF
-import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.view.MotionEvent
 import android.view.View
+import com.droidscreen.app.R
+import com.droidscreen.app.ui.LinkLine
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * Horizontal volume slider bar for the compact Stream Deck panel.
- * Shows a speaker icon on the left (tap to mute), a horizontal track
- * with a filled portion and circular thumb, and a small percentage label.
+ * Volume row for the Deck rail (Link Line): a 44dp mute button on the left
+ * (yellow while muted), a 4dp track with a yellow fill and a warm-white
+ * thumb, and the percentage in mono on the right.
  *
  * Volume range: 0..65535 (matching system volume APIs).
  */
@@ -29,7 +30,6 @@ class VolumeTileView(
 
     private val density = resources.displayMetrics.density
     private val sp = resources.displayMetrics.scaledDensity
-    private val tileCorner = TILE_CORNER_DP * density
 
     // -- State ------------------------------------------------------------
 
@@ -43,55 +43,47 @@ class VolumeTileView(
 
     // -- Paints -----------------------------------------------------------
 
-    private val tileBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x76, 0x08, 0x09, 0x12)
+    private val muteBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = LinkLine.LINE
+        style = Paint.Style.STROKE
+        strokeWidth = 1f * density
+    }
+
+    private val muteFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = LinkLine.CABLE
         style = Paint.Style.FILL
     }
 
-    private val tileBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x2C, 0xFF, 0xFF, 0xFF)
-        style = Paint.Style.STROKE
-        strokeWidth = 0.5f * density
-    }
-
     private val trackBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x44, 0xFF, 0xFF, 0xFF)
+        color = LinkLine.LINE_2
         style = Paint.Style.FILL
     }
 
     private val trackFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#8B5CF6")
-        style = Paint.Style.FILL
-    }
-
-    private val trackMutedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x40, 0xFF, 0x44, 0x44)
+        color = LinkLine.CABLE
         style = Paint.Style.FILL
     }
 
     private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
+        color = LinkLine.TEXT
         style = Paint.Style.FILL
     }
 
-    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0xCC, 0xFF, 0xFF, 0xFF)
-        style = Paint.Style.FILL
-    }
-
-    private val muteStrikePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0xCC, 0xFF, 0x44, 0x44)
+    private val thumbRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = LinkLine.INK
         style = Paint.Style.STROKE
-        strokeWidth = 1.5f * density
-        strokeCap = Paint.Cap.ROUND
+        strokeWidth = 2f * density
     }
 
     private val pctPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x99, 0xFF, 0xFF, 0xFF)
+        color = LinkLine.TEXT
         textSize = PCT_TEXT_SP * sp
-        typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+        typeface = LinkLine.mono(context)
         textAlign = Paint.Align.RIGHT
     }
+
+    private val speakerIcon: Drawable? = context.getDrawable(R.drawable.ic_ph_speaker_high)?.mutate()
+    private val mutedIcon: Drawable? = context.getDrawable(R.drawable.ic_ph_speaker_slash)?.mutate()
 
     init {
         isClickable = true
@@ -102,7 +94,14 @@ class VolumeTileView(
     // Layout helpers
     // ------------------------------------------------------------------
 
-    /** Left edge of the track, after the speaker icon. */
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        setMeasuredDimension(
+            MeasureSpec.getSize(widthMeasureSpec),
+            resolveSize((ROW_HEIGHT_DP * density).toInt(), heightMeasureSpec)
+        )
+    }
+
+    /** Left edge of the track, after the mute button. */
     private fun trackLeft(): Float = ICON_AREA_DP * density
 
     /** Right edge of the track, before the percentage text. */
@@ -129,82 +128,51 @@ class VolumeTileView(
         val tr = trackRight()
         val th = trackHeight()
         val tRadius = th / 2f
-        val bgRect = RectF(0f, 0f, width.toFloat(), height.toFloat())
 
-        canvas.drawRoundRect(bgRect, tileCorner, tileCorner, tileBgPaint)
-        canvas.drawRoundRect(bgRect, tileCorner, tileCorner, tileBorderPaint)
-
-        // 1. Speaker icon (left side)
-        drawSpeakerIcon(canvas, ICON_AREA_DP * density / 2f, cy)
+        // 1. Mute button (yellow while muted)
+        val btn = MUTE_BUTTON_DP * density
+        val inset = muteBorderPaint.strokeWidth / 2f
+        val btnRect = RectF(inset, cy - btn / 2f + inset, btn - inset, cy + btn / 2f - inset)
+        val corner = LinkLine.RADIUS_CONTROL_DP * density
+        if (muted) {
+            canvas.drawRoundRect(btnRect, corner, corner, muteFillPaint)
+        } else {
+            canvas.drawRoundRect(btnRect, corner, corner, muteBorderPaint)
+        }
+        (if (muted) mutedIcon else speakerIcon)?.let {
+            val half = SPEAKER_ICON_DP * density / 2f
+            it.setTint(if (muted) LinkLine.INK else LinkLine.TEXT)
+            it.setBounds(
+                (btnRect.centerX() - half).toInt(), (cy - half).toInt(),
+                (btnRect.centerX() + half).toInt(), (cy + half).toInt()
+            )
+            it.draw(canvas)
+        }
 
         // 2. Track background
         val trackRect = RectF(tl, cy - th / 2f, tr, cy + th / 2f)
         canvas.drawRoundRect(trackRect, tRadius, tRadius, trackBgPaint)
 
-        // 3. Filled portion
-        val fraction = if (muted) 0f else volume / MAX_VOLUME.toFloat()
-        val fillRight = tl + (tr - tl) * fraction.coerceIn(0f, 1f)
+        // 3. Filled portion (dimmed while muted)
+        val fraction = (volume / MAX_VOLUME.toFloat()).coerceIn(0f, 1f)
+        val fillRight = tl + (tr - tl) * fraction
+        trackFillPaint.alpha = if (muted) 90 else 255
         if (fillRight > tl + 1f) {
             val fillRect = RectF(tl, cy - th / 2f, fillRight, cy + th / 2f)
-            val fillPaint = if (muted) trackMutedPaint else trackFillPaint
-            canvas.drawRoundRect(fillRect, tRadius, tRadius, fillPaint)
+            canvas.drawRoundRect(fillRect, tRadius, tRadius, trackFillPaint)
         }
 
         // 4. Thumb
-        if (!muted && fraction > 0f) {
-            val thumbX = fillRight.coerceIn(tl + thumbRadius(), tr - thumbRadius())
-            canvas.drawCircle(thumbX, cy, thumbRadius(), thumbPaint)
-        }
+        thumbPaint.alpha = if (muted) 90 else 255
+        val thumbX = fillRight.coerceIn(tl + thumbRadius(), tr - thumbRadius())
+        canvas.drawCircle(thumbX, cy, thumbRadius(), thumbPaint)
+        canvas.drawCircle(thumbX, cy, thumbRadius(), thumbRingPaint)
 
         // 5. Percentage text (right side)
-        val pct = if (muted) "Mute" else "${((volume / MAX_VOLUME.toFloat()) * 100).roundToInt()}%"
-        val pctX = width - 4f * density
-        val pctY = cy + pctPaint.textSize * 0.35f
-        canvas.drawText(pct, pctX, pctY, pctPaint)
-    }
-
-    private fun drawSpeakerIcon(canvas: Canvas, cx: Float, cy: Float) {
-        val sz = SPEAKER_ICON_SIZE_DP * density
-        // Speaker body
-        val bodyPaint = Paint(iconPaint)
-        if (muted) bodyPaint.color = Color.argb(0xAA, 0xFF, 0x44, 0x44)
-
-        val bodyLeft = cx - sz * 0.5f
-        val bodyRight = cx - sz * 0.05f
-        val bodyTop = cy - sz * 0.25f
-        val bodyBottom = cy + sz * 0.25f
-        canvas.drawRect(bodyLeft, bodyTop, bodyRight, bodyBottom, bodyPaint)
-
-        // Cone
-        val path = Path()
-        path.moveTo(bodyRight, bodyTop)
-        path.lineTo(cx + sz * 0.4f, cy - sz * 0.55f)
-        path.lineTo(cx + sz * 0.4f, cy + sz * 0.55f)
-        path.lineTo(bodyRight, bodyBottom)
-        path.close()
-        canvas.drawPath(path, bodyPaint)
-
-        if (muted) {
-            // Strike-through
-            canvas.drawLine(
-                cx - sz * 0.6f, cy - sz * 0.5f,
-                cx + sz * 0.6f, cy + sz * 0.5f,
-                muteStrikePaint
-            )
-        } else {
-            // Sound waves (small arcs)
-            val wavePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.argb(0x60, 0xFF, 0xFF, 0xFF)
-                style = Paint.Style.STROKE
-                strokeWidth = 1f * density
-                strokeCap = Paint.Cap.ROUND
-            }
-            val waveRect = RectF(
-                cx + sz * 0.2f, cy - sz * 0.4f,
-                cx + sz * 0.8f, cy + sz * 0.4f
-            )
-            canvas.drawArc(waveRect, -40f, 80f, false, wavePaint)
-        }
+        val pct = if (muted) "Mute" else "${(fraction * 100).roundToInt()}%"
+        pctPaint.color = if (muted) LinkLine.TEXT_3 else LinkLine.TEXT
+        val pctY = cy - (pctPaint.ascent() + pctPaint.descent()) / 2f
+        canvas.drawText(pct, width.toFloat(), pctY, pctPaint)
     }
 
     // ------------------------------------------------------------------
@@ -309,12 +277,13 @@ class VolumeTileView(
         private const val DRAG_COOLDOWN_MS = 500L  // ignore incoming state after drag
         private const val SEND_THROTTLE_MS = 50L   // max ~20 sends/sec during drag
 
-        private const val TRACK_HEIGHT_DP = 6f
+        private const val ROW_HEIGHT_DP = 44f
+        private const val MUTE_BUTTON_DP = 44f
+        private const val TRACK_HEIGHT_DP = 4f
         private const val THUMB_RADIUS_DP = 8f
-        private const val ICON_AREA_DP = 42f
-        private const val PCT_AREA_DP = 46f
-        private const val PCT_TEXT_SP = 12f
-        private const val SPEAKER_ICON_SIZE_DP = 10f
-        private const val TILE_CORNER_DP = 16f
+        private const val ICON_AREA_DP = 54f
+        private const val PCT_AREA_DP = 50f
+        private const val PCT_TEXT_SP = 13f
+        private const val SPEAKER_ICON_DP = 19f
     }
 }

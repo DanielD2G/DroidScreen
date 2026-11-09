@@ -10,6 +10,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <string.h>
 #include <arpa/inet.h>
 
@@ -31,7 +32,7 @@ int tcp_server_start(int port) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons((uint16_t)port);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         LOGE("tcp_server_start: bind() failed on port %d: %s", port, strerror(errno));
@@ -45,11 +46,11 @@ int tcp_server_start(int port) {
         return -1;
     }
 
-    LOGI("tcp_server_start: listening on 127.0.0.1:%d", port);
+    LOGI("tcp_server_start: listening on 0.0.0.0:%d", port);
     return fd;
 }
 
-int tcp_server_accept(int server_fd) {
+int tcp_server_accept(int server_fd, int *is_loopback) {
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
 
@@ -60,7 +61,12 @@ int tcp_server_accept(int server_fd) {
     }
 
     tcp_set_nodelay(client_fd);
-    LOGI("tcp_server_accept: client connected, fd=%d", client_fd);
+    int loopback = (ntohl(client_addr.sin_addr.s_addr) >> 24) == 127;
+    if (is_loopback) *is_loopback = loopback;
+    char ip[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+    LOGI("tcp_server_accept: client %s connected (%s), fd=%d",
+         ip, loopback ? "usb" : "wifi", client_fd);
     return client_fd;
 }
 
@@ -115,6 +121,13 @@ void tcp_set_nodelay(int fd) {
     int quickack = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
 #endif
+}
+
+void tcp_set_recv_timeout(int fd, int timeout_ms) {
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 void tcp_close(int fd) {

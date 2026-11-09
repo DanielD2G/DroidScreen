@@ -34,6 +34,7 @@
 extern "C" {
 #include "droidscreen/protocol.h"
 #include "droidscreen/handshake.h"
+#include "droidscreen/hello.h"
 #include "droidscreen/frame.h"
 #include "droidscreen/mouse.h"
 #include "droidscreen/pen.h"
@@ -148,6 +149,7 @@ static jmethodID         g_onStatusChanged = nullptr;
 static jmethodID         g_onDeckConfigReceived = nullptr;
 static jmethodID         g_onMediaStateReceived = nullptr;
 static jmethodID         g_onVolumeStateReceived = nullptr;
+static jmethodID         g_authorizeDesktop = nullptr;
 static jclass            g_codecSelectorClass = nullptr;
 static jclass            g_decoderChoiceClass = nullptr;
 static jmethodID         g_chooseDecoderForNative = nullptr;
@@ -163,6 +165,51 @@ static int64_t now_us() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
+
+/* ---- Loss recovery ----
+ * A dropped P-frame breaks every later frame until the next IDR. When we
+ * have to drop one we stop feeding P-frames (frozen image beats corrupted
+ * image) and ask the desktop for a keyframe, rate-limited because the
+ * desktop needs a frame interval or two to produce it. */
+static std::atomic<bool>    g_awaiting_keyframe{false};
+static std::atomic<int64_t> g_last_keyframe_request_us{0};
+
+static void request_keyframe(const char* why) {
+    int64_t now = now_us();
+    int64_t last = g_last_keyframe_request_us.load(std::memory_order_relaxed);
+    if (now - last < 100000) return;
+    g_last_keyframe_request_us.store(now, std::memory_order_relaxed);
+
+    int fd = g_client_fd;
+    if (fd < 0) return;
+    uint8_t buf[DS_HEADER_SIZE + 1];
+    ds_header_t hdr;
+    hdr.type = DS_MSG_CONTROL;
+    hdr.flags = 0;
+    hdr.length = 1;
+    ds_header_serialize(buf, &hdr);
+    buf[DS_HEADER_SIZE] = DS_CTRL_REQUEST_KEYFRAME;
+    tcp_send_all(fd, buf, sizeof(buf));
+    LOGW("requesting keyframe (%s)", why);
+}
+
+static void on_frame_dropped(const char* why) {
+    g_awaiting_keyframe.store(true, std::memory_order_release);
+    request_keyframe(why);
+}
+
+/* Returns true when this frame must be skipped because we are waiting for
+ * a keyframe after a loss. Keyframes clear the wait. */
+static bool skip_until_keyframe(uint32_t mc_flags, int is_config) {
+    if (is_config) return false;
+    if (mc_flags & MC_BUFFER_FLAG_KEY_FRAME) {
+        g_awaiting_keyframe.store(false, std::memory_order_release);
+        return false;
+    }
+    if (!g_awaiting_keyframe.load(std::memory_order_acquire)) return false;
+    request_keyframe("waiting for keyframe");
+    return true;
 }
 
 static uint8_t codec_cap_for_codec(uint8_t codec) {
@@ -434,6 +481,130 @@ static void record_feed_latency(const AndroidFrameTelemetry* meta,
 static bool feed_video_message_direct(const uint8_t* msg, size_t msg_len,
                                       int32_t input_idx);
 
+static void bytes_to_hex(const uint8_t* in, size_t len, char* out) {
+    static const char kHex[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; ++i) {
+        out[i * 2]     = kHex[in[i] >> 4];
+        out[i * 2 + 1] = kHex[in[i] & 0x0F];
+    }
+    out[len * 2] = '\0';
+}
+
+static bool hex_to_bytes(const char* in, uint8_t* out, size_t len) {
+    if (!in || strlen(in) != len * 2) return false;
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < len; ++i) {
+        int hi = nibble(in[i * 2]);
+        int lo = nibble(in[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+/**
+ * Ask Java whether a desktop that connected over Wi-Fi may stream to us.
+ * Blocks until the user decides (bounded by DS_HELLO_APPROVAL_TIMEOUT_MS on
+ * the Java side). On success writes the token the desktop must keep.
+ */
+static bool authorize_desktop(const ds_hello_t& hello, uint8_t out_token[DS_HELLO_TOKEN_SIZE]) {
+    if (!g_jvm || !g_activity || !g_authorizeDesktop) return false;
+
+    JNIEnv* env = nullptr;
+    bool did_attach = false;
+    jint result = g_jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (result == JNI_EDETACHED) {
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("authorize_desktop: AttachCurrentThread failed");
+            return false;
+        }
+        did_attach = true;
+    } else if (result != JNI_OK) {
+        LOGE("authorize_desktop: GetEnv failed: %d", result);
+        return false;
+    }
+
+    char id_hex[DS_HELLO_ID_SIZE * 2 + 1];
+    char token_hex[DS_HELLO_TOKEN_SIZE * 2 + 1];
+    bytes_to_hex(hello.desktop_id, DS_HELLO_ID_SIZE, id_hex);
+    bytes_to_hex(hello.token, DS_HELLO_TOKEN_SIZE, token_hex);
+
+    jstring j_id = env->NewStringUTF(id_hex);
+    jstring j_name = env->NewStringUTF(hello.name);
+    jstring j_token = env->NewStringUTF(token_hex);
+    auto j_result = (jstring)env->CallObjectMethod(g_activity, g_authorizeDesktop,
+                                                   j_id, j_name, j_token);
+    bool ok = false;
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    } else if (j_result) {
+        const char* chars = env->GetStringUTFChars(j_result, nullptr);
+        ok = hex_to_bytes(chars, out_token, DS_HELLO_TOKEN_SIZE);
+        env->ReleaseStringUTFChars(j_result, chars);
+        env->DeleteLocalRef(j_result);
+    }
+    env->DeleteLocalRef(j_id);
+    env->DeleteLocalRef(j_name);
+    env->DeleteLocalRef(j_token);
+
+    if (did_attach) g_jvm->DetachCurrentThread();
+    return ok;
+}
+
+/**
+ * Wireless gate: read DS_MSG_HELLO, ask for authorization, reply.
+ * Returns true when the desktop may continue with the handshake.
+ */
+static bool run_wireless_hello(int fd) {
+    uint8_t hdr_buf[DS_HEADER_SIZE];
+    ds_header_t hdr;
+    if (tcp_recv_exact(fd, hdr_buf, DS_HEADER_SIZE) != 0) {
+        LOGE("hello: failed to read header");
+        return false;
+    }
+    ds_header_deserialize(hdr_buf, &hdr);
+    if (hdr.type != DS_MSG_HELLO || hdr.length != DS_HELLO_SIZE) {
+        LOGE("hello: network peer did not start with HELLO (type=0x%02x len=%u)",
+             hdr.type, hdr.length);
+        return false;
+    }
+    uint8_t buf[DS_HELLO_SIZE];
+    if (tcp_recv_exact(fd, buf, DS_HELLO_SIZE) != 0) {
+        LOGE("hello: failed to read payload");
+        return false;
+    }
+    ds_hello_t hello;
+    ds_hello_deserialize(buf, &hello);
+    LOGI("hello: desktop '%s' asking to connect", hello.name);
+
+    ds_hello_resp_t resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.status = authorize_desktop(hello, resp.token) ? DS_HELLO_ACCEPTED : DS_HELLO_REJECTED;
+    LOGI("hello: desktop '%s' %s", hello.name,
+         resp.status == DS_HELLO_ACCEPTED ? "accepted" : "rejected");
+
+    uint8_t resp_hdr[DS_HEADER_SIZE];
+    ds_header_t resp_header;
+    resp_header.type = DS_MSG_HELLO_RESP;
+    resp_header.flags = 0;
+    resp_header.length = DS_HELLO_RESP_SIZE;
+    ds_header_serialize(resp_hdr, &resp_header);
+    uint8_t resp_buf[DS_HELLO_RESP_SIZE];
+    ds_hello_resp_serialize(resp_buf, &resp);
+    if (tcp_send_all(fd, resp_hdr, DS_HEADER_SIZE) != 0 ||
+        tcp_send_all(fd, resp_buf, DS_HELLO_RESP_SIZE) != 0) {
+        LOGE("hello: failed to send response");
+        return false;
+    }
+    return resp.status == DS_HELLO_ACCEPTED;
+}
+
 /* ---- Receive thread ----
  * Accepts connections in a loop. For each connection:
  *   1. Performs handshake
@@ -459,7 +630,8 @@ static void* recv_thread_func(void* /*arg*/) {
         LOGI("recv_thread: waiting for connection on fd=%d", g_server_fd);
 
         /* Accept a client connection (blocking). */
-        g_client_fd = tcp_server_accept(g_server_fd);
+        int is_loopback = 0;
+        g_client_fd = tcp_server_accept(g_server_fd, &is_loopback);
         if (g_client_fd < 0) {
             if (g_running.load(std::memory_order_acquire)) {
                 LOGW("recv_thread: accept failed, retrying in 500ms...");
@@ -468,6 +640,23 @@ static void* recv_thread_func(void* /*arg*/) {
             continue;
         }
         LOGI("recv_thread: client connected, fd=%d", g_client_fd);
+
+        /* Peers that did not come through the adb tunnel must identify
+         * themselves and be approved on the tablet before anything else.
+         * A short receive timeout keeps a silent LAN peer from holding the
+         * single connection slot forever (the approval wait itself happens
+         * on our side, not in recv). */
+        if (!is_loopback) {
+            tcp_set_recv_timeout(g_client_fd, 5000);
+            if (!run_wireless_hello(g_client_fd)) {
+                tcp_close(g_client_fd);
+                g_client_fd = -1;
+                continue;
+            }
+            /* Approved: behave exactly like a USB peer from here on (the
+             * desktop sets up its virtual display before the handshake). */
+            tcp_set_recv_timeout(g_client_fd, 0);
+        }
 
         /* ---- Handshake ---- */
         if (tcp_recv_exact(g_client_fd, hdr_buf, DS_HEADER_SIZE) != 0) {
@@ -602,6 +791,7 @@ static void* recv_thread_func(void* /*arg*/) {
                 selection.hints.is_qcom_c2 ||
                 selection.hints.is_qcom_omx,
             std::memory_order_release);
+        g_awaiting_keyframe.store(false, std::memory_order_release);
         g_decoder_configured.store(true, std::memory_order_release);
         LOGI("recv_thread: accepted codec=%d direct_submit=%d",
              selection.codec_id,
@@ -742,6 +932,7 @@ static void* recv_thread_func(void* /*arg*/) {
                     if (!consumed && ring_buffer_write_message(
                             g_ring_buf, video_msg_buf, msg_len) != 0) {
                         LOGW("recv_thread: ring buffer full, dropping frame");
+                        on_frame_dropped("ring buffer full");
                     } else {
                         /* Wake decode thread — new data available */
                         g_decode_cv.notify_one();
@@ -951,6 +1142,18 @@ static void record_release_latency(int64_t pts_us, int64_t release_us) {
     int64_t e2e_release = meta.telemetry.capture_to_send_us
         + transit_est + recv_to_release;
 
+    /* "Wake" latency: first real frame after the screen sat still. This is
+     * what typing into an idle editor feels like, and what the idle
+     * keep-alive frames exist to protect. */
+    static int64_t last_real_release_us = 0;
+    if (last_real_release_us > 0 && release_us - last_real_release_us > 500000) {
+        LOGI("wake: gap=%lldms e2e=%.1fms android=%.1fms desk=%.1fms",
+             (long long)((release_us - last_real_release_us) / 1000),
+             e2e_release / 1000.0, recv_to_release / 1000.0,
+             meta.telemetry.capture_to_send_us / 1000.0);
+    }
+    last_real_release_us = release_us;
+
     g_stats_android_recv_to_release_us.store(
         ewma_us(g_stats_android_recv_to_release_us.load(std::memory_order_relaxed),
                 recv_to_release),
@@ -1011,6 +1214,7 @@ static bool feed_video_message_direct(const uint8_t* msg, size_t msg_len,
 
     if (!is_config) {
         remove_pending_telemetry(pts_us);
+        on_frame_dropped("direct feed failed");
     }
     g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -1137,6 +1341,12 @@ static void* decode_thread_func(void* /*arg*/) {
                 if (is_config) {
                     patch_h264_config_for_decoder(video_data, &nal_len);
                 }
+                if (skip_until_keyframe(mc_flags, is_config)) {
+                    held_async_input_idx = input_idx;  /* reuse for the next NAL */
+                    frames_skipped++;
+                    g_stats_frames_skipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
 
                 int64_t pts_us = reserve_frame_pts_us(is_config != 0);
                 if (!is_config) {
@@ -1159,6 +1369,7 @@ static void* decode_thread_func(void* /*arg*/) {
                 } else {
                     if (!is_config) {
                         remove_pending_telemetry(pts_us);
+                        on_frame_dropped("async feed failed");
                     }
                     feed_errors++;
                     g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
@@ -1186,16 +1397,42 @@ static void* decode_thread_func(void* /*arg*/) {
                 if (is_config) {
                     patch_h264_config_for_decoder(video_data, &nal_len);
                 }
+                if (skip_until_keyframe(mc_flags, is_config)) {
+                    frames_skipped++;
+                    g_stats_frames_skipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
 
                 int64_t pts_us = reserve_frame_pts_us(is_config != 0);
                 if (!is_config) {
                     store_pending_telemetry(pts_us, &frame_meta);
                 }
+                /* Wi-Fi delivers frames in bursts; all decoder input buffers
+                 * can be momentarily busy. Instead of dropping the frame
+                 * (which corrupts the stream until the next IDR), render what
+                 * is decoded to free a buffer and retry for a few ms. */
                 int ret = -1;
-                {
-                    std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
-                    ret = decoder_feed(g_decoder, video_data, nal_len,
-                                       pts_us, mc_flags);
+                for (int attempt = 0; attempt < 6; ++attempt) {
+                    {
+                        std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
+                        ret = decoder_feed(g_decoder, video_data, nal_len,
+                                           pts_us, mc_flags);
+                    }
+                    if (ret == 0 || !g_running.load(std::memory_order_acquire)) break;
+                    int64_t rp = -1;
+                    int rr = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
+                        if (g_decoder) rr = decoder_drain_wait(g_decoder, 2000, &rp);
+                    }
+                    if (rr > 0) {
+                        frames_rendered += rr;
+                        g_stats_frames_decoded.fetch_add(rr, std::memory_order_relaxed);
+                        record_release_latency(rp, now_us());
+                    }
+                }
+                if (ret != 0 && !is_config) {
+                    on_frame_dropped("decoder input busy");
                 }
                 if (ret == 0) {
                     frames_fed++;
@@ -1232,13 +1469,29 @@ static void* decode_thread_func(void* /*arg*/) {
         /* ---- 4. Wait for next event ---- */
         if (!any_work) {
             if (is_async) {
-                /* Event-driven: wait on condition variable.
-                 * Woken by: MediaCodec callbacks OR ring buffer writes. */
+                /* Event-driven: async callbacks + ring writes signal the CV. */
                 std::unique_lock<std::mutex> lock(g_decode_mutex);
                 g_decode_cv.wait_for(lock, std::chrono::milliseconds(1));
             } else {
-                /* Sync fallback: brief polling sleep */
-                usleep(50);
+                /* Sync: block *on the decoder output* so we render the instant a
+                 * frame is ready (near-zero render latency) while sleeping in the
+                 * kernel — not busy-polling. This both cuts render latency and
+                 * frees the core, so the (unpinned) recv_thread is no longer
+                 * starved as it was by the old 50us spin (~20k polls/s). The next
+                 * NAL from recv_thread is picked up on the following iteration;
+                 * at streaming frame rates the inter-frame gap (>=8ms) exceeds
+                 * this wait, so it adds no measurable input latency. */
+                int64_t rp = -1;
+                int r2 = 0;
+                {
+                    std::lock_guard<std::mutex> lock(g_decoder_api_mutex);
+                    if (g_decoder) r2 = decoder_drain_wait(g_decoder, 4000, &rp);
+                }
+                if (r2 > 0) {
+                    frames_rendered += r2;
+                    g_stats_frames_decoded.fetch_add(r2, std::memory_order_relaxed);
+                    record_release_latency(rp, now_us());
+                }
             }
         }
 
@@ -1258,7 +1511,7 @@ static void* decode_thread_func(void* /*arg*/) {
             LOGI("decode[%s]: fed=%u rendered=%u err=%u | "
                  "%.1f fed/s %.1f render/s idle=%llu | ring=%zu bytes | "
                  "lat feed=%.1fms release=%.1fms desk=%.1fms android=%.1fms rtt=%.1fms "
-                 "capenc=%.1fms encsend=%.1fms",
+                 "capenc=%.1fms encsend=%.1fms skip=%u",
                  is_async ? "async" : "sync",
                  (unsigned)total_fed, (unsigned)total_rendered, feed_errors,
                  total_fed / elapsed, total_rendered / elapsed,
@@ -1270,7 +1523,8 @@ static void* decode_thread_func(void* /*arg*/) {
                  g_stats_android_recv_to_release_us.load(std::memory_order_relaxed) / 1000.0,
                  g_stats_video_rtt_us.load(std::memory_order_relaxed) / 1000.0,
                  g_stats_desktop_capture_to_encode_us.load(std::memory_order_relaxed) / 1000.0,
-                 g_stats_desktop_encode_to_send_us.load(std::memory_order_relaxed) / 1000.0);
+                 g_stats_desktop_encode_to_send_us.load(std::memory_order_relaxed) / 1000.0,
+                 frames_skipped);
         }
     }
 
@@ -1312,6 +1566,12 @@ Java_com_droidscreen_app_MainActivity_nativeInit(
     g_onDeckConfigReceived = env->GetMethodID(clazz, "onDeckConfigReceived", "(Ljava/lang/String;)V");
     g_onMediaStateReceived = env->GetMethodID(clazz, "onMediaStateReceived", "(Ljava/lang/String;)V");
     g_onVolumeStateReceived = env->GetMethodID(clazz, "onVolumeStateReceived", "(IZ)V");
+    g_authorizeDesktop = env->GetMethodID(clazz, "authorizeDesktop",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    if (!g_authorizeDesktop) {
+        LOGE("nativeInit: authorizeDesktop not found; Wi-Fi connections will be rejected");
+        env->ExceptionClear();
+    }
     if (!g_onDeckConfigReceived) {
         LOGW("nativeInit: deck callbacks not found (deck feature unavailable)");
         env->ExceptionClear();
@@ -1398,6 +1658,12 @@ Java_com_droidscreen_app_MainActivity_nativeInit(
     pthread_create(&g_decode_thread, nullptr, decode_thread_func, nullptr);
 
     LOGI("nativeInit: started successfully");
+}
+
+JNIEXPORT jint JNICALL
+Java_com_droidscreen_app_MainActivity_nativeProtocolVersion(
+        JNIEnv* /*env*/, jobject /*thiz*/) {
+    return DS_PROTOCOL_VERSION;
 }
 
 JNIEXPORT void JNICALL

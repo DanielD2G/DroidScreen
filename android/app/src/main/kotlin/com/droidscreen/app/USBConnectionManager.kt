@@ -2,7 +2,7 @@ package com.droidscreen.app
 
 /**
  * Manages USB connection parameters.
- * The TCP port is tunneled over USB via `adb reverse tcp:PORT tcp:PORT`.
+ * The TCP port is reachable over USB (`adb forward`) and over Wi-Fi.
  *
  * Stub for future USB accessory detection and automatic setup.
  */

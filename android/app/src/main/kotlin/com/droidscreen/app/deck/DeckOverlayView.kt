@@ -1,25 +1,26 @@
 package com.droidscreen.app.deck
 
-import android.animation.AnimatorSet
-import android.animation.ObjectAnimator
 import android.content.Context
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.LinearGradient
-import android.graphics.Paint
-import android.graphics.RectF
-import android.graphics.Shader
+import android.content.res.ColorStateList
+import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
+import com.droidscreen.app.R
+import com.droidscreen.app.ui.LinkLine
+import com.droidscreen.app.ui.LinkMarkView
 
 /**
- * Root overlay view for the Stream Deck. Draws a semi-transparent scrim over
- * the entire screen and lays out a **compact floating panel** in the center
- * containing an app-icon grid, media bar, and volume slider — like a real
- * Stream Deck control panel.
+ * Root overlay view for the Stream Deck, in the Link Line style: an opaque
+ * rail docked to the Mac-facing (left) edge, at most 30% of the screen, with
+ * no scrim and no blur. It holds the app-shortcut grid, the media card, the
+ * volume row and the quick controls (input modes, Lock, Hide). Tapping the
+ * stream outside the rail dismisses it.
  */
 class DeckOverlayView(context: Context) : FrameLayout(context) {
 
@@ -27,95 +28,71 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
     var onVolumeChange: ((volume: Int, muted: Boolean) -> Unit)? = null
     var onDismiss: (() -> Unit)? = null
 
+    /** Any touch inside the overlay (used to restart the auto-hide timer). */
+    var onInteraction: (() -> Unit)? = null
+    /** A finger went down on the Deck: hold auto-hide until it lifts. */
+    var onGestureStart: (() -> Unit)? = null
+    var onFingerModeSelected: ((Int) -> Unit)? = null
+    var onStylusModeSelected: ((Int) -> Unit)? = null
+    var onUnknownModeSelected: ((Int) -> Unit)? = null
+    var onLockToggle: (() -> Unit)? = null
+    var onHide: (() -> Unit)? = null
+    var onStatsChipClick: (() -> Unit)? = null
+
     private val density = resources.displayMetrics.density
-
-    // -- Panel metrics (dp -> px) -----------------------------------------
-
-    private val tileSizePx = (TILE_SIZE_DP * density).toInt()
+    private val edgeOffsetPx = (EDGE_DP * density).toInt()
     private val tileHeightPx = (TILE_HEIGHT_DP * density).toInt()
     private val tileGapPx = (TILE_GAP_DP * density).toInt()
-    private val panelPadPx = (PANEL_PAD_DP * density).toInt()
-    private val panelCorner = PANEL_CORNER_DP * density
-    private val mediaBarHeightPx = (MEDIA_BAR_HEIGHT_DP * density).toInt()
-    private val volumeBarHeightPx = (VOLUME_BAR_HEIGHT_DP * density).toInt()
-    private val sectionGapPx = (SECTION_GAP_DP * density).toInt()
-    private val maxPanelWidthPx = (MAX_PANEL_WIDTH_DP * density).toInt()
 
-    // -- Paints -----------------------------------------------------------
-
-    private val scrimPaint = Paint().apply {
-        color = Color.argb(0x70, 0x00, 0x00, 0x10)
-        style = Paint.Style.FILL
-    }
-
-    private val panelBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(0x9A, 0x08, 0x09, 0x12)
-        style = Paint.Style.FILL
-    }
-
-    private val panelBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 1f * density
-        color = Color.argb(0x52, 0xFF, 0xFF, 0xFF)
-    }
-
-    private val panelInnerGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 0.5f * density
-        color = Color.argb(0x18, 0xFF, 0xFF, 0xFF)
-    }
-
-    // -- State ------------------------------------------------------------
+    private val rail: View = LayoutInflater.from(context).inflate(R.layout.deck_rail, this, false)
+    private val appsLabel: View = rail.findViewById(R.id.deck_apps_label)
+    private val appsGrid: LinearLayout = rail.findViewById(R.id.deck_apps_grid)
+    private val mediaLabel: View = rail.findViewById(R.id.deck_media_label)
+    private val mediaContainer: FrameLayout = rail.findViewById(R.id.deck_media_container)
+    private val volumeLabel: View = rail.findViewById(R.id.deck_volume_label)
+    private val volumeContainer: FrameLayout = rail.findViewById(R.id.deck_volume_container)
+    private val mark: LinkMarkView = rail.findViewById(R.id.deck_mark)
+    private val statsText: TextView = rail.findViewById(R.id.deck_stats_text)
+    private val statsTransport: TextView = rail.findViewById(R.id.deck_stats_transport)
+    private val statsTransportIcon: ImageView = rail.findViewById(R.id.deck_stats_transport_icon)
+    private val statsChip: View = rail.findViewById(R.id.deck_stats_chip)
+    private val fingerMode: SegmentedControlView = rail.findViewById(R.id.deck_finger_mode)
+    private val stylusMode: SegmentedControlView = rail.findViewById(R.id.deck_stylus_mode)
+    private val unknownMode: SegmentedControlView = rail.findViewById(R.id.deck_unknown_mode)
+    private val lockButton: View = rail.findViewById(R.id.deck_lock)
+    private val lockIcon: ImageView = rail.findViewById(R.id.deck_lock_icon)
+    private val lockText: TextView = rail.findViewById(R.id.deck_lock_text)
 
     private var config: DeckConfig? = null
-    private val tileViews = mutableListOf<View>()
-    private val panelRect = RectF()
-    private val panelInnerRect = RectF()
-
-    // Two-box layout: separate apps panel and media panel
-    private val appsPanelRect = RectF()
-    private val appsPanelInnerRect = RectF()
-    private val mediaPanelRect = RectF()
-    private val mediaPanelInnerRect = RectF()
-    private val panelBoxGapPx = (PANEL_BOX_GAP_DP * density).toInt()
-
-    // Categorized views (filled in buildFromConfig)
-    private val appTileViews = mutableListOf<View>()
     private var mediaTileView: MediaTileView? = null
     private var volumeTileView: VolumeTileView? = null
 
     init {
+        // The rail moves with translationX, which doesn't refresh the window's
+        // transparent-region hint over the video SurfaceView. Without this the
+        // video was composited over most of the rail until the next layout pass.
         setWillNotDraw(false)
         isClickable = true
         isFocusable = true
-        // Allow drawing beyond view bounds (for scrim covering system bar gaps)
-        clipToPadding = false
-        clipChildren = false
+        addView(rail, LayoutParams(railWidthFor(resources.displayMetrics.widthPixels), LayoutParams.MATCH_PARENT).apply {
+            marginStart = edgeOffsetPx
+        })
+        statsChip.setOnClickListener { onStatsChipClick?.invoke() }
+        lockButton.setOnClickListener { onLockToggle?.invoke() }
+        rail.findViewById<View>(R.id.deck_hide).setOnClickListener { onHide?.invoke() }
+        fingerMode.onSelected = { onFingerModeSelected?.invoke(it) }
+        stylusMode.onSelected = { onStylusModeSelected?.invoke(it) }
+        unknownMode.onSelected = { onUnknownModeSelected?.invoke(it) }
     }
 
-    // ------------------------------------------------------------------
-    // Drawing — scrim + panel background
-    // ------------------------------------------------------------------
+    private fun railWidthFor(screenWidth: Int): Int =
+        minOf((MAX_RAIL_WIDTH_DP * density).toInt(), (screenWidth * MAX_RAIL_FRACTION).toInt())
 
-    override fun onDraw(canvas: Canvas) {
-        // Full-screen scrim — simple overdraw to cover any system bar gaps
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), scrimPaint)
-
-        val innerCorner = panelCorner - 1f * density
-
-        // Apps panel background (Liquid Glass)
-        if (!appsPanelRect.isEmpty) {
-            canvas.drawRoundRect(appsPanelRect, panelCorner, panelCorner, panelBgPaint)
-            canvas.drawRoundRect(appsPanelRect, panelCorner, panelCorner, panelBorderPaint)
-            canvas.drawRoundRect(appsPanelInnerRect, innerCorner, innerCorner, panelInnerGlowPaint)
-        }
-
-        // Media + Volume panel background (Liquid Glass)
-        if (!mediaPanelRect.isEmpty) {
-            canvas.drawRoundRect(mediaPanelRect, panelCorner, panelCorner, panelBgPaint)
-            canvas.drawRoundRect(mediaPanelRect, panelCorner, panelCorner, panelBorderPaint)
-            canvas.drawRoundRect(mediaPanelInnerRect, innerCorner, innerCorner, panelInnerGlowPaint)
-        }
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val lp = rail.layoutParams
+        val target = railWidthFor(MeasureSpec.getSize(widthMeasureSpec))
+        if (target > 0 && lp.width != target) lp.width = target
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
     }
 
     // ------------------------------------------------------------------
@@ -124,205 +101,106 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
 
     fun buildFromConfig(config: DeckConfig) {
         this.config = config
-        tileViews.forEach { removeView(it) }
-        tileViews.clear()
-        appTileViews.clear()
+        appsGrid.removeAllViews()
+        mediaContainer.removeAllViews()
+        volumeContainer.removeAllViews()
         mediaTileView = null
         volumeTileView = null
 
+        val appTiles = mutableListOf<View>()
         for (tile in config.tiles) {
-            val view: View = when (tile) {
-                is TileConfig.AppTile -> {
-                    val v = DeckTileView(context, tile) { actionType, _ ->
+            when (tile) {
+                is TileConfig.AppTile -> appTiles.add(
+                    DeckTileView(context, tile) { actionType, _ ->
                         onDeckAction?.invoke(actionType, tile.slotIndex)
                     }
-                    appTileViews.add(v)
-                    v
-                }
+                )
                 is TileConfig.MediaTile -> {
                     val v = MediaTileView(context, tile) { actionType, _ ->
                         onDeckAction?.invoke(actionType, tile.slotIndex)
                     }
                     mediaTileView = v
-                    v
+                    mediaContainer.removeAllViews()
+                    mediaContainer.addView(v)
                 }
                 is TileConfig.VolumeTile -> {
                     val v = VolumeTileView(context, tile) { vol, muted ->
                         onVolumeChange?.invoke(vol, muted)
                     }
                     volumeTileView = v
-                    v
+                    volumeContainer.removeAllViews()
+                    volumeContainer.addView(v)
                 }
             }
-            tileViews.add(view)
-            addView(view)
         }
+
+        // App shortcuts: fixed 3-column grid; the last row keeps empty cells.
+        appTiles.chunked(RAIL_COLUMNS).forEachIndexed { rowIndex, rowTiles ->
+            val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            for (col in 0 until RAIL_COLUMNS) {
+                val cell = rowTiles.getOrNull(col) ?: View(context)
+                val lp = LinearLayout.LayoutParams(0, tileHeightPx, 1f)
+                if (col > 0) lp.marginStart = tileGapPx
+                row.addView(cell, lp)
+            }
+            val rowLp = LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
+            if (rowIndex > 0) rowLp.topMargin = tileGapPx
+            appsGrid.addView(row, rowLp)
+        }
+
+        appsLabel.visibility = if (appTiles.isEmpty()) View.GONE else View.VISIBLE
+        mediaLabel.visibility = if (mediaTileView == null) View.GONE else View.VISIBLE
+        volumeLabel.visibility = if (volumeTileView == null) View.GONE else View.VISIBLE
         requestLayout()
     }
 
-    // ------------------------------------------------------------------
-    // Layout — compact floating panel
-    // ------------------------------------------------------------------
+    /** Fills the input-mode segmented controls. */
+    fun bindInputModes(
+        finger: List<SegmentedControlView.Option>, fingerSelected: Int,
+        stylus: List<SegmentedControlView.Option>, stylusSelected: Int,
+        unknown: List<SegmentedControlView.Option>, unknownSelected: Int
+    ) {
+        fingerMode.setOptions(finger, fingerSelected)
+        stylusMode.setOptions(stylus, stylusSelected)
+        unknownMode.setOptions(unknown, unknownSelected)
+    }
 
-    override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
-        val cfg = config ?: return
-        if (tileViews.isEmpty()) return
+    /** Shows the Lock button as pressed (yellow) while the Deck is pinned open. */
+    fun setLocked(locked: Boolean) {
+        lockButton.isActivated = locked
+        val color = if (locked) LinkLine.INK else LinkLine.TEXT
+        lockText.text = if (locked) "Locked" else "Lock"
+        lockText.setTextColor(color)
+        lockIcon.imageTintList = ColorStateList.valueOf(color)
+        lockButton.contentDescription = if (locked) "Unlock Deck" else "Lock Deck open"
+    }
 
-        val totalW = r - l
-        val totalH = b - t
+    /** Updates the header stats chip, e.g. "30 ms · 57 fps ·" + transport. */
+    fun setStats(summary: String, wifi: Boolean) {
+        statsText.text = summary
+        statsTransport.text = if (wifi) "Wi-Fi" else "USB"
+        statsTransportIcon.setImageResource(if (wifi) R.drawable.ic_ph_wifi_high else R.drawable.ic_ph_usb)
+        mark.wifi = wifi
+    }
 
-        // --- Determine panel width ---
-        val cols = cfg.gridCols.coerceAtLeast(1)
-        // Panel width: fit the icon grid + padding, capped against the screen so the deck
-        // reads larger without clipping on smaller devices.
-        val gridContentW = cols * tileSizePx + (cols - 1) * tileGapPx
-        val desiredPanelW = gridContentW + 2 * panelPadPx
-        val panelW = desiredPanelW.coerceAtMost(
-            (totalW * PANEL_WIDTH_FRACTION).toInt().coerceAtMost(maxPanelWidthPx)
-        )
-
-        // Inner content width
-        val contentW = panelW - 2 * panelPadPx
-
-        // --- Calculate icon grid rows ---
-        val appCount = appTileViews.size
-        val iconGridRows = if (appCount == 0) 0 else ((appCount + cols - 1) / cols)
-        val iconGridH = if (iconGridRows > 0) {
-            iconGridRows * tileHeightPx + (iconGridRows - 1) * tileGapPx
-        } else 0
-
-        // --- Calculate apps panel height ---
-        val hasApps = iconGridH > 0
-        val appsPanelH = if (hasApps) iconGridH + 2 * panelPadPx else 0
-
-        // --- Calculate media panel height ---
-        val hasMedia = mediaTileView != null || volumeTileView != null
-        var mediaContentH = 0
-        if (mediaTileView != null) {
-            mediaContentH += mediaBarHeightPx
-        }
-        if (volumeTileView != null) {
-            if (mediaContentH > 0) mediaContentH += sectionGapPx
-            mediaContentH += volumeBarHeightPx
-        }
-        val mediaPanelH = if (hasMedia) mediaContentH + 2 * panelPadPx else 0
-
-        // --- Total height of both boxes + gap ---
-        val totalPanelH = appsPanelH +
-            (if (hasApps && hasMedia) panelBoxGapPx else 0) +
-            mediaPanelH
-
-        // --- Center both boxes vertically as a group ---
-        // Order: media/volume panel on top, apps panel below
-        val groupTop = (totalH - totalPanelH) / 2
-        val panelLeft = (totalW - panelW) / 2
-
-        // --- Set media panel rect (TOP) ---
-        mediaPanelRect.setEmpty()
-        mediaPanelInnerRect.setEmpty()
-        if (hasMedia) {
-            mediaPanelRect.set(
-                panelLeft.toFloat(), groupTop.toFloat(),
-                (panelLeft + panelW).toFloat(), (groupTop + mediaPanelH).toFloat()
-            )
-            val inset = 1.5f * density
-            mediaPanelInnerRect.set(
-                mediaPanelRect.left + inset, mediaPanelRect.top + inset,
-                mediaPanelRect.right - inset, mediaPanelRect.bottom - inset
-            )
-        }
-
-        // --- Set apps panel rect (BOTTOM) ---
-        appsPanelRect.setEmpty()
-        appsPanelInnerRect.setEmpty()
-        if (hasApps) {
-            val appsTop = groupTop + mediaPanelH + (if (hasMedia) panelBoxGapPx else 0)
-            appsPanelRect.set(
-                panelLeft.toFloat(), appsTop.toFloat(),
-                (panelLeft + panelW).toFloat(), (appsTop + appsPanelH).toFloat()
-            )
-            val inset = 1.5f * density
-            appsPanelInnerRect.set(
-                appsPanelRect.left + inset, appsPanelRect.top + inset,
-                appsPanelRect.right - inset, appsPanelRect.bottom - inset
-            )
-        }
-
-        // Update legacy panelRect to union of both for hit-testing
-        panelRect.setEmpty()
-        if (hasApps) panelRect.union(appsPanelRect)
-        if (hasMedia) panelRect.union(mediaPanelRect)
-
-        // Rebuild border gradient for current panel size
-        panelBorderPaint.shader = LinearGradient(
-            panelRect.left, panelRect.top,
-            panelRect.right, panelRect.bottom,
-            Color.argb(0x35, 0xFF, 0xFF, 0xFF),
-            Color.argb(0x14, 0xFF, 0xFF, 0xFF),
-            Shader.TileMode.CLAMP
-        )
-
-        // --- Layout children within the panels ---
-
-        // 1. Media bar + Volume bar (inside mediaPanelRect, TOP)
-        if (hasMedia) {
-            val cLeft = panelLeft + panelPadPx
-            val cRight = panelLeft + panelPadPx + contentW
-            var cursorY = mediaPanelRect.top.toInt() + panelPadPx
-
-            mediaTileView?.let {
-                it.measure(
-                    MeasureSpec.makeMeasureSpec(cRight - cLeft, MeasureSpec.EXACTLY),
-                    MeasureSpec.makeMeasureSpec(mediaBarHeightPx, MeasureSpec.EXACTLY)
-                )
-                it.layout(cLeft, cursorY, cRight, cursorY + mediaBarHeightPx)
-                cursorY += mediaBarHeightPx
-            }
-            volumeTileView?.let {
-                if (mediaTileView != null) cursorY += sectionGapPx
-                it.measure(
-                    MeasureSpec.makeMeasureSpec(cRight - cLeft, MeasureSpec.EXACTLY),
-                    MeasureSpec.makeMeasureSpec(volumeBarHeightPx, MeasureSpec.EXACTLY)
-                )
-                it.layout(cLeft, cursorY, cRight, cursorY + volumeBarHeightPx)
-            }
-        }
-
-        // 2. App icon grid (inside appsPanelRect, BOTTOM)
-        if (appCount > 0) {
-            val appsContentLeft = panelLeft + panelPadPx
-            val appsCursorY = appsPanelRect.top.toInt() + panelPadPx
-
-            // Center the grid horizontally within content area
-            val actualGridW = cols.coerceAtMost(appCount) * tileSizePx +
-                    (cols.coerceAtMost(appCount) - 1).coerceAtLeast(0) * tileGapPx
-            val gridOffsetX = appsContentLeft + (contentW - actualGridW) / 2
-
-            for (i in appTileViews.indices) {
-                val view = appTileViews[i]
-                val col = i % cols
-                val row = i / cols
-                val tileLeft = gridOffsetX + col * (tileSizePx + tileGapPx)
-                val tileTop = appsCursorY + row * (tileHeightPx + tileGapPx)
-                val tileRight = tileLeft + tileSizePx
-                val tileBottom = tileTop + tileHeightPx
-
-                view.measure(
-                    MeasureSpec.makeMeasureSpec(tileRight - tileLeft, MeasureSpec.EXACTLY),
-                    MeasureSpec.makeMeasureSpec(tileBottom - tileTop, MeasureSpec.EXACTLY)
-                )
-                view.layout(tileLeft, tileTop, tileRight, tileBottom)
-            }
-        }
-
-        // (media + volume already laid out above in section 1)
-
-        invalidate() // repaint panel backgrounds
+    /** Highlights the stats chip while the detailed stats panel is open. */
+    fun setStatsExpanded(expanded: Boolean) {
+        statsChip.isActivated = expanded
     }
 
     // ------------------------------------------------------------------
-    // Touch — dismiss on scrim tap, let tiles handle their own events
+    // Touch — dismiss on taps outside the rail
     // ------------------------------------------------------------------
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> onGestureStart?.invoke()
+            // Restart the auto-hide countdown only once the gesture ends, so a
+            // long scroll or press can't be dismissed under the finger.
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> onInteraction?.invoke()
+        }
+        return super.dispatchTouchEvent(ev)
+    }
 
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
         return false
@@ -330,10 +208,7 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_UP) {
-            // If tap is outside the panel, dismiss
-            val x = event.x
-            val y = event.y
-            if (!appsPanelRect.contains(x, y) && !mediaPanelRect.contains(x, y)) {
+            if (event.x > rail.right || event.x < rail.left) {
                 onDismiss?.invoke()
                 return true
             }
@@ -342,44 +217,31 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
     }
 
     // ------------------------------------------------------------------
-    // Animations
+    // Animations — the rail slides out of the edge line
     // ------------------------------------------------------------------
 
     fun animateIn() {
-        alpha = 0f
-        scaleX = 0.92f
-        scaleY = 0.92f
         visibility = View.VISIBLE
-
-        val fadeIn = ObjectAnimator.ofFloat(this, "alpha", 0f, 1f)
-        val scaleXIn = ObjectAnimator.ofFloat(this, "scaleX", 0.92f, 1f)
-        val scaleYIn = ObjectAnimator.ofFloat(this, "scaleY", 0.92f, 1f)
-
-        AnimatorSet().apply {
-            playTogether(fadeIn, scaleXIn, scaleYIn)
-            duration = ANIM_IN_MS
-            interpolator = DecelerateInterpolator()
-            start()
-        }
+        val offset = -(railWidthFor(resources.displayMetrics.widthPixels) + edgeOffsetPx).toFloat()
+        rail.translationX = offset
+        rail.animate()
+            .translationX(0f)
+            .setDuration(ANIM_IN_MS)
+            .setInterpolator(DecelerateInterpolator(2f))
+            .start()
     }
 
     fun animateOut(onEnd: () -> Unit) {
-        val fadeOut = ObjectAnimator.ofFloat(this, "alpha", 1f, 0f)
-        val scaleXOut = ObjectAnimator.ofFloat(this, "scaleX", 1f, 0.92f)
-        val scaleYOut = ObjectAnimator.ofFloat(this, "scaleY", 1f, 0.92f)
-
-        AnimatorSet().apply {
-            playTogether(fadeOut, scaleXOut, scaleYOut)
-            duration = ANIM_OUT_MS
-            interpolator = AccelerateInterpolator()
-            addListener(object : android.animation.AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: android.animation.Animator) {
-                    visibility = View.GONE
-                    onEnd()
-                }
-            })
-            start()
-        }
+        val offset = -(rail.width + edgeOffsetPx + (8 * density).toInt()).toFloat()
+        rail.animate()
+            .translationX(offset)
+            .setDuration(ANIM_OUT_MS)
+            .setInterpolator(AccelerateInterpolator())
+            .withEndAction {
+                visibility = View.GONE
+                onEnd()
+            }
+            .start()
     }
 
     // ------------------------------------------------------------------
@@ -394,23 +256,14 @@ class DeckOverlayView(context: Context) : FrameLayout(context) {
         volumeTileView?.updateVolume(volume, muted)
     }
 
-    // ------------------------------------------------------------------
-    // Constants
-    // ------------------------------------------------------------------
-
     private companion object {
-        const val TILE_SIZE_DP = 96f
-        const val TILE_HEIGHT_DP = 112f
-        const val TILE_GAP_DP = 14f
-        const val PANEL_PAD_DP = 24f
-        const val PANEL_CORNER_DP = 28f
-        const val PANEL_BOX_GAP_DP = 16f
-        const val MEDIA_BAR_HEIGHT_DP = 72f
-        const val VOLUME_BAR_HEIGHT_DP = 48f
-        const val SECTION_GAP_DP = 10f
-        const val MAX_PANEL_WIDTH_DP = 1200f
-        const val PANEL_WIDTH_FRACTION = 0.96f
-        const val ANIM_IN_MS = 200L
-        const val ANIM_OUT_MS = 150L
+        const val EDGE_DP = 4f
+        const val MAX_RAIL_WIDTH_DP = 340f
+        const val MAX_RAIL_FRACTION = 0.30f
+        const val RAIL_COLUMNS = 3
+        const val TILE_HEIGHT_DP = 84f
+        const val TILE_GAP_DP = 8f
+        const val ANIM_IN_MS = 300L
+        const val ANIM_OUT_MS = 200L
     }
 }

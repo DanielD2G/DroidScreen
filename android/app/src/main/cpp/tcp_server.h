@@ -13,7 +13,8 @@ extern "C" {
 #endif
 
 /*
- * Start a TCP server listening on 127.0.0.1:port.
+ * Start a TCP server listening on all interfaces (0.0.0.0:port), so both the
+ * adb tunnel (loopback) and the local Wi-Fi network can reach it.
  * Returns the server socket fd, or -1 on error.
  */
 int tcp_server_start(int port);
@@ -21,9 +22,16 @@ int tcp_server_start(int port);
 /*
  * Blocking accept on the server socket.
  * Sets TCP_NODELAY on the accepted connection.
+ * If is_loopback is non-NULL it is set to 1 when the peer is 127.0.0.0/8
+ * (the adb tunnel), 0 when it came over the network.
  * Returns the client socket fd, or -1 on error.
  */
-int tcp_server_accept(int server_fd);
+int tcp_server_accept(int server_fd, int *is_loopback);
+
+/*
+ * Set (timeout_ms > 0) or clear (timeout_ms == 0) the receive timeout.
+ */
+void tcp_set_recv_timeout(int fd, int timeout_ms);
 
 /*
  * Blocking receive of exactly `len` bytes into `buf`.

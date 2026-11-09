@@ -64,8 +64,8 @@ object CodecSelector {
         fps: Int,
         out: MutableList<Candidate>
     ) {
-        if (codecId == DS_CODEC_HEVC && hevcIsBlockedForThisDevice()) {
-            Log.w(TAG, "CodecSelector: skipping HEVC on ${Build.DEVICE}; output is unstable on this tablet")
+        if (codecId == DS_CODEC_HEVC && hevcIsBlockedForThisDevice(fps)) {
+            Log.w(TAG, "CodecSelector: skipping HEVC on ${Build.DEVICE} at ${fps}fps; output is unstable at high fps on this tablet")
             return
         }
 
@@ -135,11 +135,13 @@ object CodecSelector {
         }
     }
 
-    private fun hevcIsBlockedForThisDevice(): Boolean {
-        // POCO Pad / Xiaomi dizi advertises c2.qti.hevc.decoder.low_latency,
-        // but validation shows Qualcomm output-port errors followed by black
-        // Surface content at 2560x1600@120. H.264 low_latency is the safe path.
-        return Build.DEVICE.equals("dizi", ignoreCase = true)
+    private fun hevcIsBlockedForThisDevice(fps: Int): Boolean {
+        // POCO Pad / Xiaomi dizi advertises c2.qti.hevc.decoder.low_latency, but
+        // validation showed Qualcomm output-port errors + black Surface content
+        // at 2560x1600@120 — the decoder saturates at 120fps. At <=60fps it has
+        // ample headroom, so HEVC (roughly half the bitrate for the same quality)
+        // is allowed there. High fps stays on the safe H.264 low_latency path.
+        return Build.DEVICE.equals("dizi", ignoreCase = true) && fps > 60
     }
 
     private fun isSoftwareDecoder(info: MediaCodecInfo): Boolean {

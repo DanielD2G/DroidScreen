@@ -17,7 +17,7 @@ extern "C" {
 #endif
 
 /* Protocol version */
-#define DS_PROTOCOL_VERSION  8
+#define DS_PROTOCOL_VERSION  9
 
 /* Default TCP port */
 #define DS_DEFAULT_PORT      38271
@@ -31,6 +31,8 @@ extern "C" {
 typedef enum {
     DS_MSG_HANDSHAKE_REQ  = 0x01,
     DS_MSG_HANDSHAKE_RESP = 0x02,
+    DS_MSG_HELLO          = 0x03,  /* wireless only, see hello.h */
+    DS_MSG_HELLO_RESP     = 0x04,
     DS_MSG_VIDEO_FRAME    = 0x10,
     DS_MSG_TOUCH_EVENT    = 0x20,
     DS_MSG_PEN_EVENT      = 0x21,

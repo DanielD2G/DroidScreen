@@ -27,6 +27,12 @@
 #include "mouse_injector_mac.h"
 #include "droidscreen/server.h"
 #include "touch_injector_mac.h"
+#include "wifi_discovery.h"
+#import "ui/DSUIBridge.h"
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 extern "C" {
 #include "droidscreen/protocol.h"
@@ -659,6 +665,80 @@ static NSString* const kSettingResolution   = @"DroidScreenResolution";   // ind
 static NSString* const kSettingScale        = @"DroidScreenScale";        // index
 static NSString* const kSettingPort         = @"DroidScreenPort";
 static NSString* const kSettingDeckApps     = @"DroidScreenDeckApps";     // array of dicts
+static NSString* const kSettingDesktopID    = @"DroidScreenDesktopID";    // hex, identifies this Mac to tablets
+static NSString* const kSettingWifiPairings = @"DroidScreenWifiPairings"; // {tablet id: token hex}
+// Per-tablet stream settings: {device key: {name, fps, min_idle_fps, bitrate, resolution, hidpi}}.
+// Device key = Wi-Fi tablet id, or "usb:<adb serial>". Missing values fall back
+// to the global keys above, which act as the defaults for new tablets.
+static NSString* const kSettingDeviceSettings = @"DroidScreenDeviceSettings";
+
+// -----------------------------------------------------------------------------
+#pragma mark - Wi-Fi identity and pairing storage
+// -----------------------------------------------------------------------------
+
+static NSString* hex_from_bytes(const uint8_t* bytes, size_t len) {
+    NSMutableString* out = [NSMutableString stringWithCapacity:len * 2];
+    for (size_t i = 0; i < len; ++i) [out appendFormat:@"%02x", bytes[i]];
+    return out;
+}
+
+static bool bytes_from_hex(NSString* hex, uint8_t* out, size_t len) {
+    if (hex.length != len * 2) return false;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned int byte = 0;
+        NSString* pair = [hex substringWithRange:NSMakeRange(i * 2, 2)];
+        if (![[NSScanner scannerWithString:pair] scanHexInt:&byte]) return false;
+        out[i] = (uint8_t)byte;
+    }
+    return true;
+}
+
+/// Stable random id for this Mac, created on first use.
+static void desktop_id(uint8_t out[DS_HELLO_ID_SIZE]) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    NSString* stored = [defaults stringForKey:kSettingDesktopID];
+    if (stored && bytes_from_hex(stored, out, DS_HELLO_ID_SIZE)) return;
+    arc4random_buf(out, DS_HELLO_ID_SIZE);  // CSPRNG on macOS
+    [defaults setObject:hex_from_bytes(out, DS_HELLO_ID_SIZE) forKey:kSettingDesktopID];
+}
+
+static NSString* desktop_display_name() {
+    NSString* name = [[NSHost currentHost] localizedName];
+    return name.length ? name : @"Mac";
+}
+
+static NSString* stored_pairing_token(const std::string& tablet_id) {
+    NSDictionary* pairings = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kSettingWifiPairings];
+    return pairings[[NSString stringWithUTF8String:tablet_id.c_str()]];
+}
+
+static void store_pairing_token(const std::string& tablet_id, NSString* token) {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary* pairings =
+        [([defaults dictionaryForKey:kSettingWifiPairings] ?: @{}) mutableCopy];
+    pairings[[NSString stringWithUTF8String:tablet_id.c_str()]] = token;
+    [defaults setObject:pairings forKey:kSettingWifiPairings];
+}
+
+/// Set by `--wifi [name|id]` for automated tests: stream over Wi-Fi only (even
+/// with a cable attached), to the paired tablet matching the value ("" = any).
+static bool g_cliForceWifi = false;
+static std::string g_cliWifiMatch;
+
+/// A tablet we may auto-connect to over Wi-Fi: paired, compatible, and
+/// matching `--wifi <name|id>` when given.
+static bool wifi_tablet_eligible(const droidscreen::WifiTablet& tablet) {
+    bool matches = g_cliWifiMatch.empty() || tablet.id == g_cliWifiMatch ||
+                   tablet.service_name == g_cliWifiMatch;
+    return matches && stored_pairing_token(tablet.id) &&
+           tablet.protocol_version == DS_PROTOCOL_VERSION;
+}
+
+/// Where a stream goes: through the adb tunnel or straight to a Wi-Fi tablet.
+struct StreamTarget {
+    bool wifi = false;
+    droidscreen::WifiTablet tablet;  // valid when wifi
+};
 
 // Resolution presets: logical (point) resolution of the virtual display.
 // This is what macOS shows as the display size — how much content fits.
@@ -678,10 +758,9 @@ static const ResolutionPreset kResolutions[] = {
 static const int kResolutionCount = sizeof(kResolutions) / sizeof(kResolutions[0]);
 
 // Bitrate presets in kbps.
-static const int kBitrates[]     = { 5000, 10000, 15000, 20000, 25000, 30000 };
-static const char* kBitrateLabels[] = {
-    "5 Mbps", "10 Mbps", "15 Mbps", "20 Mbps", "25 Mbps", "30 Mbps"
-};
+// Bitrate cap presets (kbps), 5 to 80 Mbps. The speed test picks one of these.
+static const int kBitrates[]     = { 5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000,
+                                     45000, 50000, 55000, 60000, 65000, 70000, 75000, 80000 };
 static const int kBitrateCount = sizeof(kBitrates) / sizeof(kBitrates[0]);
 static const uint32_t kMinIdleFPSOptions[] = { 1, 10, 15, 30 };
 static NSString* const kMinIdleFPSLabels[] = {
@@ -698,7 +777,7 @@ static uint32_t sanitize_min_idle_fps(uint32_t fps) {
         case 30:
             return fps;
         default:
-            return 30;
+            return 10;
     }
 }
 
@@ -873,16 +952,34 @@ static CGSize adb_device_resolution() {
 }
 
 /// Returns YES if `adb devices` shows at least one device/emulator attached.
+/// adb also lists wireless-debugging devices ("ip:port", "adb-…._adb-tls-connect._tcp").
+/// Those are not a cable: the stream should use the Wi-Fi path for them.
+static BOOL adb_serial_is_usb(NSString* serial) {
+    if (serial.length == 0) return NO;
+    if ([serial containsString:@"._adb-tls-connect."] || [serial containsString:@"._adb._tcp"]) return NO;
+    NSRange colon = [serial rangeOfString:@":" options:NSBackwardsSearch];
+    if (colon.location != NSNotFound) return NO;   // host:port
+    return YES;
+}
+
 static BOOL adb_device_connected() {
     NSString* output = adb_run_output(@[@"devices"]);
     // Output format: "List of devices attached\n<serial>\tdevice\n"
     NSArray<NSString*>* lines = [output componentsSeparatedByString:@"\n"];
     for (NSString* line in lines) {
-        if ([line hasSuffix:@"\tdevice"]) {
+        if ([line hasSuffix:@"\tdevice"] && adb_serial_is_usb([line componentsSeparatedByString:@"\t"].firstObject)) {
             return YES;
         }
     }
     return NO;
+}
+
+/// Serial of the adb-attached device, or nil.
+static NSString* adb_device_serial() {
+    NSString* serial = [adb_run_output(@[@"get-serialno"])
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (serial.length == 0 || [serial hasPrefix:@"error"] || [serial isEqualToString:@"unknown"]) return nil;
+    return serial;
 }
 
 /// Returns YES if the DroidScreen Android app is currently running on the device.
@@ -901,80 +998,13 @@ static BOOL adb_droidscreen_running() {
 // =============================================================================
 
 /// Creates a small monitor+phone icon drawn programmatically.
-static NSImage* CreateStatusBarIcon() {
-    NSImage* image = [NSImage imageWithSize:NSMakeSize(18, 18)
-                                   flipped:NO
-                            drawingHandler:^BOOL(NSRect rect) {
-        [[NSColor blackColor] setStroke];
-
-        // Monitor body (left portion).
-        NSBezierPath* monitor = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1, 5, 10, 8)
-                                                                xRadius:1.0
-                                                                yRadius:1.0];
-        monitor.lineWidth = 1.2;
-        [monitor stroke];
-
-        // Monitor stand.
-        NSBezierPath* stand = [NSBezierPath bezierPath];
-        [stand moveToPoint:NSMakePoint(4, 5)];
-        [stand lineToPoint:NSMakePoint(3, 3)];
-        [stand moveToPoint:NSMakePoint(8, 5)];
-        [stand lineToPoint:NSMakePoint(9, 3)];
-        [stand moveToPoint:NSMakePoint(2, 3)];
-        [stand lineToPoint:NSMakePoint(10, 3)];
-        stand.lineWidth = 1.0;
-        [stand stroke];
-
-        // Phone (right portion, slightly overlapping).
-        NSBezierPath* phone = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(12, 3, 5, 10)
-                                                               xRadius:0.8
-                                                               yRadius:0.8];
-        phone.lineWidth = 1.2;
-        [phone stroke];
-
-        // Phone screen line.
-        NSBezierPath* screenLine = [NSBezierPath bezierPath];
-        [screenLine moveToPoint:NSMakePoint(12.5, 5)];
-        [screenLine lineToPoint:NSMakePoint(16.5, 5)];
-        [screenLine moveToPoint:NSMakePoint(12.5, 11)];
-        [screenLine lineToPoint:NSMakePoint(16.5, 11)];
-        screenLine.lineWidth = 0.8;
-        [screenLine stroke];
-
-        return YES;
-    }];
-
-    [image setTemplate:YES];
-    return image;
-}
-
 // =============================================================================
 #pragma mark - AppDelegate
 // =============================================================================
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, DSUIHost>
 
-// Menu bar.
-@property (nonatomic, strong) NSStatusItem* statusItem;
-@property (nonatomic, strong) NSMenu*       statusMenu;
-@property (nonatomic, strong) NSMenuItem*   statusMenuItem;
-@property (nonatomic, strong) NSMenuItem*   connectMenuItem;
-
-// Settings window.
-@property (nonatomic, strong) NSWindow* settingsWindow;
-@property (nonatomic, strong) NSPopUpButton* fpsPopup;
-@property (nonatomic, strong) NSPopUpButton* minFpsPopup;
-@property (nonatomic, strong) NSPopUpButton* bitratePopup;
-@property (nonatomic, strong) NSPopUpButton* resolutionPopup;
-@property (nonatomic, strong) NSPopUpButton* scalePopup;       // unused, kept for compat
-@property (nonatomic, strong) NSButton*      retinaCheckbox;
-@property (nonatomic, strong) NSTextField*   portField;
-@property (nonatomic, strong) NSButton*      autoDetectButton;
-@property (nonatomic, strong) NSProgressIndicator* speedTestSpinner;
-
-// Deck Shortcuts section in settings.
-@property (nonatomic, strong) NSScrollView*  deckAppListScrollView;
-@property (nonatomic, strong) NSView*        deckAppListContainer;
+// Deck shortcuts (mirrors kSettingDeckApps).
 @property (nonatomic, strong) NSMutableArray<NSDictionary*>* deckApps;
 
 // State.
@@ -1006,12 +1036,35 @@ static NSImage* CreateStatusBarIcon() {
     // ADB device detection timer.
     NSTimer* _deviceTimer;
 
+    // Wi-Fi: Bonjour discovery, the transport of the active stream, and the
+    // tablet the user picked from the menu (empty = automatic).
+    std::unique_ptr<droidscreen::WifiDiscovery> _wifiDiscovery;
+    BOOL _streamingOverWifi;
+    std::string _wifiTargetId;
+    std::string _activeWifiTabletId;
+
+    // Interface (SwiftUI) and what it shows.
+    id<DSUIController> _ui;
+    NSString* _statusDetail;
+    NSString* _activeTabletName;
+    NSString* _activeAddress;
+    NSString* _activeCodec;
+    NSString* _activeDeviceKey;
+    NSString* _usbDeviceKey;
+    NSString* _usbDeviceName;
+    BOOL _uiPending;
+    BOOL _activeHiDPI;
+    BOOL _usbDevicePresent;
+    unsigned _statsTick;
+
     // Stats timer.
     NSTimer* _statsTimer;
     uint64_t _lastStatsCaptured;
     uint64_t _lastStatsEncoded;
     uint64_t _lastStatsDropped;
     uint64_t _lastStatsBytes;
+    uint64_t _lastStatsEncSum;
+    uint64_t _lastStatsEncN;
     CFAbsoluteTime _lastStatsTime;
 
     // Validation-only animated window. Enabled by the validation script via
@@ -1042,7 +1095,7 @@ static NSImage* CreateStatusBarIcon() {
     // Register default settings.
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         kSettingFPS:         @60,
-        kSettingMinIdleFPS:  @30,
+        kSettingMinIdleFPS:  @10,  // measured: same wake latency as 30, ~1/3 less tablet CPU
         kSettingBitrate:     @15000,
         kSettingResolution:  @0,
         kSettingScale:       @0,
@@ -1059,9 +1112,11 @@ static NSImage* CreateStatusBarIcon() {
     _deckStateQueue = dispatch_queue_create("com.droidscreen.deck-state", DISPATCH_QUEUE_SERIAL);
     _isStreaming = NO;
 
-    [self buildStatusBar];
-    [self buildSettingsWindow];
+    [self loadDeckApps];
+    _ui = DSUICreateController(self);
+    [self pushUIState];
     [self startDeviceDetectionTimer];
+    [self startWifiDiscovery];
 
     // Request screen capture permission once at launch.
     if (!CGPreflightScreenCaptureAccess()) {
@@ -1069,11 +1124,16 @@ static NSImage* CreateStatusBarIcon() {
         CGRequestScreenCaptureAccess();
     }
 
+    if (g_cliForceWifi) {
+        NSLog(@"[DroidScreen] --wifi: streaming over Wi-Fi only (match='%s')",
+              g_cliWifiMatch.c_str());
+    }
     NSLog(@"[DroidScreen] Menu bar app launched");
 }
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
     [self stopDeviceDetectionTimer];
+    if (_wifiDiscovery) _wifiDiscovery->stop();
     [self stopStatsTimer];
 
     if (_isStreaming) {
@@ -1088,427 +1148,116 @@ static NSImage* CreateStatusBarIcon() {
 }
 
 // -----------------------------------------------------------------------------
-#pragma mark - Status Bar
+#pragma mark - Interface (SwiftUI menu bar popover + settings, see src/ui/)
 // -----------------------------------------------------------------------------
 
-- (void)buildStatusBar {
-    self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    self.statusItem.button.image = CreateStatusBarIcon();
-    self.statusItem.button.toolTip = @"DroidScreen";
-
-    self.statusMenu = [[NSMenu alloc] init];
-
-    // Title item.
-    NSMenuItem* titleItem = [[NSMenuItem alloc] initWithTitle:@"DroidScreen"
-                                                       action:nil
-                                                keyEquivalent:@""];
-    [titleItem setEnabled:NO];
-    NSDictionary* boldAttrs = @{
-        NSFontAttributeName: [NSFont boldSystemFontOfSize:13]
-    };
-    titleItem.attributedTitle = [[NSAttributedString alloc] initWithString:@"DroidScreen"
-                                                               attributes:boldAttrs];
-    [self.statusMenu addItem:titleItem];
-
-    // Status item.
-    self.statusMenuItem = [[NSMenuItem alloc] initWithTitle:@"Status: Disconnected"
-                                                     action:nil
-                                              keyEquivalent:@""];
-    [self.statusMenuItem setEnabled:NO];
-    [self.statusMenu addItem:self.statusMenuItem];
-
-    [self.statusMenu addItem:[NSMenuItem separatorItem]];
-
-    // Settings.
-    NSMenuItem* settingsItem = [[NSMenuItem alloc] initWithTitle:@"Settings..."
-                                                          action:@selector(showSettings:)
-                                                   keyEquivalent:@","];
-    settingsItem.target = self;
-    [self.statusMenu addItem:settingsItem];
-
-    // Stream Deck.
-    NSMenuItem* deckItem = [[NSMenuItem alloc] initWithTitle:@"Configure Deck..."
-                                                       action:@selector(showDeckConfig:)
-                                                keyEquivalent:@""];
-    deckItem.target = self;
-    [self.statusMenu addItem:deckItem];
-
-    [self.statusMenu addItem:[NSMenuItem separatorItem]];
-
-    // Connect / Disconnect toggle.
-    self.connectMenuItem = [[NSMenuItem alloc] initWithTitle:@"Connect"
-                                                      action:@selector(toggleConnect:)
-                                               keyEquivalent:@""];
-    self.connectMenuItem.target = self;
-    [self.statusMenu addItem:self.connectMenuItem];
-
-    [self.statusMenu addItem:[NSMenuItem separatorItem]];
-
-    // Quit.
-    NSMenuItem* quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit"
-                                                      action:@selector(quitApp:)
-                                               keyEquivalent:@"q"];
-    quitItem.target = self;
-    [self.statusMenu addItem:quitItem];
-
-    self.statusItem.menu = self.statusMenu;
+static NSString* strip_status_prefix(NSString* text) {
+    return [text hasPrefix:@"Status: "] ? [text substringFromIndex:8] : text;
 }
 
+static NSString* codec_name(ds_codec_t codec) {
+    switch (codec) {
+        case DS_CODEC_HEVC: return @"HEVC";
+        default:            return @"H.264";
+    }
+}
+
+/// Remote address of a connected socket, or nil.
+static NSString* peer_address(int fd) {
+    if (fd < 0) return nil;
+    struct sockaddr_storage addr {};
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&addr), &len) != 0) return nil;
+    char host[INET6_ADDRSTRLEN] = {};
+    if (addr.ss_family == AF_INET) {
+        inet_ntop(AF_INET, &reinterpret_cast<struct sockaddr_in*>(&addr)->sin_addr, host, sizeof(host));
+    } else if (addr.ss_family == AF_INET6) {
+        inet_ntop(AF_INET6, &reinterpret_cast<struct sockaddr_in6*>(&addr)->sin6_addr, host, sizeof(host));
+    } else {
+        return nil;
+    }
+    return [NSString stringWithUTF8String:host];
+}
+
+/// Friendly name of the adb-attached tablet ("POCO Pad"), falling back to the model.
+static NSString* adb_device_name() {
+    NSString* name = [adb_run_output(@[@"shell", @"settings", @"get", @"global", @"device_name"])
+        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (name.length == 0 || [name isEqualToString:@"null"]) {
+        name = [adb_run_output(@[@"shell", @"getprop", @"ro.product.model"])
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    }
+    return name.length ? name : @"USB tablet";
+}
+
+/// Status line from the connection code. Safe from any thread.
 - (void)updateStatusText:(NSString*)text {
+    NSString* detail = strip_status_prefix(text);
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.statusMenuItem.title = text;
+        self->_statusDetail = detail;
+        [self pushUIState];
     });
 }
 
+/// Kept for the connection code: the title itself now comes from the phase.
 - (void)updateConnectMenuTitle:(NSString*)title {
+    BOOL pending = [title hasSuffix:@"..."];
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.connectMenuItem.title = title;
+        self->_uiPending = pending;
+        [self pushUIState];
     });
 }
 
-// -----------------------------------------------------------------------------
-#pragma mark - Settings Window
-// -----------------------------------------------------------------------------
-
-- (void)buildSettingsWindow {
-    // Load deck apps from defaults.
-    NSArray* savedDeckApps = [[NSUserDefaults standardUserDefaults] arrayForKey:kSettingDeckApps];
-    self.deckApps = savedDeckApps ? [savedDeckApps mutableCopy] : [NSMutableArray new];
-
-    NSRect frame = NSMakeRect(0, 0, 500, 620);
-    NSWindowStyleMask style = NSWindowStyleMaskTitled
-                            | NSWindowStyleMaskClosable;
-
-    self.settingsWindow = [[NSWindow alloc] initWithContentRect:frame
-                                                      styleMask:style
-                                                        backing:NSBackingStoreBuffered
-                                                          defer:NO];
-    self.settingsWindow.title = @"DroidScreen Settings";
-    self.settingsWindow.delegate = self;
-
-    // Force dark appearance — all standard AppKit controls automatically render dark.
-    self.settingsWindow.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-
-    // Keep settings window on main display — never let it migrate to virtual display.
-    self.settingsWindow.collectionBehavior = NSWindowCollectionBehaviorMoveToActiveSpace
-                                          | NSWindowCollectionBehaviorTransient;
-    self.settingsWindow.level = NSFloatingWindowLevel;
-    [self.settingsWindow setReleasedWhenClosed:NO];
-    [self.settingsWindow center];
-
-    // Prevent resizing.
-    self.settingsWindow.minSize = frame.size;
-    self.settingsWindow.maxSize = frame.size;
-
-    // Dark background color for the window content.
-    self.settingsWindow.backgroundColor =
-        [NSColor colorWithCalibratedRed:0.08 green:0.08 blue:0.12 alpha:1.0];
-
-    NSView* contentView = self.settingsWindow.contentView;
-    CGFloat leftMargin  = 24;
-    CGFloat labelWidth  = 110;
-    CGFloat controlLeft = leftMargin + labelWidth + 10;
-    CGFloat controlWidth = 310;
-    CGFloat rowHeight   = 32;
-    CGFloat startY      = frame.size.height - 50;
-
-    // --- Section: Streaming Settings ---
-    CGFloat y = startY;
-    NSTextField* streamingHeader = [NSTextField labelWithString:@"Streaming"];
-    streamingHeader.frame = NSMakeRect(leftMargin, y + 2, 200, 20);
-    streamingHeader.font = [NSFont boldSystemFontOfSize:15];
-    streamingHeader.textColor = [NSColor whiteColor];
-    [contentView addSubview:streamingHeader];
-
-    // Separator line.
-    y -= 14;
-    NSBox* sep1 = [[NSBox alloc] initWithFrame:NSMakeRect(leftMargin, y, frame.size.width - 2 * leftMargin, 1)];
-    sep1.boxType = NSBoxSeparator;
-    [contentView addSubview:sep1];
-
-    // --- Row 1: FPS ---
-    y -= rowHeight;
-    [self addLabel:@"Frame Rate:" toView:contentView atX:leftMargin y:y width:labelWidth];
-    self.fpsPopup = [self addPopUpButton:contentView atX:controlLeft y:y width:controlWidth];
-    [self.fpsPopup addItemWithTitle:@"30 fps"];
-    [self.fpsPopup addItemWithTitle:@"60 fps"];
-    [self.fpsPopup addItemWithTitle:@"120 fps"];
-    NSInteger savedFPS = [[NSUserDefaults standardUserDefaults] integerForKey:kSettingFPS];
-    NSInteger fpsIdx = 1; // default: 60
-    if (savedFPS == 30) fpsIdx = 0;
-    else if (savedFPS == 120) fpsIdx = 2;
-    [self.fpsPopup selectItemAtIndex:fpsIdx];
-
-    // --- Row 2: Minimum idle FPS ---
-    y -= rowHeight + 4;
-    [self addLabel:@"Minimum FPS:" toView:contentView atX:leftMargin y:y width:labelWidth];
-    self.minFpsPopup = [self addPopUpButton:contentView atX:controlLeft y:y width:controlWidth];
-    for (int i = 0; i < kMinIdleFPSCount; i++) {
-        [self.minFpsPopup addItemWithTitle:kMinIdleFPSLabels[i]];
+/// Publish the connection state to the interface. Main thread.
+- (void)pushUIState {
+    if (!_ui) return;
+    NSString* phase = _isStreaming ? @"streaming" : ((_isBusy || _uiPending) ? @"connecting" : @"idle");
+    NSMutableDictionary* state = [@{
+        @"phase":     phase,
+        @"detail":    _statusDetail ?: @"Not connected",
+        @"usbDevice": @(_usbDevicePresent),
+    } mutableCopy];
+    if (_usbDevicePresent && _usbDeviceKey) {
+        state[@"usbDeviceKey"] = _usbDeviceKey;
+        state[@"usbDeviceName"] = _usbDeviceName ?: @"USB tablet";
     }
-    uint32_t savedMinIdleFPS = sanitize_min_idle_fps(
-        (uint32_t)[[NSUserDefaults standardUserDefaults] integerForKey:kSettingMinIdleFPS]);
-    [self.minFpsPopup selectItemAtIndex:min_idle_fps_index(savedMinIdleFPS)];
-
-    // --- Row 3: Bitrate ---
-    y -= rowHeight + 4;
-    [self addLabel:@"Bitrate:" toView:contentView atX:leftMargin y:y width:labelWidth];
-    self.bitratePopup = [self addPopUpButton:contentView atX:controlLeft y:y width:230];
-    for (int i = 0; i < kBitrateCount; i++) {
-        [self.bitratePopup addItemWithTitle:@(kBitrateLabels[i])];
+    if (_isStreaming || _isBusy) {
+        state[@"transport"] = _streamingOverWifi ? @"wifi" : @"usb";
+        if (_activeTabletName) state[@"tabletName"] = _activeTabletName;
+        if (_activeDeviceKey) state[@"deviceKey"] = _activeDeviceKey;
+        if (_activeAddress) state[@"address"] = _activeAddress;
     }
-    NSInteger savedBitrate = [[NSUserDefaults standardUserDefaults] integerForKey:kSettingBitrate];
-    int bitrateIdx = 2; // default: 15 Mbps
-    for (int i = 0; i < kBitrateCount; i++) {
-        if (kBitrates[i] == (int)savedBitrate) { bitrateIdx = i; break; }
+    if (_isStreaming) {
+        state[@"width"] = @(_streamWidth);
+        state[@"height"] = @(_streamHeight);
+        state[@"fps"] = @(_streamFPS);
+        state[@"hidpi"] = @(_activeHiDPI);
+        state[@"codec"] = _activeCodec ?: @"HEVC";
     }
-    [self.bitratePopup selectItemAtIndex:bitrateIdx];
-
-    // Auto-detect bitrate button.
-    self.autoDetectButton = [[NSButton alloc] initWithFrame:
-        NSMakeRect(controlLeft + 240, y, 65, 26)];
-    self.autoDetectButton.title = @"Auto";
-    self.autoDetectButton.bezelStyle = NSBezelStyleRounded;
-    [self.autoDetectButton setFont:[NSFont systemFontOfSize:11]];
-    self.autoDetectButton.target = self;
-    self.autoDetectButton.action = @selector(runSpeedTest:);
-    [contentView addSubview:self.autoDetectButton];
-
-    // Spinner shown during speed test (hidden by default).
-    self.speedTestSpinner = [[NSProgressIndicator alloc] initWithFrame:
-        NSMakeRect(controlLeft + 240, y + 3, 60, 20)];
-    self.speedTestSpinner.style = NSProgressIndicatorStyleBar;
-    self.speedTestSpinner.indeterminate = YES;
-    self.speedTestSpinner.hidden = YES;
-    [contentView addSubview:self.speedTestSpinner];
-
-    // --- Row 4: Resolution ---
-    y -= rowHeight + 4;
-    [self addLabel:@"Resolution:" toView:contentView atX:leftMargin y:y width:labelWidth];
-    self.resolutionPopup = [self addPopUpButton:contentView atX:controlLeft y:y width:controlWidth];
-    for (int i = 0; i < kResolutionCount; i++) {
-        [self.resolutionPopup addItemWithTitle:@(kResolutions[i].label)];
-    }
-    NSInteger savedRes = [[NSUserDefaults standardUserDefaults] integerForKey:kSettingResolution];
-    if (savedRes >= 0 && savedRes < kResolutionCount) {
-        [self.resolutionPopup selectItemAtIndex:savedRes];
-    }
-
-    // --- Row 5: Retina (HiDPI) ---
-    y -= rowHeight + 4;
-    self.scalePopup = nil; // Not used anymore — replaced by retinaCheckbox.
-    self.retinaCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(controlLeft, y, controlWidth, 20)];
-    [self.retinaCheckbox setButtonType:NSButtonTypeSwitch];
-    self.retinaCheckbox.title = @"Retina (HiDPI) — sharper text and UI";
-    [self.retinaCheckbox setFont:[NSFont systemFontOfSize:13]];
-    self.retinaCheckbox.state = [[NSUserDefaults standardUserDefaults] boolForKey:kSettingScale]
-                                 ? NSControlStateValueOn : NSControlStateValueOff;
-    [contentView addSubview:self.retinaCheckbox];
-    [self addLabel:@"Quality:" toView:contentView atX:leftMargin y:y width:labelWidth];
-
-    // --- Row 6: Port ---
-    y -= rowHeight + 8;
-    [self addLabel:@"Port:" toView:contentView atX:leftMargin y:y width:labelWidth];
-    self.portField = [[NSTextField alloc] initWithFrame:NSMakeRect(controlLeft, y, 100, 24)];
-    self.portField.stringValue = [NSString stringWithFormat:@"%ld",
-        (long)[[NSUserDefaults standardUserDefaults] integerForKey:kSettingPort]];
-    [self.portField setFont:[NSFont systemFontOfSize:13]];
-    [self.portField setBezelStyle:NSTextFieldRoundedBezel];
-    [contentView addSubview:self.portField];
-
-    // --- Apply button ---
-    y -= rowHeight + 12;
-    NSButton* applyButton = [[NSButton alloc] initWithFrame:NSMakeRect(frame.size.width - 100 - 24, y, 100, 32)];
-    applyButton.title = @"Apply";
-    applyButton.bezelStyle = NSBezelStyleRounded;
-    [applyButton setFont:[NSFont systemFontOfSize:13]];
-    applyButton.target = self;
-    applyButton.action = @selector(applySettings:);
-    applyButton.keyEquivalent = @"\r"; // Enter key.
-    [contentView addSubview:applyButton];
-
-    // =========================================================================
-    // Section: Stream Deck Shortcuts
-    // =========================================================================
-    y -= 30;
-    NSTextField* deckHeader = [NSTextField labelWithString:@"Stream Deck Shortcuts"];
-    deckHeader.frame = NSMakeRect(leftMargin, y, 300, 20);
-    deckHeader.font = [NSFont boldSystemFontOfSize:15];
-    deckHeader.textColor = [NSColor whiteColor];
-    [contentView addSubview:deckHeader];
-
-    y -= 14;
-    NSBox* sep2 = [[NSBox alloc] initWithFrame:NSMakeRect(leftMargin, y, frame.size.width - 2 * leftMargin, 1)];
-    sep2.boxType = NSBoxSeparator;
-    [contentView addSubview:sep2];
-
-    // Scrollable list of configured deck apps.
-    y -= 6;
-    CGFloat listHeight = y - 50; // Leave room for "Add App..." button at bottom.
-    if (listHeight < 60) listHeight = 60;
-
-    self.deckAppListScrollView = [[NSScrollView alloc] initWithFrame:
-        NSMakeRect(leftMargin, y - listHeight, frame.size.width - 2 * leftMargin, listHeight)];
-    self.deckAppListScrollView.hasVerticalScroller = YES;
-    self.deckAppListScrollView.autohidesScrollers = YES;
-    self.deckAppListScrollView.borderType = NSBezelBorder;
-    self.deckAppListScrollView.drawsBackground = YES;
-    self.deckAppListScrollView.backgroundColor =
-        [NSColor colorWithCalibratedRed:0.12 green:0.12 blue:0.16 alpha:1.0];
-    [contentView addSubview:self.deckAppListScrollView];
-
-    [self rebuildDeckAppList];
-
-    // "Add App..." button.
-    y = self.deckAppListScrollView.frame.origin.y - 10;
-    NSButton* addAppButton = [[NSButton alloc] initWithFrame:
-        NSMakeRect(leftMargin, y - 28, 120, 28)];
-    addAppButton.title = @"Add App...";
-    addAppButton.bezelStyle = NSBezelStyleRounded;
-    [addAppButton setFont:[NSFont systemFontOfSize:12]];
-    addAppButton.target = self;
-    addAppButton.action = @selector(addDeckApp:);
-    [contentView addSubview:addAppButton];
+    [_ui updateState:state];
 }
 
-- (void)addLabel:(NSString*)text toView:(NSView*)view atX:(CGFloat)x y:(CGFloat)y width:(CGFloat)w {
-    NSTextField* label = [NSTextField labelWithString:text];
-    label.frame = NSMakeRect(x, y, w, 20);
-    label.alignment = NSTextAlignmentRight;
-    [label setFont:[NSFont systemFontOfSize:13]];
-    [view addSubview:label];
-}
-
-- (NSPopUpButton*)addPopUpButton:(NSView*)view atX:(CGFloat)x y:(CGFloat)y width:(CGFloat)w {
-    NSPopUpButton* popup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(x, y - 2, w, 26)
-                                                      pullsDown:NO];
-    [popup setFont:[NSFont systemFontOfSize:13]];
-    [view addSubview:popup];
-    return popup;
-}
-
-// ---------------------------------------------------------------------------
-// Deck Shortcuts: rebuild the scrollable list of configured apps.
-// ---------------------------------------------------------------------------
-- (void)rebuildDeckAppList {
-    CGFloat rowH = 28;
-    CGFloat listW = self.deckAppListScrollView.contentSize.width;
-    CGFloat totalH = MAX(rowH * (CGFloat)self.deckApps.count, self.deckAppListScrollView.contentSize.height);
-
-    self.deckAppListContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, listW, totalH)];
-    self.deckAppListContainer.wantsLayer = YES;
-
-    for (NSInteger i = 0; i < (NSInteger)self.deckApps.count; i++) {
-        NSDictionary* app = self.deckApps[i];
-        CGFloat ry = totalH - rowH * (i + 1);
-
-        // App icon (16x16).
-        NSString* appPath = app[@"path"];
-        NSImage* icon = nil;
-        if (appPath && [[NSFileManager defaultManager] fileExistsAtPath:appPath]) {
-            icon = [[NSWorkspace sharedWorkspace] iconForFile:appPath];
-        }
-        if (!icon) {
-            icon = [NSImage imageNamed:NSImageNameApplicationIcon];
-        }
-        NSImageView* iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(8, ry + 6, 16, 16)];
-        iconView.image = icon;
-        iconView.imageScaling = NSImageScaleProportionallyUpOrDown;
-        [self.deckAppListContainer addSubview:iconView];
-
-        // App name label.
-        NSTextField* nameLabel = [NSTextField labelWithString:app[@"label"] ?: @"Unknown"];
-        nameLabel.frame = NSMakeRect(32, ry + 4, listW - 80, 20);
-        nameLabel.font = [NSFont systemFontOfSize:12];
-        nameLabel.textColor = [NSColor secondaryLabelColor];
-        [self.deckAppListContainer addSubview:nameLabel];
-
-        // Remove (x) button.
-        NSButton* removeBtn = [[NSButton alloc] initWithFrame:NSMakeRect(listW - 36, ry + 2, 24, 24)];
-        removeBtn.bezelStyle = NSBezelStyleInline;
-        removeBtn.title = @"";
-        removeBtn.image = [NSImage imageWithSystemSymbolName:@"xmark.circle.fill"
-                                    accessibilityDescription:@"Remove"];
-        removeBtn.imagePosition = NSImageOnly;
-        removeBtn.bordered = NO;
-        removeBtn.tag = i;
-        removeBtn.target = self;
-        removeBtn.action = @selector(removeDeckApp:);
-        [self.deckAppListContainer addSubview:removeBtn];
+/// Publish the Wi-Fi tablets seen on the network. Main thread.
+- (void)rebuildWifiMenu {
+    if (!_ui) return;
+    NSMutableArray* list = [NSMutableArray array];
+    auto tablets = _wifiDiscovery ? _wifiDiscovery->tablets() : std::vector<droidscreen::WifiTablet>{};
+    for (const auto& tablet : tablets) {
+        bool current = _isStreaming && _streamingOverWifi && tablet.id == _activeWifiTabletId;
+        [list addObject:@{
+            @"id":         [NSString stringWithUTF8String:tablet.id.c_str()],
+            @"name":       [NSString stringWithUTF8String:tablet.service_name.c_str()],
+            @"paired":     @(stored_pairing_token(tablet.id) != nil),
+            @"compatible": @(tablet.protocol_version == DS_PROTOCOL_VERSION),
+            @"current":    @(current),
+        }];
     }
-
-    self.deckAppListScrollView.documentView = self.deckAppListContainer;
+    [_ui updateTablets:list];
 }
 
-// ---------------------------------------------------------------------------
-// Deck Shortcuts: "Add App..." opens an NSOpenPanel in /Applications.
-// ---------------------------------------------------------------------------
-- (void)addDeckApp:(id)sender {
-    NSOpenPanel* panel = [NSOpenPanel openPanel];
-    panel.title = @"Select Applications for Stream Deck";
-    panel.allowsMultipleSelection = YES;
-    panel.canChooseDirectories = NO;
-    panel.canChooseFiles = YES;
-    panel.directoryURL = [NSURL fileURLWithPath:@"/Applications"];
-    panel.allowedContentTypes = @[[UTType typeWithIdentifier:@"com.apple.application-bundle"]];
-    panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-
-    [panel beginSheetModalForWindow:self.settingsWindow completionHandler:^(NSModalResponse result) {
-        if (result != NSModalResponseOK) return;
-
-        for (NSURL* url in panel.URLs) {
-            NSString* appPath = url.path;
-            NSBundle* appBundle = [NSBundle bundleWithPath:appPath];
-            NSString* bundleId = appBundle.bundleIdentifier ?: @"";
-            NSString* appName = [[appPath lastPathComponent] stringByDeletingPathExtension];
-            NSString* tileId = [NSString stringWithFormat:@"app_%@",
-                [appName lowercaseString]];
-
-            // Avoid duplicates.
-            BOOL exists = NO;
-            for (NSDictionary* existing in self.deckApps) {
-                if ([existing[@"path"] isEqualToString:appPath]) {
-                    exists = YES;
-                    break;
-                }
-            }
-            if (exists) continue;
-
-            NSDictionary* entry = @{
-                @"id":        tileId,
-                @"label":     appName,
-                @"bundle_id": bundleId,
-                @"path":      appPath,
-            };
-            [self.deckApps addObject:entry];
-        }
-
-        // Persist and update UI.
-        [self saveDeckAppsAndRebuild];
-    }];
-}
-
-// ---------------------------------------------------------------------------
-// Deck Shortcuts: remove an app by index (button tag).
-// ---------------------------------------------------------------------------
-- (void)removeDeckApp:(id)sender {
-    NSInteger idx = [(NSButton*)sender tag];
-    if (idx >= 0 && idx < (NSInteger)self.deckApps.count) {
-        [self.deckApps removeObjectAtIndex:idx];
-        [self saveDeckAppsAndRebuild];
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Deck Shortcuts: persist to NSUserDefaults, rebuild UI, update deck layout.
-// ---------------------------------------------------------------------------
-- (void)saveDeckAppsAndRebuild {
-    [[NSUserDefaults standardUserDefaults] setObject:[self.deckApps copy]
-                                              forKey:kSettingDeckApps];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-
-    [self rebuildDeckAppList];
-    [self rebuildDeckLayout];
+- (void)loadDeckApps {
+    NSArray* saved = [[NSUserDefaults standardUserDefaults] arrayForKey:kSettingDeckApps];
+    self.deckApps = saved ? [saved mutableCopy] : [NSMutableArray new];
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,7 +1270,6 @@ static NSImage* CreateStatusBarIcon() {
     NSImage* icon = [[NSWorkspace sharedWorkspace] iconForFile:appPath];
     if (!icon) return @"";
 
-    // Resize to 64x64.
     NSSize targetSize = NSMakeSize(64, 64);
     NSImage* resized = [[NSImage alloc] initWithSize:targetSize];
     [resized lockFocus];
@@ -1532,7 +1280,6 @@ static NSImage* CreateStatusBarIcon() {
             fraction:1.0];
     [resized unlockFocus];
 
-    // Get PNG data.
     NSBitmapImageRep* rep = [[NSBitmapImageRep alloc]
         initWithData:[resized TIFFRepresentation]];
     NSData* pngData = [rep representationUsingType:NSBitmapImageFileTypePNG
@@ -1548,11 +1295,7 @@ static NSImage* CreateStatusBarIcon() {
 - (void)rebuildDeckLayout {
     if (!_deckManager) return;
 
-    // Load deck apps from defaults if not yet loaded.
-    if (!self.deckApps) {
-        NSArray* saved = [[NSUserDefaults standardUserDefaults] arrayForKey:kSettingDeckApps];
-        self.deckApps = saved ? [saved mutableCopy] : [NSMutableArray new];
-    }
+    if (!self.deckApps) [self loadDeckApps];
 
     droidscreen::DeckLayout layout;
     layout.grid_cols = 4;
@@ -1589,20 +1332,17 @@ static NSImage* CreateStatusBarIcon() {
         tile.col       = (int)(i % layout.grid_cols);
         tile.col_span  = 1;
 
-        // Extract app icon as base64 PNG for Android.
         NSString* iconB64 = [self extractIconBase64ForAppAtPath:app[@"path"]];
         tile.icon_b64 = [iconB64 UTF8String] ?: "";
 
         layout.tiles.push_back(std::move(tile));
     }
 
-    // Calculate grid rows needed.
     int appRows = (int)((self.deckApps.count + layout.grid_cols - 1) / layout.grid_cols);
     layout.grid_rows = 1 + (appRows > 1 ? appRows : 1);
 
     _deckManager->set_layout(layout);
 
-    // If streaming, push the updated config to Android.
     if (_isStreaming && _pipeline && _pipeline->is_running()) {
         _pipeline->send_deck_config();
         NSLog(@"[deck] Pushed updated deck config to Android (%lu app tiles)",
@@ -1610,66 +1350,40 @@ static NSImage* CreateStatusBarIcon() {
     }
 }
 
-// NSWindowDelegate: just hide the settings window rather than destroying it.
-- (void)windowWillClose:(NSNotification*)notification {
-    // Nothing special -- window is retained, will be shown again via makeKeyAndOrderFront.
+// DSUIHost ----------------------------------------------------------------
+
+- (void)uiToggleConnect {
+    [self toggleConnect:nil];
 }
 
-// -----------------------------------------------------------------------------
-#pragma mark - Settings Load / Save
-// -----------------------------------------------------------------------------
+- (void)uiConnectWifiTablet:(NSString*)tabletId {
+    if (!tabletId.length) return;
+    _wifiTargetId = tabletId.UTF8String;
+    _userDisconnected = NO;
+    [self updateConnectMenuTitle:@"Connecting..."];
+    dispatch_async(_streamQueue, ^{
+        if (self->_isStreaming) {
+            [self disconnectSync];
+        }
+        [self connectSync];
+        [self updateConnectMenuTitle:@""];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self rebuildWifiMenu]; });
+    });
+}
 
-- (void)applySettings:(id)sender {
+- (void)uiSettingsChanged:(BOOL)reconnect {
     NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
-
-    // FPS.
-    NSInteger fpsIdx = self.fpsPopup.indexOfSelectedItem;
-    NSInteger fps;
-    switch (fpsIdx) {
-        case 0: fps = 30; break;
-        case 2: fps = 120; break;
-        default: fps = 60; break;
-    }
-    [defaults setInteger:fps forKey:kSettingFPS];
-
-    // Minimum idle FPS.
-    NSInteger minFpsIdx = self.minFpsPopup.indexOfSelectedItem;
-    NSInteger minIdleFPS = 30;
-    if (minFpsIdx >= 0 && minFpsIdx < kMinIdleFPSCount) {
-        minIdleFPS = kMinIdleFPSOptions[minFpsIdx];
-    }
-    [defaults setInteger:minIdleFPS forKey:kSettingMinIdleFPS];
-
-    // Bitrate.
-    NSInteger brIdx = self.bitratePopup.indexOfSelectedItem;
-    if (brIdx >= 0 && brIdx < kBitrateCount) {
-        [defaults setInteger:kBitrates[brIdx] forKey:kSettingBitrate];
-    }
-
-    // Resolution.
-    [defaults setInteger:self.resolutionPopup.indexOfSelectedItem forKey:kSettingResolution];
-
-    // Retina (HiDPI).
-    [defaults setBool:(self.retinaCheckbox.state == NSControlStateValueOn) forKey:kSettingScale];
-
-    // Port.
-    NSInteger port = self.portField.integerValue;
-    if (port < 1 || port > 65535) port = 38271;
-    [defaults setInteger:port forKey:kSettingPort];
-
-    [defaults synchronize];
-
     NSLog(@"[Settings] Saved: fps=%ld min_idle_fps=%ld bitrate=%ld res=%ld retina=%d port=%ld",
-          (long)fps,
-          (long)minIdleFPS,
+          (long)[defaults integerForKey:kSettingFPS],
+          (long)[defaults integerForKey:kSettingMinIdleFPS],
           (long)[defaults integerForKey:kSettingBitrate],
           (long)[defaults integerForKey:kSettingResolution],
           (int)[defaults boolForKey:kSettingScale],
-          (long)port);
+          (long)[defaults integerForKey:kSettingPort]);
 
-    // If currently streaming, restart the pipeline with new settings.
-    if (_isStreaming) {
+    if (reconnect && _isStreaming) {
         NSLog(@"[Settings] Restarting pipeline with new settings...");
+        [self updateConnectMenuTitle:@"Connecting..."];
         dispatch_async(_streamQueue, ^{
             [self disconnectSync];
             // Wait for the Android side to finish cleaning up the old
@@ -1677,11 +1391,35 @@ static NSImage* CreateStatusBarIcon() {
             // fails because the old socket is still in TIME_WAIT.
             usleep(500000);  // 500ms
             [self connectSync];
+            [self updateConnectMenuTitle:@""];
         });
     }
-
-    [self.settingsWindow close];
 }
+
+- (void)uiDeckAppsChanged {
+    [self loadDeckApps];
+    [self rebuildDeckLayout];
+}
+
+- (void)uiForgetTablet:(NSString*)tabletId {
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary* pairings = [[defaults dictionaryForKey:kSettingWifiPairings] mutableCopy];
+    if (pairings[tabletId]) {
+        [pairings removeObjectForKey:tabletId];
+        [defaults setObject:pairings forKey:kSettingWifiPairings];
+        NSLog(@"[Wi-Fi] Forgot pairing with tablet %@", tabletId);
+    }
+    [self rebuildWifiMenu];
+}
+
+- (void)uiRunSpeedTest {
+    [self runSpeedTest:nil];
+}
+
+- (void)uiQuit {
+    [self quitApp:nil];
+}
+
 
 /// Perform a handshake with the given TCPClient (used by speed test).
 static bool speed_test_handshake(droidscreen::TCPClient* client) {
@@ -1713,11 +1451,6 @@ static bool speed_test_handshake(droidscreen::TCPClient* client) {
 }
 
 - (void)runSpeedTest:(id)sender {
-    // Show spinner, hide button.
-    self.autoDetectButton.hidden = YES;
-    self.speedTestSpinner.hidden = NO;
-    [self.speedTestSpinner startAnimation:nil];
-
     // If currently streaming, disconnect first (the speed test needs
     // its own TCP connection to the Android app).
     BOOL wasStreaming = _isStreaming;
@@ -1733,18 +1466,18 @@ static bool speed_test_handshake(droidscreen::TCPClient* client) {
             uint16_t port = (uint16_t)[[NSUserDefaults standardUserDefaults]
                                         integerForKey:kSettingPort];
 
-            // Set up ADB forward.
-            if (!adb_forward_setup(port)) {
-                NSLog(@"[SpeedTest] ADB forward failed");
+            StreamTarget target;
+            NSString* targetError = nil;
+            if (![self chooseTarget:&target error:&targetError]) {
+                NSLog(@"[SpeedTest] %@", targetError);
                 [self speedTestFinished:0 wasStreaming:wasStreaming];
                 return;
             }
 
-            // Connect TCP.
-            auto client = std::make_unique<droidscreen::TCPClient>();
-            if (!client->connect(port)) {
-                NSLog(@"[SpeedTest] TCP connect failed");
-                adb_forward_remove(port);
+            std::unique_ptr<droidscreen::TCPClient> client;
+            NSString* openError = nil;
+            if (![self openTransport:target port:port client:client error:&openError]) {
+                NSLog(@"[SpeedTest] %@", openError);
                 [self speedTestFinished:0 wasStreaming:wasStreaming];
                 return;
             }
@@ -1753,7 +1486,7 @@ static bool speed_test_handshake(droidscreen::TCPClient* client) {
             if (!speed_test_handshake(client.get())) {
                 NSLog(@"[SpeedTest] Handshake failed");
                 client->close();
-                adb_forward_remove(port);
+                if (!target.wifi) adb_forward_remove(port);
                 [self speedTestFinished:0 wasStreaming:wasStreaming];
                 return;
             }
@@ -1763,7 +1496,7 @@ static bool speed_test_handshake(droidscreen::TCPClient* client) {
 
             // Disconnect and clean up.
             client->close();
-            adb_forward_remove(port);
+            if (!target.wifi) adb_forward_remove(port);
 
             [self speedTestFinished:throughput_kbps wasStreaming:wasStreaming];
         }
@@ -1786,39 +1519,15 @@ static bool speed_test_handshake(droidscreen::TCPClient* client) {
     NSLog(@"[SpeedTest] throughput=%u kbps, target=%u kbps, selected=%d kbps",
           throughput_kbps, target_kbps, kBitrates[bestIdx]);
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // Stop spinner, show button.
-        [self.speedTestSpinner stopAnimation:nil];
-        self.speedTestSpinner.hidden = YES;
-        self.autoDetectButton.hidden = NO;
-
-        if (throughput_kbps == 0) {
-            self.autoDetectButton.title = @"Failed";
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
-                           dispatch_get_main_queue(), ^{
-                self.autoDetectButton.title = @"Auto";
-            });
-            return;
-        }
-
-        // Show result briefly.
-        NSString* resultStr = [NSString stringWithFormat:@"%.0f Mbps",
-                               throughput_kbps / 1000.0];
-        self.autoDetectButton.title = resultStr;
-
-        // Update the bitrate popup and save to defaults.
-        [self.bitratePopup selectItemAtIndex:bestIdx];
+    if (throughput_kbps > 0) {
         [[NSUserDefaults standardUserDefaults] setInteger:kBitrates[bestIdx]
                                                    forKey:kSettingBitrate];
-
-        NSLog(@"[SpeedTest] Set bitrate to %d kbps (USB throughput: %u kbps)",
+        NSLog(@"[SpeedTest] Set bitrate to %d kbps (throughput: %u kbps)",
               kBitrates[bestIdx], throughput_kbps);
-
-        // Reset button title after 3 seconds.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
-                       dispatch_get_main_queue(), ^{
-            self.autoDetectButton.title = @"Auto";
-        });
+    }
+    NSInteger selected = throughput_kbps > 0 ? kBitrates[bestIdx] : 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_ui speedTestFinishedWithThroughput:throughput_kbps selectedKbps:selected];
     });
 
     // If we were streaming before the test, reconnect.
@@ -1862,6 +1571,45 @@ struct StreamSettings {
     // at 2× density so text and UI look much sharper.
     s.hidpi = [defaults boolForKey:kSettingScale];
 
+    return s;
+}
+
+/// Global settings overlaid with what the user chose for this tablet.
+/// Command-line overrides (-DroidScreenFPS 60, ...) still win, for tests.
+- (StreamSettings)settingsForDeviceKey:(NSString*)key name:(NSString*)name {
+    StreamSettings s = [self currentSettings];
+    if (!key.length) return s;
+
+    NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary* all = [[defaults dictionaryForKey:kSettingDeviceSettings] mutableCopy]
+        ?: [NSMutableDictionary dictionary];
+    NSMutableDictionary* dev = [all[key] mutableCopy] ?: [NSMutableDictionary dictionary];
+
+    // Remember the name so the settings window can list it while offline.
+    if (name.length && ![dev[@"name"] isEqual:name]) {
+        dev[@"name"] = name;
+        all[key] = dev;
+        [defaults setObject:all forKey:kSettingDeviceSettings];
+    }
+
+    NSDictionary* args = [defaults volatileDomainForName:NSArgumentDomain];
+    auto pick = ^BOOL(NSString* devKey, NSString* globalKey) {
+        return dev[devKey] != nil && args[globalKey] == nil;
+    };
+    if (pick(@"fps", kSettingFPS)) s.fps = [dev[@"fps"] unsignedIntValue];
+    if (pick(@"min_idle_fps", kSettingMinIdleFPS))
+        s.min_idle_fps = sanitize_min_idle_fps([dev[@"min_idle_fps"] unsignedIntValue]);
+    if (pick(@"bitrate", kSettingBitrate)) s.bitrate_kbps = [dev[@"bitrate"] unsignedIntValue];
+    if (pick(@"resolution", kSettingResolution)) {
+        NSInteger idx = [dev[@"resolution"] integerValue];
+        if (idx >= 0 && idx < kResolutionCount) {
+            s.width = kResolutions[idx].width;
+            s.height = kResolutions[idx].height;
+        }
+    }
+    if (pick(@"hidpi", kSettingScale)) s.hidpi = [dev[@"hidpi"] boolValue];
+    if (s.fps != 30 && s.fps != 60 && s.fps != 120) s.fps = 60;
+    if (s.bitrate_kbps < 1000) s.bitrate_kbps = 15000;
     return s;
 }
 
@@ -1982,26 +1730,7 @@ struct StreamSettings {
 // -----------------------------------------------------------------------------
 
 - (void)showSettings:(id)sender {
-    NSLog(@"[DEBUG] showSettings: called");
-
-    // Always rebuild the settings window to avoid dangling pointer issues.
-    // When a virtual display is destroyed/recreated, any window that was
-    // on it can become invalidated — even if the pointer is non-nil.
-    [self buildSettingsWindow];
-
-    // Ensure the settings window appears on the main (built-in) display.
-    NSScreen* mainScreen = [NSScreen mainScreen];
-    if (mainScreen) {
-        NSRect screenFrame = mainScreen.visibleFrame;
-        NSRect windowFrame = self.settingsWindow.frame;
-        CGFloat x = NSMidX(screenFrame) - windowFrame.size.width / 2;
-        CGFloat y = NSMidY(screenFrame) - windowFrame.size.height / 2;
-        [self.settingsWindow setFrameOrigin:NSMakePoint(x, y)];
-    }
-
-    [self.settingsWindow makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
-    NSLog(@"[DEBUG] showSettings: done");
+    [_ui showSettings];
 }
 
 - (void)toggleConnect:(id)sender {
@@ -2011,23 +1740,17 @@ struct StreamSettings {
         // re-plugged or user clicks Connect again.
         _userDisconnected = YES;
         [self updateConnectMenuTitle:@"Disconnecting..."];
-        self.connectMenuItem.enabled = NO;
         dispatch_async(_streamQueue, ^{
             [self disconnectSync];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self.connectMenuItem.enabled = YES;
-            });
+            [self updateConnectMenuTitle:@""];
         });
     } else {
         // User manually connecting — clear the suppression flag.
         _userDisconnected = NO;
         [self updateConnectMenuTitle:@"Connecting..."];
-        self.connectMenuItem.enabled = NO;
         dispatch_async(_streamQueue, ^{
             [self connectSync];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self.connectMenuItem.enabled = YES;
-            });
+            [self updateConnectMenuTitle:@""];
         });
     }
 }
@@ -2077,20 +1800,61 @@ struct StreamSettings {
               settings.bitrate_kbps, settings.port,
               settings.hidpi ? "YES" : "NO");
 
-        [self updateStatusText:@"Status: Setting up ADB..."];
-
-        // 1. ADB forward.
-        if (!adb_forward_setup(settings.port)) {
-            [self updateStatusText:@"Status: ADB forward failed"];
+        // 1. Pick the tablet and open the connection (adb tunnel or Wi-Fi).
+        //    Done before creating the virtual display so a Wi-Fi approval
+        //    prompt on the tablet doesn't leave an empty display around.
+        StreamTarget target;
+        NSString* targetError = nil;
+        if (![self chooseTarget:&target error:&targetError]) {
+            NSLog(@"[Stream] %@", targetError);
+            [self updateStatusText:[@"Status: " stringByAppendingString:targetError]];
             [self updateConnectMenuTitle:@"Connect"];
             _isBusy = NO;
             return;
         }
+        NSString* openError = nil;
+        if (![self openTransport:target port:settings.port client:_client error:&openError]) {
+            NSLog(@"[Stream] %@", openError);
+            [self updateStatusText:[@"Status: " stringByAppendingString:openError]];
+            [self updateConnectMenuTitle:@"Connect"];
+            _client.reset();
+            _isBusy = NO;
+            return;
+        }
+        _streamingOverWifi = target.wifi;
+        _activeWifiTabletId = target.wifi ? target.tablet.id : std::string();
+        {
+            NSString* name = target.wifi
+                ? [NSString stringWithUTF8String:target.tablet.service_name.c_str()]
+                : adb_device_name();
+            NSString* serial = target.wifi ? nil : adb_device_serial();
+            NSString* deviceKey = target.wifi
+                ? [NSString stringWithUTF8String:target.tablet.id.c_str()]
+                : (serial ? [@"usb:" stringByAppendingString:serial] : nil);
+            NSString* address = target.wifi ? peer_address((int)_client->fd()) : nil;
 
-        // 1b. Detect Android device's native resolution (landscape).
-        //     Used to cap the capture resolution so we never stream
-        //     more pixels than the tablet can display.
-        CGSize deviceRes = adb_device_resolution();
+            // Per-tablet settings (port stays global: it was needed to connect).
+            uint16_t port = settings.port;
+            settings = [self settingsForDeviceKey:deviceKey name:name];
+            settings.port = port;
+            NSLog(@"[Stream] Settings for %@ (%@): %ux%u@%ufps, min_idle=%ufps, %u kbps, hidpi=%s",
+                  name, deviceKey ?: @"no key", settings.width, settings.height, settings.fps,
+                  settings.min_idle_fps, settings.bitrate_kbps, settings.hidpi ? "YES" : "NO");
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_activeTabletName = name;
+                self->_activeAddress = address;
+                self->_activeDeviceKey = deviceKey;
+                [self pushUIState];
+            });
+        }
+
+        // 1b. The tablet's native resolution (landscape) caps the capture
+        //     resolution so we never stream more pixels than it can display.
+        //     Wi-Fi tablets publish it in their Bonjour record.
+        CGSize deviceRes = target.wifi
+            ? CGSizeMake(target.tablet.width, target.tablet.height)
+            : adb_device_resolution();
         uint32_t device_w = (uint32_t)deviceRes.width;
         uint32_t device_h = (uint32_t)deviceRes.height;
         if (device_w == 0 || device_h == 0) {
@@ -2113,7 +1877,7 @@ struct StreamSettings {
             NSLog(@"[Stream] Virtual display creation failed");
             [self updateStatusText:@"Status: Virtual display failed"];
             [self updateConnectMenuTitle:@"Connect"];
-            adb_forward_remove(settings.port);
+            [self closeTransportForPort:settings.port];
             _virtualDisplay.reset();
             _isBusy = NO;
             return;
@@ -2160,7 +1924,7 @@ struct StreamSettings {
             _virtualDisplay->destroy();
             _virtualDisplay.reset();
             _capturer.reset();
-            adb_forward_remove(settings.port);
+            [self closeTransportForPort:settings.port];
             _isBusy = NO;
             return;
         }
@@ -2168,26 +1932,11 @@ struct StreamSettings {
         _streamWidth  = _capturer->width();
         _streamHeight = _capturer->height();
         _streamFPS    = settings.fps;
+        _activeHiDPI  = settings.hidpi;
 
         NSLog(@"[Stream] Capture resolution: %ux%u", _streamWidth, _streamHeight);
 
-        // 4. Connect TCP.
-        [self updateStatusText:@"Status: Connecting to device..."];
-        _client = std::make_unique<droidscreen::TCPClient>();
-
-        if (!_client->connect(settings.port)) {
-            NSLog(@"[Stream] TCP connect failed");
-            [self updateStatusText:@"Status: Connection failed (is Android app running?)"];
-            [self updateConnectMenuTitle:@"Connect"];
-            [self stopValidationScene];
-            _virtualDisplay->destroy();
-            _virtualDisplay.reset();
-            _capturer.reset();
-            _client.reset();
-            adb_forward_remove(settings.port);
-            _isBusy = NO;
-            return;
-        }
+        // 4. TCP connection was opened in step 1.
 
         // 5. Create encoder, touch/mouse injector, deck manager, pipeline.
         _encoder = std::make_unique<droidscreen::VTEncoder>();
@@ -2343,15 +2092,23 @@ struct StreamSettings {
             _virtualDisplay->destroy();
             _virtualDisplay.reset();
             _capturer.reset();
-            adb_forward_remove(settings.port);
+            [self closeTransportForPort:settings.port];
             _isBusy = NO;
             return;
         }
 
         // Success.
         _isStreaming = YES;
-        NSString* statusStr = [NSString stringWithFormat:@"Status: Streaming %ux%u@%ufps",
-                               _streamWidth, _streamHeight, _streamFPS];
+        {
+            NSString* codec = codec_name(_pipeline->accepted_codec());
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_activeCodec = codec;
+                [self rebuildWifiMenu];
+            });
+        }
+        NSString* statusStr = [NSString stringWithFormat:@"Status: Streaming %ux%u@%ufps (%@)",
+                               _streamWidth, _streamHeight, _streamFPS,
+                               _streamingOverWifi ? @"Wi-Fi" : @"USB"];
         [self updateStatusText:statusStr];
         [self updateConnectMenuTitle:@"Disconnect"];
 
@@ -2394,9 +2151,25 @@ struct StreamSettings {
 
         uint16_t port = (uint16_t)[[NSUserDefaults standardUserDefaults] integerForKey:kSettingPort];
 
-        if (_pipeline) {
-            _pipeline->stop();
-            _pipeline.reset();
+        // The deck-state queue and the stats timer (main thread) use _pipeline
+        // without locks, and a deck push can be mid-flight (the Now Playing
+        // query is slow) when the connection drops. Detach the pipeline from
+        // both before destroying it, or they touch a freed object.
+        __block droidscreen::Pipeline* detached = nullptr;
+        dispatch_sync(_deckStateQueue, ^{
+            detached = self->_pipeline.release();
+        });
+        if (NSThread.isMainThread) {
+            [self stopStatsTimer];
+        } else {
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                [self stopStatsTimer];
+            });
+        }
+        std::unique_ptr<droidscreen::Pipeline> pipeline(detached);
+        if (pipeline) {
+            pipeline->stop();
+            pipeline.reset();
         }
         if (_encoder) {
             _encoder.reset();
@@ -2423,14 +2196,182 @@ struct StreamSettings {
             _virtualDisplay.reset();
         }
 
-        adb_forward_remove(port);
+        [self closeTransportForPort:port];
 
         _isStreaming = NO;
         [self updateStatusText:@"Status: Disconnected"];
         [self updateConnectMenuTitle:@"Connect"];
+        dispatch_async(dispatch_get_main_queue(), ^{ [self rebuildWifiMenu]; });
 
         NSLog(@"[Stream] Disconnected");
     }
+}
+
+// -----------------------------------------------------------------------------
+#pragma mark - Transport selection (USB / Wi-Fi)
+// -----------------------------------------------------------------------------
+
+/// Decide where to stream. Order: tablet picked in the menu, then a USB
+/// device, then any Wi-Fi tablet this Mac is already paired with.
+- (BOOL)chooseTarget:(StreamTarget*)target error:(NSString**)error {
+    if (!_wifiTargetId.empty()) {
+        droidscreen::WifiTablet tablet;
+        if (_wifiDiscovery && _wifiDiscovery->find(_wifiTargetId, &tablet)) {
+            target->wifi = true;
+            target->tablet = tablet;
+            return YES;
+        }
+        // The tablet picked in the menu left the network: back to automatic.
+        _wifiTargetId.clear();
+    }
+    if (!g_cliForceWifi && adb_device_connected()) {
+        target->wifi = false;
+        return YES;
+    }
+    if (_wifiDiscovery) {
+        for (const auto& tablet : _wifiDiscovery->tablets()) {
+            if (wifi_tablet_eligible(tablet)) {
+                target->wifi = true;
+                target->tablet = tablet;
+                return YES;
+            }
+        }
+    }
+    *error = @"No tablet found (USB or paired Wi-Fi)";
+    return NO;
+}
+
+/// Open a protocol-ready connection to the target. Over Wi-Fi this includes
+/// the hello exchange, which may wait for the user to approve on the tablet.
+- (BOOL)openTransport:(const StreamTarget&)target
+                 port:(uint16_t)port
+               client:(std::unique_ptr<droidscreen::TCPClient>&)client
+                error:(NSString**)error {
+    client = std::make_unique<droidscreen::TCPClient>();
+
+    if (!target.wifi) {
+        [self updateStatusText:@"Status: Setting up ADB..."];
+        if (!adb_forward_setup(port)) {
+            *error = @"ADB forward failed";
+            return NO;
+        }
+        [self updateStatusText:@"Status: Connecting to device..."];
+        if (!client->connect(port)) {
+            adb_forward_remove(port);
+            *error = @"Connection failed (is Android app running?)";
+            return NO;
+        }
+        return YES;
+    }
+
+    const auto& tablet = target.tablet;
+    if (tablet.protocol_version != DS_PROTOCOL_VERSION) {
+        *error = [NSString stringWithFormat:@"Update DroidScreen on %s (protocol v%u, need v%u)",
+                  tablet.service_name.c_str(), tablet.protocol_version, DS_PROTOCOL_VERSION];
+        return NO;
+    }
+    [self updateStatusText:[NSString stringWithFormat:@"Status: Connecting to %s over Wi-Fi...",
+                            tablet.service_name.c_str()]];
+    if (!client->connect(tablet.host.c_str(), tablet.port, 3000)) {
+        *error = [NSString stringWithFormat:@"Could not reach %s over Wi-Fi",
+                  tablet.service_name.c_str()];
+        return NO;
+    }
+
+    uint8_t my_id[DS_HELLO_ID_SIZE];
+    desktop_id(my_id);
+    uint8_t token[DS_HELLO_TOKEN_SIZE] = {0};
+    NSString* stored = stored_pairing_token(tablet.id);
+    bool paired = stored && bytes_from_hex(stored, token, DS_HELLO_TOKEN_SIZE);
+    if (!paired) {
+        [self updateStatusText:[NSString stringWithFormat:@"Status: Tap \"Allow\" on %s...",
+                                tablet.service_name.c_str()]];
+    }
+
+    auto result = droidscreen::perform_hello(client.get(), my_id, token,
+                                             desktop_display_name().UTF8String);
+    if (result == droidscreen::HelloResult::Rejected && paired) {
+        // The tablet no longer trusts us (user denied, or it forgot the
+        // pairing). Drop the stale token so auto-connect stops retrying.
+        NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+        NSMutableDictionary* pairings =
+            [([defaults dictionaryForKey:kSettingWifiPairings] ?: @{}) mutableCopy];
+        [pairings removeObjectForKey:[NSString stringWithUTF8String:tablet.id.c_str()]];
+        [defaults setObject:pairings forKey:kSettingWifiPairings];
+    }
+    if (result != droidscreen::HelloResult::Accepted) {
+        client->close();
+        *error = result == droidscreen::HelloResult::Rejected
+            ? [NSString stringWithFormat:@"%s did not allow this Mac", tablet.service_name.c_str()]
+            : [NSString stringWithFormat:@"Wi-Fi pairing with %s failed", tablet.service_name.c_str()];
+        return NO;
+    }
+    store_pairing_token(tablet.id, hex_from_bytes(token, DS_HELLO_TOKEN_SIZE));
+    return YES;
+}
+
+- (void)closeTransportForPort:(uint16_t)port {
+    if (_client) {
+        _client->close();
+        _client.reset();
+    }
+    if (!_streamingOverWifi) {
+        adb_forward_remove(port);
+    }
+    _streamingOverWifi = NO;
+    _activeWifiTabletId.clear();
+}
+
+// -----------------------------------------------------------------------------
+#pragma mark - Wi-Fi discovery and menu
+// -----------------------------------------------------------------------------
+
+- (void)startWifiDiscovery {
+    _wifiDiscovery = std::make_unique<droidscreen::WifiDiscovery>();
+    __weak AppDelegate* weakSelf = self;
+    if (!_wifiDiscovery->start([weakSelf]() {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf rebuildWifiMenu];
+            [strongSelf wifiTabletsChanged];
+        })) {
+        NSLog(@"[Wi-Fi] Bonjour browsing unavailable");
+    }
+}
+
+/// Runs on the main queue whenever tablets appear or disappear.
+- (void)wifiTabletsChanged {
+    if (!_wifiDiscovery) return;
+    bool any_paired = false;
+    for (const auto& tablet : _wifiDiscovery->tablets()) {
+        if (stored_pairing_token(tablet.id)) any_paired = true;
+    }
+    // The paired tablet left the network (app closed, tablet asleep): like
+    // unplugging the cable, re-arm auto-connect for when it comes back.
+    if (!any_paired && !_isStreaming) {
+        _userDisconnected = NO;
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [self autoConnectWifiIfPaired];
+    });
+}
+
+/// Auto-connect to a paired Wi-Fi tablet when nothing is streaming and no
+/// USB device is attached (USB keeps priority). Call off the main thread.
+- (void)autoConnectWifiIfPaired {
+    if (_isStreaming || _isBusy || _userDisconnected || !_wifiDiscovery) return;
+    if (!g_cliForceWifi && adb_device_connected()) return;
+    bool candidate = false;
+    for (const auto& tablet : _wifiDiscovery->tablets()) {
+        if (wifi_tablet_eligible(tablet)) candidate = true;
+    }
+    if (!candidate) return;
+    NSLog(@"[AutoConnect] Paired Wi-Fi tablet available, connecting...");
+    dispatch_async(_streamQueue, ^{
+        if (!self->_isStreaming) {
+            [self connectSync];
+        }
+    });
 }
 
 // -----------------------------------------------------------------------------
@@ -2550,7 +2491,8 @@ struct StreamSettings {
     _lastStatsDropped = 0;
     _lastStatsBytes = 0;
     _lastStatsTime = CFAbsoluteTimeGetCurrent();
-    _statsTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+    _statsTick = 0;
+    _statsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                                    target:self
                                                  selector:@selector(statsTimerFired:)
                                                  userInfo:nil
@@ -2585,13 +2527,34 @@ struct StreamSettings {
         uint64_t drop = pl->frames_dropped();
         uint64_t byt = pl->bytes_sent();
         int64_t rtt = pl->last_rtt_us();
+        uint64_t encSum = pl->encode_us_sum();
+        uint64_t encN = pl->encode_samples();
+        double encMs = (encN > _lastStatsEncN)
+            ? (double)(encSum - _lastStatsEncSum) / (double)(encN - _lastStatsEncN) / 1000.0
+            : 0.0;
+        _lastStatsEncSum = encSum;
+        _lastStatsEncN = encN;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         double elapsed = now - _lastStatsTime;
         double capFps = elapsed > 0 ? (cap - _lastStatsCaptured) / elapsed : 0.0;
         double encFps = elapsed > 0 ? (enc - _lastStatsEncoded) / elapsed : 0.0;
         double mbps = elapsed > 0 ? ((byt - _lastStatsBytes) * 8.0 / elapsed / 1000000.0) : 0.0;
 
-        NSLog(@"[Stats] captured=%llu encoded=%llu dropped=%llu bytes=%llu rtt=%lld us cap_fps=%.1f enc_fps=%.1f mbps=%.1f cap_q=%zu send_q=%zu",
+        // Interface: estimated Mac-to-tablet latency = capture-to-send on
+        // this side plus half the measured round trip.
+        double rttMs = rtt > 0 ? rtt / 1000.0 : 0.0;
+        double c2sMs = pl->last_capture_to_send_us() > 0 ? pl->last_capture_to_send_us() / 1000.0 : encMs;
+        NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+        [_ui updateStats:@{
+            @"latencyMs": @(c2sMs + rttMs / 2.0),
+            @"fps":       @(encFps),
+            @"targetFps": @(_streamFPS),
+            @"mbps":      @(mbps),
+            @"capMbps":   @([defaults integerForKey:kSettingBitrate] / 1000.0),
+        }];
+
+        if ((_statsTick++ % 2) == 0)
+        NSLog(@"[Stats] captured=%llu encoded=%llu dropped=%llu bytes=%llu rtt=%lld us cap_fps=%.1f enc_fps=%.1f mbps=%.1f cap_q=%zu send_q=%zu enc_ms=%.2f",
               (unsigned long long)cap,
               (unsigned long long)enc,
               (unsigned long long)drop,
@@ -2601,7 +2564,8 @@ struct StreamSettings {
               encFps,
               mbps,
               pl->capture_queue_depth(),
-              pl->send_queue_depth());
+              pl->send_queue_depth(),
+              encMs);
 
         _lastStatsCaptured = cap;
         _lastStatsEncoded = enc;
@@ -2633,9 +2597,30 @@ struct StreamSettings {
 - (void)deviceTimerFired:(NSTimer*)timer {
     // Run device check off the main thread.
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if (g_cliForceWifi) {
+            [self autoConnectWifiIfPaired];
+            return;
+        }
         BOOL connected = adb_device_connected();
+        if (connected != self->_usbDevicePresent) {
+            NSString* serial = connected ? adb_device_serial() : nil;
+            NSString* name = connected ? adb_device_name() : nil;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_usbDevicePresent = connected;
+                self->_usbDeviceKey = serial ? [@"usb:" stringByAppendingString:serial] : nil;
+                self->_usbDeviceName = name;
+                [self pushUIState];
+            });
+        }
 
         if (!connected) {
+            // Wi-Fi streams don't depend on the cable; only offer Wi-Fi auto-connect.
+            if (self->_isStreaming && self->_streamingOverWifi) return;
+            if (!self->_isStreaming) {
+                [self autoConnectWifiIfPaired];
+                return;
+            }
+
             // Device physically removed — reset the user-disconnect flag so
             // auto-connect kicks in when the device is plugged back in.
             self->_userDisconnected = NO;
@@ -2674,6 +2659,16 @@ int main(int argc, const char* argv[]) {
         if (argc >= 3 && strcmp(argv[1], "--validation-scene-helper") == 0) {
             uint32_t displayID = (uint32_t)strtoul(argv[2], nullptr, 10);
             return run_validation_scene_helper(displayID);
+        }
+        for (int i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "--wifi") == 0) {
+                g_cliForceWifi = true;
+                // Optional value; anything starting with '-' is another flag
+                // (including NSUserDefaults overrides like -DroidScreenFPS).
+                if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    g_cliWifiMatch = argv[++i];
+                }
+            }
         }
 
         // ── Single-instance guard ──────────────────────────────────────────────

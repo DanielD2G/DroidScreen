@@ -22,10 +22,13 @@
 #include <deque>
 #include <vector>
 
+#include <memory>
+
 #include "droidscreen/capturer.h"
 #include "droidscreen/deck_manager.h"
 #include "droidscreen/encoder.h"
 #include "droidscreen/mouse_injector.h"
+#include "droidscreen/rate_controller.h"
 #include "droidscreen/server.h"
 #include "droidscreen/touch_injector.h"
 
@@ -77,7 +80,12 @@ public:
     uint64_t frames_idle_resent() const { return frames_idle_resent_.load(); }
     uint64_t bytes_sent() const { return bytes_sent_.load(); }
     int64_t last_rtt_us() const { return last_rtt_us_.load(); }
+    /// Codec the tablet accepted during the handshake.
+    ds_codec_t accepted_codec() const { return accepted_codec_; }
     int64_t last_encode_us() const { return last_encode_us_.load(); }
+    /// Sum of VT submit-to-output times and the number of samples, for averaging.
+    uint64_t encode_us_sum() const { return encode_us_sum_.load(); }
+    uint64_t encode_samples() const { return encode_samples_.load(); }
     int64_t last_send_us() const { return last_send_us_.load(); }
     int64_t last_capture_to_send_us() const { return last_capture_to_send_us_.load(); }
     size_t capture_queue_depth() const;
@@ -104,6 +112,11 @@ private:
     // Thread: send periodic pings for RTT measurement.
     void ping_loop();
 
+    // Thread: detect a stalled connection (no send progress) and fail fast so
+    // the owner can reconnect. Reads atomics only -- never takes write_mutex_,
+    // so it stays alive even when the send thread is blocked on a stuck write.
+    void watchdog_loop();
+
     // Handle an incoming control message.
     void handle_control(const uint8_t* data, size_t len);
 
@@ -120,6 +133,10 @@ private:
     TouchInjector* touch_;
     MouseInjector* mouse_;
     DeckManager*   deck_;
+
+    // Adaptive bitrate: backs off encoder bitrate under send-queue congestion,
+    // ramps back toward the user-configured ceiling when the link is clear.
+    std::unique_ptr<RateController> rate_controller_;
 
     // --- Capture queue: newest-frame-wins (not FIFO) ---
     // Only holds the most recent frame; stale frames are dropped.
@@ -157,6 +174,7 @@ private:
     std::thread send_thread_;
     std::thread recv_thread_;
     std::thread ping_thread_;
+    std::thread watchdog_thread_;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> capturer_restarting_{false};
@@ -168,6 +186,8 @@ private:
     std::atomic<uint64_t> bytes_sent_{0};
     std::atomic<int64_t>  last_rtt_us_{0};
     std::atomic<int64_t>  last_encode_us_{0};
+    std::atomic<uint64_t> encode_us_sum_{0};
+    std::atomic<uint64_t> encode_samples_{0};
     std::atomic<int64_t>  last_send_us_{0};
     std::atomic<int64_t>  last_capture_to_send_us_{0};
     std::atomic<int64_t>  last_capture_callback_us_{0};
@@ -191,6 +211,17 @@ private:
 
     // Timestamp of last ping sent, for RTT calculation.
     std::atomic<int64_t> ping_sent_us_{0};
+
+    // Liveness watchdog: timestamp of the last successful socket activity
+    // (video/control byte sent, or message received). If this stops advancing
+    // while running, the connection is stalled and the pipeline fails fast.
+    // Idle re-encode keeps sending frames even on a static screen, so a lack of
+    // progress reliably means a dead link rather than legitimate idleness.
+    std::atomic<int64_t> last_send_activity_us_{0};
+    // Must exceed the worst-case legitimate burst stall (see kSendTimeoutMs in
+    // server.cpp). Heavy-motion bursts can freeze send progress for a few
+    // seconds and recover; only a genuinely dead link stays stuck for 12 s+.
+    static constexpr int64_t kStallTimeoutUs = 12000000;  // 12 s
 
     // RTT tracking (replaces RateController for stats-only use).
     static constexpr size_t kRttWindowSize = 10;

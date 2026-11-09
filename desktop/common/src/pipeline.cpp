@@ -17,6 +17,7 @@
 
 #include "droidscreen/pipeline.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -233,6 +234,16 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   quality_window_motion_sum_ = 0.0;
 
   max_idle_interval_us_ = idle_interval_us_for_fps(min_idle_fps);
+
+  // Adaptive bitrate: the configured bitrate is the ceiling ("tope"); back off
+  // under sustained send-queue congestion, ramp back up when the link is clear.
+  // The floor stays low (<= 8 Mbps) even with a high cap, so a congested
+  // Wi-Fi link can actually back off.
+  rate_controller_ = std::make_unique<RateController>(
+      encoder_, bitrate_kbps,
+      /*min_kbps=*/std::max(4000u, std::min(bitrate_kbps / 4, 8000u)),
+      /*max_kbps=*/bitrate_kbps);
+
   running_.store(true);
   frames_encoded_.store(0);
   frames_captured_.store(0);
@@ -244,6 +255,7 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   last_send_us_.store(0);
   last_capture_to_send_us_.store(0);
   last_capture_callback_us_.store(now_us());
+  last_send_activity_us_.store(now_us());
   next_video_sequence_.store(1);
   capturer_restarting_.store(false);
 
@@ -298,6 +310,7 @@ bool Pipeline::start(uint32_t width, uint32_t height, uint32_t fps,
   send_thread_ = std::thread(&Pipeline::send_loop, this);
   recv_thread_ = std::thread(&Pipeline::recv_loop, this);
   ping_thread_ = std::thread(&Pipeline::ping_loop, this);
+  watchdog_thread_ = std::thread(&Pipeline::watchdog_loop, this);
 
   // Send initial deck configuration to Android if a DeckManager is set.
   if (deck_) {
@@ -316,7 +329,7 @@ void Pipeline::stop() {
   }
   const bool had_threads = encode_thread_.joinable() || send_thread_.joinable() ||
                            recv_thread_.joinable() || ping_thread_.joinable() ||
-                           had_restart_thread;
+                           watchdog_thread_.joinable() || had_restart_thread;
   bool was_running = running_.exchange(false);
 
   // Always join threads if they are joinable, even if running_ was
@@ -357,6 +370,8 @@ void Pipeline::stop() {
     recv_thread_.join();
   if (ping_thread_.joinable())
     ping_thread_.join();
+  if (watchdog_thread_.joinable())
+    watchdog_thread_.join();
 
   {
     std::lock_guard<std::mutex> lock(capturer_restart_thread_mutex_);
@@ -387,6 +402,7 @@ void Pipeline::stop() {
   touch_->shutdown();
   mouse_->shutdown();
   capture_callback_ = nullptr;
+  rate_controller_.reset();
 
   fprintf(stderr,
           "[pipeline] stopped (encoded %llu frames, idle_resent %llu, "
@@ -420,6 +436,10 @@ void Pipeline::encode_loop() {
                           bool is_idle, float motion_score) {
     int64_t t_enc_end = now_us();
     last_encode_us_.store(t_enc_end - t_enc_start);
+    if (!pkt.is_config) {
+      encode_us_sum_.fetch_add(static_cast<uint64_t>(t_enc_end - t_enc_start));
+      encode_samples_.fetch_add(1);
+    }
 
     uint8_t flags = 0;
     if (pkt.is_keyframe)
@@ -585,6 +605,7 @@ void Pipeline::send_loop() {
         int64_t t_send_end = now_us();
         last_send_us_.store(t_send_end - t_send_start);
         bytes_sent_.fetch_add(DS_HEADER_SIZE + wire_payload.size());
+        last_send_activity_us_.store(t_send_end);
 
         if (!pkt.is_idle && (pkt.flags & DS_FLAG_CONFIG) == 0) {
           if (quality_window_start_us_ == 0) {
@@ -668,6 +689,9 @@ void Pipeline::recv_loop() {
       running_.store(false);
       break;
     }
+
+    // Inbound traffic proves the link is alive -- feed the watchdog.
+    last_send_activity_us_.store(now_us());
 
     // Read the payload if any.
     std::vector<uint8_t> payload;
@@ -784,6 +808,42 @@ void Pipeline::ping_loop() {
   }
 
   fprintf(stderr, "[ping] thread exiting\n");
+}
+
+// --------------------------------------------------------------------------
+// Watchdog thread
+// Detects a stalled connection and fails the pipeline so the owner (stats
+// timer -> disconnect -> auto-reconnect) recovers within seconds instead of
+// freezing indefinitely. Reads atomics only; never takes write_mutex_, so it
+// keeps ticking even while the send thread is blocked on a stuck socket write.
+// --------------------------------------------------------------------------
+void Pipeline::watchdog_loop() {
+  fprintf(stderr, "[watchdog] thread started\n");
+
+  while (running_.load()) {
+    // Poll in small steps so stop() joins us quickly.
+    for (int i = 0; i < 5 && running_.load(); i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!running_.load())
+      break;
+
+    const int64_t idle_us = now_us() - last_send_activity_us_.load();
+    if (idle_us > kStallTimeoutUs) {
+      char reason[128];
+      snprintf(reason, sizeof(reason),
+               "no socket progress for %.1fs (connection stalled)",
+               idle_us / 1000000.0);
+      mark_failed(reason);
+      break;
+    }
+
+    // Adaptive bitrate: sample send-queue congestion at this ~2 Hz cadence.
+    if (rate_controller_)
+      rate_controller_->update(send_queue_depth(), kMaxSendQueueSize);
+  }
+
+  fprintf(stderr, "[watchdog] thread exiting\n");
 }
 
 void Pipeline::handle_control(const uint8_t *data, size_t len) {

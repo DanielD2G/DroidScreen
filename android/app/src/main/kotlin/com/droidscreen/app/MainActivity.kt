@@ -5,6 +5,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.SpannableStringBuilder
+import android.text.Spanned
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -14,22 +16,30 @@ import android.view.Surface
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.Spinner
 import android.widget.TextView
 import com.droidscreen.app.deck.DeckConfig
+import com.droidscreen.app.deck.DeckEdgeView
 import com.droidscreen.app.deck.DeckOverlayView
 import com.droidscreen.app.deck.MediaState
+import com.droidscreen.app.deck.SegmentedControlView
+import com.droidscreen.app.ui.LinkHeroView
+import com.droidscreen.app.ui.LinkLine
+import com.droidscreen.app.ui.LinkMarkView
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity(), SurfaceHolder.Callback {
 
     companion object {
         private const val TAG = "DroidScreen"
         private const val DECK_AUTO_HIDE_MS = 6_000L
+        // Must match DS_HELLO_APPROVAL_TIMEOUT_MS in protocol/include/droidscreen/hello.h
+        private const val APPROVAL_TIMEOUT_MS = 60_000L
+        // Distance from the approval card's top to where the hero cable crosses it.
+        private const val CARD_CABLE_OFFSET_DP = 210f
 
         // Status constants — must match native_bridge.cpp
         const val STATUS_WAITING = 0
@@ -43,20 +53,32 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private lateinit var surfaceView: SurfaceView
-    private lateinit var statusOverlay: LinearLayout
+    private lateinit var statusOverlay: FrameLayout
     private lateinit var statusText: TextView
     private lateinit var statusDetail: TextView
-    private lateinit var inputSettingsScrim: View
-    private lateinit var controlsContainer: LinearLayout
-    private lateinit var inputToggleButton: Button
-    private lateinit var inputPanel: LinearLayout
-    private lateinit var fingerModeSpinner: Spinner
-    private lateinit var stylusModeSpinner: Spinner
-    private lateinit var unknownModeSpinner: Spinner
+    private lateinit var statusDot: View
+    private lateinit var statusMark: LinkMarkView
+    private lateinit var statusDeviceName: TextView
+    private lateinit var statusHintRow: View
+    private lateinit var statusHint: TextView
+    private lateinit var statusHero: LinkHeroView
+    private lateinit var statusStep1: TextView
+    private lateinit var statusStep2: TextView
+    private lateinit var statusStep3: TextView
+    private lateinit var statusVersion: TextView
+    private lateinit var statusTransport: TextView
+    private lateinit var approvalLayer: FrameLayout
+    private lateinit var approvalCard: View
+    private lateinit var approvalTitle: TextView
+    private lateinit var approvalAllow: Button
+    private lateinit var approvalDeny: Button
+    private lateinit var approvalDotStart: View
+    private lateinit var approvalDotEnd: View
     private lateinit var deckOverlayContainer: FrameLayout
-    private lateinit var lockButton: Button
-    private lateinit var hideButton: Button
+    private lateinit var deckEdge: DeckEdgeView
     private var deckOverlay: DeckOverlayView? = null
+    /** A finger is down on the Deck; auto-hide waits for it to lift. */
+    private var deckGestureActive = false
     private var isDeckVisible = false
     private var isDeckLocked = false
     private var currentDeckConfig: DeckConfig = DeckConfig.createDefault()
@@ -65,7 +87,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var currentVolumeMuted = false
     private var nativeStarted = false
     private lateinit var inputSettings: InputSettings
-    private lateinit var statsToggleButton: Button
     private lateinit var statsPanel: LinearLayout
     private lateinit var statsBitrate: TextView
     private lateinit var statsFps: TextView
@@ -75,12 +96,41 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var lastBytesReceived = 0L
     private var lastFramesDecoded = 0L
     private var lastStatsTime = 0L
+    private var chipBytes = 0L
+    private var chipFrames = 0L
+    private var chipTime = 0L
+    private var currentStatus = STATUS_WAITING
+    /** Set by authorizeDesktop (Wi-Fi only) just before a connection starts. */
+    @Volatile private var pendingWifiConnection = false
+    private var streamOverWifi = false
     private val uiHandler = Handler(Looper.getMainLooper())
+    private lateinit var wireless: WirelessManager
+
+    /** A Wi-Fi desktop waiting for the user to allow or deny it. */
+    private class PendingApproval(val name: String) {
+        val latch = CountDownLatch(1)
+        @Volatile var approved = false
+        fun decide(allow: Boolean) {
+            approved = allow
+            latch.countDown()
+        }
+    }
+    @Volatile private var pendingApproval: PendingApproval? = null
+    /** The request whose prompt is on screen (UI thread only). */
+    private var shownApproval: PendingApproval? = null
     private val statsUpdateRunnable = object : Runnable {
         override fun run() {
             if (statsVisible) {
                 updateStats()
                 uiHandler.postDelayed(this, 500)
+            }
+        }
+    }
+    private val chipStatsRunnable = object : Runnable {
+        override fun run() {
+            if (isDeckVisible) {
+                updateChipStats()
+                uiHandler.postDelayed(this, 1_000)
             }
         }
     }
@@ -103,14 +153,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         statusOverlay = findViewById(R.id.status_overlay)
         statusText = findViewById(R.id.status_text)
         statusDetail = findViewById(R.id.status_detail)
-        inputSettingsScrim = findViewById(R.id.input_settings_scrim)
-        controlsContainer = findViewById(R.id.controls_container)
-        inputToggleButton = findViewById(R.id.input_settings_toggle)
-        inputPanel = findViewById(R.id.input_settings_panel)
-        fingerModeSpinner = findViewById(R.id.finger_mode_spinner)
-        stylusModeSpinner = findViewById(R.id.stylus_mode_spinner)
-        unknownModeSpinner = findViewById(R.id.unknown_mode_spinner)
-        statsToggleButton = findViewById(R.id.stats_toggle)
+        statusDot = findViewById(R.id.status_dot)
+        statusMark = findViewById(R.id.status_mark)
+        statusDeviceName = findViewById(R.id.status_device_name)
+        statusHintRow = findViewById(R.id.status_hint_row)
+        statusHint = findViewById(R.id.status_hint)
+        statusHero = findViewById(R.id.status_hero)
+        statusStep1 = findViewById(R.id.status_step_1)
+        statusStep2 = findViewById(R.id.status_step_2)
+        statusStep3 = findViewById(R.id.status_step_3)
+        statusVersion = findViewById(R.id.status_version)
+        statusTransport = findViewById(R.id.status_transport)
+        approvalLayer = findViewById(R.id.approval_layer)
+        approvalCard = findViewById(R.id.approval_card)
+        approvalTitle = findViewById(R.id.approval_title)
+        approvalAllow = findViewById(R.id.approval_allow)
+        approvalDeny = findViewById(R.id.approval_deny)
+        approvalDotStart = findViewById(R.id.approval_dot_start)
+        approvalDotEnd = findViewById(R.id.approval_dot_end)
         statsPanel = findViewById(R.id.stats_panel)
         statsBitrate = findViewById(R.id.stats_bitrate)
         statsFps = findViewById(R.id.stats_fps)
@@ -118,6 +178,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         statsStability = findViewById(R.id.stats_stability)
 
         inputSettings = InputSettingsStore.load(this)
+        wireless = WirelessManager(this)
+        wireless.startAdvertising(USBConnectionManager.PORT, nativeProtocolVersion())
 
         surfaceView.isFocusable = true
         surfaceView.isFocusableInTouchMode = true
@@ -131,33 +193,33 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         surfaceView.holder.addCallback(this)
 
+        deckOverlayContainer = findViewById(R.id.deck_overlay_container)
+        deckEdge = findViewById(R.id.deck_edge)
+        deckEdge.onOpenDeck = { showDeckAndControls() }
+        bindWaitingScreen()
+
         // Show initial waiting state
         updateStatusUI(STATUS_WAITING)
-        bindInputSettingsUi()
-        bindStatsUi()
-
-        deckOverlayContainer = findViewById(R.id.deck_overlay_container)
-        lockButton = findViewById(R.id.lock_toggle)
-        hideButton = findViewById(R.id.hide_toggle)
-        lockButton.setOnClickListener {
-            isDeckLocked = !isDeckLocked
-            lockButton.text = if (isDeckLocked) "Unlock" else "Lock"
-            if (isDeckLocked) uiHandler.removeCallbacks(hideDeckRunnable)
-            else scheduleDeckAutoHide()
-        }
-        hideButton.setOnClickListener { hideDeckAndControls() }
         setImmersiveMode()
     }
 
     override fun onResume() {
         super.onResume()
         setImmersiveMode()
+        // The Wi-Fi address may have changed while the app was in the background.
+        if (currentStatus == STATUS_WAITING) renderWaitingDetail()
     }
 
     override fun onDestroy() {
         uiHandler.removeCallbacks(hideDeckRunnable)
         uiHandler.removeCallbacks(statsUpdateRunnable)
+        uiHandler.removeCallbacks(chipStatsRunnable)
+        wireless.stopAdvertising()
+        wireless.releaseLowLatencyWifi()
         if (nativeStarted) {
+            // The receive thread may be blocked waiting on an approval
+            // dialog; release it first or nativeStop() could never join it.
+            pendingApproval?.decide(false)
             nativeStop()
             nativeStarted = false
         }
@@ -165,6 +227,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun onBackPressed() {
+        // Back on the approval prompt denies it (like cancelling a dialog).
+        shownApproval?.let { request ->
+            decideApproval(request, false)
+            return
+        }
+
         // If deck is showing, hide everything
         if (isDeckVisible) {
             hideDeckAndControls()
@@ -173,11 +241,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         if (statsVisible) {
             closeStatsPanel()
-            return
-        }
-
-        if (inputPanel.visibility == View.VISIBLE) {
-            closeInputPanel()
             return
         }
 
@@ -225,6 +288,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             // Surface was recreated (e.g., app went to background and came back).
             // Must restart native layer with the new Surface — old one is dead.
             android.util.Log.i(TAG, "Surface recreated, restarting native layer")
+            pendingApproval?.decide(false)
             nativeStop()
             nativeStarted = false
         }
@@ -259,7 +323,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         // When deck is visible, reset auto-hide timer and let overlay handle touches
         if (isDeckVisible) {
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) scheduleDeckAutoHide()
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    deckGestureActive = true
+                    uiHandler.removeCallbacks(hideDeckRunnable)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    deckGestureActive = false
+                    scheduleDeckAutoHide()
+                }
+            }
             return false
         }
 
@@ -289,107 +362,48 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             source == InputDevice.SOURCE_MOUSE_RELATIVE
     }
 
-    private fun bindInputSettingsUi() {
-        val touchRescheduler = View.OnTouchListener { _, event ->
-            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                scheduleDeckAutoHide()
-            }
-            false
-        }
-
-        controlsContainer.setOnTouchListener(touchRescheduler)
-        inputSettingsScrim.setOnClickListener {
-            closeInputPanel()
-            scheduleDeckAutoHide()
-        }
-        inputSettingsScrim.setOnTouchListener(touchRescheduler)
-
-        inputToggleButton.setOnClickListener {
-            toggleInputPanel()
-            scheduleDeckAutoHide()
-        }
-
-        bindSpinner(
-            fingerModeSpinner,
-            FingerInputMode.values().map { it.label },
-            inputSettings.fingerInputMode.ordinal
-        ) { index ->
-            inputSettings = inputSettings.copy(
-                fingerInputMode = FingerInputMode.values()[index]
-            )
-            persistInputSettings()
-            scheduleDeckAutoHide()
-        }
-
-        bindSpinner(
-            stylusModeSpinner,
-            StylusInputMode.values().map { it.label },
-            inputSettings.stylusInputMode.ordinal
-        ) { index ->
-            inputSettings = inputSettings.copy(
-                stylusInputMode = StylusInputMode.values()[index]
-            )
-            persistInputSettings()
-            scheduleDeckAutoHide()
-        }
-
-        bindSpinner(
-            unknownModeSpinner,
-            UnknownPointerFallback.values().map { it.label },
-            inputSettings.unknownPointerFallback.ordinal
-        ) { index ->
-            inputSettings = inputSettings.copy(
-                unknownPointerFallback = UnknownPointerFallback.values()[index]
-            )
-            persistInputSettings()
-            scheduleDeckAutoHide()
-        }
-    }
-
-    private fun bindSpinner(
-        spinner: Spinner,
-        items: List<String>,
-        selectedIndex: Int,
-        onSelected: (Int) -> Unit
-    ) {
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, items)
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        spinner.adapter = adapter
-        spinner.setSelection(selectedIndex, false)
-        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                onSelected(position)
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-        }
-    }
-
     private fun persistInputSettings() {
         InputSettingsStore.save(this, inputSettings)
     }
 
-    private fun toggleInputPanel() {
-        val showing = inputPanel.visibility == View.VISIBLE
-        if (showing) {
-            closeInputPanel()
-        } else {
-            inputPanel.visibility = View.VISIBLE
-            inputSettingsScrim.visibility = View.VISIBLE
-            inputToggleButton.text = "Close"
+    /** Fills the Deck's Finger / Stylus / Other segmented controls. */
+    private fun bindDeckInputModes(overlay: DeckOverlayView) {
+        val fingerIcons = mapOf(
+            FingerInputMode.NATIVE_TOUCH to R.drawable.ic_ph_hand_pointing,
+            FingerInputMode.MOUSE_CURSOR to R.drawable.ic_ph_cursor
+        )
+        val stylusIcons = mapOf(
+            StylusInputMode.NATIVE_PEN to R.drawable.ic_ph_pen,
+            StylusInputMode.NATIVE_TOUCH to R.drawable.ic_ph_hand_pointing,
+            StylusInputMode.MOUSE_CURSOR to R.drawable.ic_ph_cursor
+        )
+        overlay.bindInputModes(
+            finger = FingerInputMode.values().map {
+                SegmentedControlView.Option(it.shortLabel, fingerIcons[it])
+            },
+            fingerSelected = inputSettings.fingerInputMode.ordinal,
+            stylus = StylusInputMode.values().map {
+                SegmentedControlView.Option(it.shortLabel, stylusIcons[it])
+            },
+            stylusSelected = inputSettings.stylusInputMode.ordinal,
+            unknown = UnknownPointerFallback.values().map { SegmentedControlView.Option(it.shortLabel) },
+            unknownSelected = inputSettings.unknownPointerFallback.ordinal
+        )
+        overlay.onFingerModeSelected = { index ->
+            inputSettings = inputSettings.copy(fingerInputMode = FingerInputMode.values()[index])
+            persistInputSettings()
+            scheduleDeckAutoHide()
         }
-    }
-
-    private fun closeInputPanel() {
-        inputPanel.visibility = View.GONE
-        inputSettingsScrim.visibility = View.GONE
-        inputToggleButton.text = "Input"
-        scheduleDeckAutoHide()
-    }
-
-    private fun bindStatsUi() {
-        statsToggleButton.setOnClickListener {
-            toggleStatsPanel()
+        overlay.onStylusModeSelected = { index ->
+            inputSettings = inputSettings.copy(stylusInputMode = StylusInputMode.values()[index])
+            persistInputSettings()
+            scheduleDeckAutoHide()
+        }
+        overlay.onUnknownModeSelected = { index ->
+            inputSettings = inputSettings.copy(
+                unknownPointerFallback = UnknownPointerFallback.values()[index]
+            )
+            persistInputSettings()
             scheduleDeckAutoHide()
         }
     }
@@ -399,8 +413,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             closeStatsPanel()
         } else {
             statsPanel.visibility = View.VISIBLE
-            statsToggleButton.text = "Close"
             statsVisible = true
+            deckOverlay?.setStatsExpanded(true)
             val stats = nativeGetStats()
             lastBytesReceived = stats[0]
             lastFramesDecoded = stats[1]
@@ -412,8 +426,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun closeStatsPanel() {
         if (!statsVisible) return
         statsPanel.visibility = View.GONE
-        statsToggleButton.text = "Stats"
         statsVisible = false
+        deckOverlay?.setStatsExpanded(false)
         uiHandler.removeCallbacks(statsUpdateRunnable)
     }
 
@@ -464,22 +478,31 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         lastStatsTime = now
     }
 
+    /** Live "30 ms · 57 fps ·" summary for the Deck's stats chip. */
+    private fun updateChipStats() {
+        val stats = nativeGetStats()
+        val now = System.nanoTime()
+        val elapsed = (now - chipTime) / 1_000_000_000.0
+        if (chipTime != 0L && elapsed > 0.1) {
+            val fps = (stats[1] - chipFrames) / elapsed
+            val latencyMs = if (stats.size > 8) stats[8] / 1000.0 else 0.0
+            val latency = if (latencyMs > 0.0) String.format("%.0f", latencyMs) else "--"
+            deckOverlay?.setStats(String.format("%s ms · %.0f fps ·", latency, fps), streamOverWifi)
+        } else {
+            deckOverlay?.setStats("-- ms · -- fps ·", streamOverWifi)
+        }
+        chipBytes = stats[0]
+        chipFrames = stats[1]
+        chipTime = now
+    }
+
     private fun showDeckAndControls() {
         if (isDeckVisible) return
         isDeckVisible = true
         isDeckLocked = false
-        lockButton.text = "Lock"
 
         // Re-force immersive mode so system bars don't steal space
         setImmersiveMode()
-
-        // Expand container with negative margins to cover any residual inset gaps
-        val margin = -200
-        val lp = deckOverlayContainer.layoutParams as FrameLayout.LayoutParams
-        lp.setMargins(margin, margin, margin, margin)
-        deckOverlayContainer.layoutParams = lp
-
-        controlsContainer.visibility = View.VISIBLE
 
         val overlay = DeckOverlayView(this).apply {
             onDeckAction = { actionType, slotIndex ->
@@ -491,7 +514,29 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 scheduleDeckAutoHide()
             }
             onDismiss = { hideDeckAndControls() }
+            onInteraction = {
+                deckGestureActive = false
+                scheduleDeckAutoHide()
+            }
+            onGestureStart = {
+                deckGestureActive = true
+                uiHandler.removeCallbacks(hideDeckRunnable)
+            }
+            onHide = { hideDeckAndControls() }
+            onLockToggle = {
+                isDeckLocked = !isDeckLocked
+                setLocked(isDeckLocked)
+                if (isDeckLocked) uiHandler.removeCallbacks(hideDeckRunnable)
+                else scheduleDeckAutoHide()
+            }
+            onStatsChipClick = {
+                toggleStatsPanel()
+                scheduleDeckAutoHide()
+            }
         }
+        bindDeckInputModes(overlay)
+        overlay.setLocked(false)
+        overlay.setStatsExpanded(statsVisible)
 
         overlay.buildFromConfig(currentDeckConfig)
         currentMediaState?.let(overlay::updateMediaState)
@@ -505,18 +550,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         deckOverlayContainer.visibility = View.VISIBLE
         overlay.animateIn()
         deckOverlay = overlay
+        deckEdge.deckShown = true
 
+        chipTime = 0L
+        uiHandler.removeCallbacks(chipStatsRunnable)
+        uiHandler.post(chipStatsRunnable)
         scheduleDeckAutoHide()
     }
 
     private fun hideDeckAndControls() {
         uiHandler.removeCallbacks(hideDeckRunnable)
-        closeInputPanel()
+        deckGestureActive = false
+        uiHandler.removeCallbacks(chipStatsRunnable)
 
-        if (!isDeckVisible) {
-            controlsContainer.visibility = View.GONE
-            return
-        }
+        if (!isDeckVisible) return
 
         deckOverlay?.animateOut {
             deckOverlayContainer.removeAllViews()
@@ -524,13 +571,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             deckOverlay = null
             isDeckVisible = false
             isDeckLocked = false
-            controlsContainer.visibility = View.GONE
+            deckEdge.deckShown = false
         }
     }
 
     private fun scheduleDeckAutoHide() {
         uiHandler.removeCallbacks(hideDeckRunnable)
-        if (isDeckVisible && !isDeckLocked) {
+        // Callbacks fired mid-gesture (e.g. volume drag) must not re-arm the timer;
+        // it restarts when the finger lifts.
+        if (isDeckVisible && !isDeckLocked && !deckGestureActive) {
             uiHandler.postDelayed(hideDeckRunnable, DECK_AUTO_HIDE_MS)
         }
     }
@@ -547,33 +596,223 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun updateStatusUI(status: Int) {
+        currentStatus = status
         when (status) {
             STATUS_WAITING -> {
                 closeStatsPanel()
                 hideDeckAndControls()
-                statusOverlay.visibility = View.VISIBLE
-                statusText.text = "Waiting for connection..."
-                statusDetail.text = "Port: ${USBConnectionManager.PORT}"
+                showStatusScreen()
+                setStatusPill("Waiting for a Mac", LinkLine.CABLE)
+                renderWaitingDetail()
+                wireless.releaseLowLatencyWifi()
             }
             STATUS_CONNECTED -> {
+                wireless.acquireLowLatencyWifi()
                 hideDeckAndControls()
+                streamOverWifi = pendingWifiConnection
+                pendingWifiConnection = false
                 statusOverlay.visibility = View.GONE
+                statusHero.waiting = false
+                deckEdge.wifi = streamOverWifi
+                deckEdge.deckShown = false
+                deckEdge.visibility = View.VISIBLE
             }
             STATUS_DISCONNECTED -> {
                 closeStatsPanel()
                 hideDeckAndControls()
-                statusOverlay.visibility = View.VISIBLE
-                statusText.text = "Disconnected"
-                statusDetail.text = "Reconnecting..."
+                showStatusScreen()
+                setStatusPill("Reconnecting…", LinkLine.WARN)
+                wireless.releaseLowLatencyWifi()
+                renderWaitingDetail(headline = "Disconnected from your Mac")
             }
             STATUS_ERROR -> {
                 closeStatsPanel()
                 hideDeckAndControls()
-                statusOverlay.visibility = View.VISIBLE
-                statusText.text = "Error"
-                statusDetail.text = "Please restart the app"
+                showStatusScreen()
+                setStatusPill("Error", LinkLine.ERROR)
+                statusHero.waiting = false
+                statusDetail.text = "Something went wrong. Please restart the app."
+                statusHintRow.visibility = View.GONE
             }
         }
+    }
+
+    /** One-time setup of the static parts of the waiting screen. */
+    private fun bindWaitingScreen() {
+        val name = wireless.deviceName
+        statusDeviceName.text = name
+        statusStep1.text = stepText("Open ", "DroidScreen", " on your Mac")
+        statusStep2.text = stepText("Choose ", "\u201C$name\u201D", " in the menu bar")
+        statusStep3.text = stepText("", "Allow", " the connection here")
+        statusVersion.text = "DroidScreen ${appVersionName()}"
+        approvalAllow.setOnClickListener { shownApproval?.let { decideApproval(it, true) } }
+        approvalDeny.setOnClickListener { shownApproval?.let { decideApproval(it, false) } }
+        statusHero.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (approvalLayer.visibility == View.VISIBLE) positionApprovalCard()
+        }
+        approvalCard.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (approvalLayer.visibility == View.VISIBLE) positionApprovalCard()
+        }
+    }
+
+    private fun showStatusScreen() {
+        statusOverlay.visibility = View.VISIBLE
+        deckEdge.visibility = View.GONE
+        streamOverWifi = false
+    }
+
+    private fun setStatusPill(text: String, dotColor: Int) {
+        statusText.text = text
+        statusDot.background.mutate().setTint(dotColor)
+    }
+
+    /** "Ready on Wi-Fi as <ip>" (IP in mono yellow), or the USB-only variant. */
+    private fun renderWaitingDetail(headline: String? = null) {
+        val ip = wireless.wifiAddress()
+        val wifi = ip != null
+        statusMark.wifi = wifi
+        statusHero.wifi = wifi
+        statusHero.address = ip
+        statusHero.waiting = currentStatus != STATUS_ERROR
+        statusHero.cableLabel = if (approvalLayer.visibility == View.VISIBLE) null
+        else if (wifi) "Wi-Fi · waiting" else "USB · waiting"
+        statusTransport.text = if (wifi) "Wi-Fi · $ip" else "USB"
+        statusHintRow.visibility = View.VISIBLE
+        if (headline != null) {
+            statusDetail.text = headline
+            statusHint.text = if (wifi) "Reconnecting over Wi-Fi or USB…" else "Reconnecting over USB…"
+        } else if (wifi) {
+            val text = SpannableStringBuilder("Ready on Wi-Fi as ")
+            val start = text.length
+            text.append(ip)
+            text.setSpan(
+                LinkLine.TypefaceSpanCompat(LinkLine.mono(this), LinkLine.CABLE),
+                start, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+            statusDetail.text = text
+            statusHint.text = "or connect a USB cable"
+        } else {
+            statusDetail.text = "Not on Wi-Fi"
+            statusHint.text = "Connect a USB cable, or join the same Wi-Fi as your Mac"
+        }
+    }
+
+    private fun stepText(before: String, strong: String, after: String): CharSequence {
+        val text = SpannableStringBuilder(before)
+        val start = text.length
+        text.append(strong)
+        text.setSpan(
+            LinkLine.TypefaceSpanCompat(LinkLine.sans(this, 500), LinkLine.TEXT),
+            start, text.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+        )
+        text.append(after)
+        return text
+    }
+
+    private fun appVersionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+    } catch (e: Exception) {
+        ""
+    }
+
+    /** Shows the in-layout approval card for [request] (UI thread). */
+    private fun showApprovalPrompt(request: PendingApproval) {
+        shownApproval = request
+        approvalTitle.text = "\u201C${request.name}\u201D?"
+        approvalLayer.visibility = View.VISIBLE
+        statusHero.cableLabel = null
+        // Allow is never pre-focused.
+        approvalLayer.requestFocus()
+        positionApprovalCard()
+    }
+
+    /** Hides the prompt if it still belongs to [request] (UI thread). */
+    private fun hideApprovalPrompt(request: PendingApproval) {
+        if (shownApproval !== request) return
+        shownApproval = null
+        approvalLayer.visibility = View.GONE
+        if (currentStatus == STATUS_WAITING || currentStatus == STATUS_DISCONNECTED) {
+            renderWaitingDetail(
+                headline = if (currentStatus == STATUS_DISCONNECTED) "Disconnected from your Mac" else null
+            )
+        }
+    }
+
+    private fun decideApproval(request: PendingApproval, allow: Boolean) {
+        // Only the first answer counts; the receive thread may already be reading it.
+        if (request.latch.count == 0L) return
+        request.decide(allow)
+        hideApprovalPrompt(request)
+    }
+
+    /**
+     * Anchors the approval card on the middle of the hero cable, with the two
+     * yellow dots where the cable meets the card's edges. Falls back to the
+     * vertical center when the waiting screen is not showing.
+     */
+    private fun positionApprovalCard() {
+        val layerH = approvalLayer.height
+        val cardH = approvalCard.height
+        if (layerH == 0 || cardH == 0) {
+            approvalLayer.post { if (approvalLayer.visibility == View.VISIBLE) positionApprovalCard() }
+            return
+        }
+        val density = resources.displayMetrics.density
+        val margin = 16f * density
+        val heroVisible = statusOverlay.visibility == View.VISIBLE && statusHero.isShown
+        val cableY: Float
+        val cardTop: Float
+        if (heroVisible) {
+            val heroLoc = IntArray(2)
+            val layerLoc = IntArray(2)
+            statusHero.getLocationInWindow(heroLoc)
+            approvalLayer.getLocationInWindow(layerLoc)
+            cableY = heroLoc[1] - layerLoc[1] + statusHero.cableCenterY()
+            cardTop = (cableY - CARD_CABLE_OFFSET_DP * density)
+                .coerceIn(margin, (layerH - cardH - margin).coerceAtLeast(margin))
+        } else {
+            cardTop = (layerH - cardH) / 2f
+            cableY = -1f
+        }
+        approvalCard.translationY = cardTop
+        val dotsVisible = heroVisible && cableY > cardTop && cableY < cardTop + cardH
+        approvalDotStart.visibility = if (dotsVisible) View.VISIBLE else View.INVISIBLE
+        approvalDotEnd.visibility = if (dotsVisible) View.VISIBLE else View.INVISIBLE
+        if (dotsVisible) {
+            val half = approvalDotStart.width / 2f
+            approvalDotStart.translationX = approvalCard.left - half
+            approvalDotStart.translationY = cableY - half
+            approvalDotEnd.translationX = approvalCard.right - half
+            approvalDotEnd.translationY = cableY - half
+        }
+    }
+
+    /**
+     * Called from the native receive thread when a computer connects over
+     * Wi-Fi. Returns the token it must keep, or null to reject it. Blocks
+     * until the user decides (or the request times out).
+     */
+    @Suppress("unused") // Called from JNI
+    fun authorizeDesktop(desktopId: String, name: String, presentedToken: String): String? {
+        wireless.tokenIfTrusted(desktopId, presentedToken)?.let {
+            pendingWifiConnection = true
+            return it
+        }
+
+        val request = PendingApproval(name)
+        pendingApproval = request
+        runOnUiThread {
+            if (isFinishing || isDestroyed) {
+                request.decide(false)
+                return@runOnUiThread
+            }
+            showApprovalPrompt(request)
+        }
+        request.latch.await(APPROVAL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        runOnUiThread { hideApprovalPrompt(request) }
+        pendingApproval = null
+        if (request.approved) pendingWifiConnection = true
+        return if (request.approved) wireless.trust(desktopId, name) else null
     }
 
     @Suppress("unused") // Called from JNI
@@ -614,6 +853,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private external fun nativeInit(surface: Surface, port: Int)
     private external fun nativeStop()
+    private external fun nativeProtocolVersion(): Int
     external fun nativeSendTouch(
         action: Int,
         pointerId: Int,

@@ -16,10 +16,13 @@
 #else
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <fcntl.h>
 #include <errno.h>
 #endif
 
@@ -46,17 +49,7 @@ TCPClient::~TCPClient() {
     close();
 }
 
-bool TCPClient::connect(uint16_t port) {
-#ifdef _WIN32
-    if (!init_wsa()) return false;
-#endif
-
-    fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fd_ == kInvalidSocket) {
-        fprintf(stderr, "[tcp] socket() failed\n");
-        return false;
-    }
-
+void TCPClient::configure_socket() {
     // Set TCP_NODELAY to disable Nagle's algorithm for low latency.
     int flag = 1;
 #ifdef _WIN32
@@ -67,7 +60,9 @@ bool TCPClient::connect(uint16_t port) {
 #endif
 
     // Moderate socket buffers — enough for keyframes, small enough to
-    // avoid OS-level queuing latency on USB connections (128 KB each).
+    // avoid OS-level queuing latency (128 KB each). On Wi-Fi the adaptive
+    // rate controller watches the send queue, so a bigger kernel buffer would
+    // only hide congestion from it.
     int buf_size = 128 * 1024;  // 131072
 #ifdef _WIN32
     setsockopt(fd_, SOL_SOCKET, SO_SNDBUF,
@@ -85,28 +80,192 @@ bool TCPClient::connect(uint16_t port) {
     setsockopt(fd_, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
 #endif
 
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr),
-                  sizeof(addr)) != 0) {
-#ifdef _WIN32
-        fprintf(stderr, "[tcp] connect() to 127.0.0.1:%u failed: %d\n",
-                port, WSAGetLastError());
-        closesocket(fd_);
-#else
-        fprintf(stderr, "[tcp] connect() to 127.0.0.1:%u failed: %s\n",
-                port, strerror(errno));
-        ::close(fd_);
+#ifdef __APPLE__
+    // A write to a peer that vanished must return an error, not kill the app.
+    int nosigpipe = 1;
+    setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
 #endif
+
+    // Send timeout: a blocking write must NEVER hang forever. If the device
+    // stops draining (USB/adb-forward hiccup, Wi-Fi dropout, decoder stall,
+    // half-open peer), an unbounded writev() would deadlock the send thread
+    // while holding write_mutex_ — which also blocks the ping thread, killing
+    // the RTT liveness signal. With SO_SNDTIMEO the write fails with
+    // EWOULDBLOCK, the send thread tears the pipeline down, and the owner
+    // reconnects.
+    //
+    // The timeout must be well above the worst-case *legitimate* stall: a heavy
+    // motion burst (large keyframe + high-motion deltas) can momentarily
+    // overwhelm the decoder, so writev() may make zero progress for a few
+    // seconds and then recover on its own. A too-tight timeout kills those
+    // healthy bursts and causes reconnect churn. True deadlocks last minutes, so
+    // 8 s cleanly separates "slow burst" (ride it out) from "dead link".
+    constexpr int kSendTimeoutMs = 8000;
+#ifdef _WIN32
+    DWORD snd_timeout = kSendTimeoutMs;
+    setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&snd_timeout), sizeof(snd_timeout));
+#else
+    struct timeval snd_timeout;
+    snd_timeout.tv_sec  = kSendTimeoutMs / 1000;
+    snd_timeout.tv_usec = (kSendTimeoutMs % 1000) * 1000;
+    setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout));
+#endif
+}
+
+bool TCPClient::connect(uint16_t port) {
+    return connect("127.0.0.1", port, 3000);
+}
+
+static void close_socket(socket_t fd) {
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    ::close(fd);
+#endif
+}
+
+static bool set_blocking(socket_t fd, bool blocking) {
+#ifdef _WIN32
+    u_long mode = blocking ? 0 : 1;
+    return ioctlsocket(fd, FIONBIO, &mode) == 0;
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return false;
+    flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
+    return fcntl(fd, F_SETFL, flags) == 0;
+#endif
+}
+
+bool TCPClient::connect(const char* host, uint16_t port, int timeout_ms) {
+#ifdef _WIN32
+    if (!init_wsa()) return false;
+#endif
+    close();
+
+    // The Android server listens on IPv4 only.
+    struct addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    struct addrinfo* res = nullptr;
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", port);
+    int gai = getaddrinfo(host, port_str, &hints, &res);
+    if (gai != 0 || !res) {
+        fprintf(stderr, "[tcp] cannot resolve %s: %s\n", host, gai_strerror(gai));
+        return false;
+    }
+
+    fd_ = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd_ == kInvalidSocket) {
+        fprintf(stderr, "[tcp] socket() failed\n");
+        freeaddrinfo(res);
+        return false;
+    }
+    configure_socket();
+
+    // Non-blocking connect so an unreachable host fails after timeout_ms
+    // instead of the OS default (75 s on macOS).
+    bool ok = set_blocking(fd_, false);
+    if (ok) {
+        int rc = ::connect(fd_, res->ai_addr, static_cast<int>(res->ai_addrlen));
+#ifdef _WIN32
+        bool in_progress = rc != 0 && WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        bool in_progress = rc != 0 && errno == EINPROGRESS;
+#endif
+        if (rc == 0) {
+            ok = true;
+        } else if (in_progress) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd_, &wfds);
+            struct timeval tv;
+            tv.tv_sec = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+            int sel = ::select(static_cast<int>(fd_) + 1, nullptr, &wfds, nullptr, &tv);
+            if (sel <= 0) {
+                fprintf(stderr, "[tcp] connect() to %s:%u timed out\n", host, port);
+                ok = false;
+            } else {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                getsockopt(fd_, SOL_SOCKET, SO_ERROR,
+                           reinterpret_cast<char*>(&err), &len);
+                if (err != 0) {
+                    fprintf(stderr, "[tcp] connect() to %s:%u failed: %s\n",
+                            host, port, strerror(err));
+                }
+                ok = err == 0;
+            }
+        } else {
+            fprintf(stderr, "[tcp] connect() to %s:%u failed\n", host, port);
+            ok = false;
+        }
+    }
+    freeaddrinfo(res);
+
+    if (!ok || !set_blocking(fd_, true)) {
+        close_socket(fd_);
         fd_ = kInvalidSocket;
         return false;
     }
 
-    fprintf(stderr, "[tcp] connected to 127.0.0.1:%u\n", port);
+    fprintf(stderr, "[tcp] connected to %s:%u\n", host, port);
     return true;
+}
+
+void TCPClient::set_recv_timeout(int timeout_ms) {
+    if (fd_ == kInvalidSocket) return;
+#ifdef _WIN32
+    DWORD tv = static_cast<DWORD>(timeout_ms);
+    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+HelloResult perform_hello(TCPClient* client,
+                          const uint8_t desktop_id[DS_HELLO_ID_SIZE],
+                          uint8_t token[DS_HELLO_TOKEN_SIZE],
+                          const char* desktop_name) {
+    ds_hello_t hello{};
+    memcpy(hello.desktop_id, desktop_id, DS_HELLO_ID_SIZE);
+    memcpy(hello.token, token, DS_HELLO_TOKEN_SIZE);
+    snprintf(hello.name, sizeof(hello.name), "%s", desktop_name ? desktop_name : "");
+
+    uint8_t buf[DS_HELLO_SIZE];
+    ds_hello_serialize(buf, &hello);
+    if (!client->send_message(DS_MSG_HELLO, 0, buf, DS_HELLO_SIZE)) {
+        return HelloResult::Failed;
+    }
+
+    // The tablet may be showing an approval prompt; wait a bit longer than it does.
+    client->set_recv_timeout(DS_HELLO_APPROVAL_TIMEOUT_MS + 5000);
+    ds_header_t hdr;
+    uint8_t resp_buf[DS_HELLO_RESP_SIZE];
+    bool got = client->recv_header(&hdr) &&
+               hdr.type == DS_MSG_HELLO_RESP &&
+               hdr.length == DS_HELLO_RESP_SIZE &&
+               client->recv_exact(resp_buf, DS_HELLO_RESP_SIZE);
+    client->set_recv_timeout(0);
+    if (!got) {
+        fprintf(stderr, "[tcp] no valid hello response\n");
+        return HelloResult::Failed;
+    }
+
+    ds_hello_resp_t resp;
+    ds_hello_resp_deserialize(resp_buf, &resp);
+    if (resp.status != DS_HELLO_ACCEPTED) {
+        return HelloResult::Rejected;
+    }
+    memcpy(token, resp.token, DS_HELLO_TOKEN_SIZE);
+    return HelloResult::Accepted;
 }
 
 bool TCPClient::send_all(const void* data, size_t len) {
@@ -203,7 +362,15 @@ bool TCPClient::send_message(uint8_t type, uint8_t flags,
     while (written < total) {
         ssize_t n = ::writev(fd_, iov, iovcnt);
         if (n <= 0) {
-            fprintf(stderr, "[tcp] writev() failed\n");
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                          errno == ETIMEDOUT)) {
+                fprintf(stderr,
+                        "[tcp] writev() timed out after %zu/%zu bytes "
+                        "(peer not draining); dropping connection\n",
+                        written, total);
+            } else {
+                fprintf(stderr, "[tcp] writev() failed\n");
+            }
             return false;
         }
         written += static_cast<size_t>(n);

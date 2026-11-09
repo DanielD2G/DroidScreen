@@ -583,6 +583,63 @@ int decoder_drain(DecoderContext *ctx, int64_t *rendered_pts_us) {
     return 0;
 }
 
+int decoder_drain_wait(DecoderContext *ctx, int64_t timeout_us,
+                       int64_t *rendered_pts_us) {
+    if (!ctx || !ctx->configured) {
+        return 0;
+    }
+    if (rendered_pts_us) {
+        *rendered_pts_us = -1;
+    }
+
+    /* Async output is delivered via callbacks; just drain the queue. */
+    if (ctx->async_mode) {
+        return decoder_drain(ctx, rendered_pts_us);
+    }
+
+    /* Sync path: the FIRST dequeue blocks up to timeout_us so the decode thread
+     * sleeps in the kernel and wakes the instant a decoded frame is ready —
+     * near-zero render latency without busy-polling. Remaining buffers are
+     * drained non-blocking so we still keep render-queue-depth = 1. */
+    AMediaCodecBufferInfo info;
+    ssize_t last_idx = -1;
+    bool first = true;
+
+    for (;;) {
+        ssize_t idx = AMediaCodec_dequeueOutputBuffer(
+            ctx->codec, &info, first ? timeout_us : 0);
+        first = false;
+
+        if (idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER)       break;
+        if (idx == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+            AMediaFormat *fmt = AMediaCodec_getOutputFormat(ctx->codec);
+            if (fmt) {
+                LOGI("decoder_drain_wait: output format changed: %s",
+                     AMediaFormat_toString(fmt));
+                AMediaFormat_delete(fmt);
+            }
+            continue;
+        }
+        if (idx == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
+        if (idx < 0) break;
+
+        if (last_idx >= 0) {
+            AMediaCodec_releaseOutputBuffer(ctx->codec, (size_t)last_idx, false);
+        }
+        last_idx = idx;
+    }
+
+    if (last_idx >= 0) {
+        if (rendered_pts_us) {
+            *rendered_pts_us = info.presentationTimeUs;
+        }
+        render_frame(ctx, (size_t)last_idx);
+        return 1;
+    }
+
+    return 0;
+}
+
 void decoder_destroy(DecoderContext *ctx) {
     if (!ctx) {
         return;

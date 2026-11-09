@@ -40,7 +40,7 @@ Existing apps work mainly over Wi-Fi — which means variable latency, compressi
 
 DroidScreen does things differently:
 
-- **USB-first** — ADB reverse tunneling for predictable, stable latency
+- **USB or Wi-Fi** — ADB tunnel over the cable, or automatic discovery and one-tap pairing on the local network
 - **Real touch** — not mouse emulation, but native touch events with pressure and multitouch
 - **First-class stylus** — pressure, tilt, rotation, hover distance
 - **Built-in Deck** — action panel, media and volume controls, no extra hardware needed

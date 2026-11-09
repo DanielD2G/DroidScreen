@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Link Line tokens (mockups/droidscreen-ui/spec-3.md) -->
+    <color name="ds_ink">#0F1115</color>
+    <color name="ds_surface">#171A20</color>
+    <color name="ds_raised">#1F232B</color>
+    <color name="ds_line">#2A2F39</color>
+    <color name="ds_line_2">#363C48</color>
+    <color name="ds_text">#F3F1EA</color>
+    <color name="ds_text_2">#A8ABB3</color>
+    <color name="ds_text_3">#6C707A</color>
+    <color name="ds_cable">#F2D13A</color>
+    <color name="ds_cable_pressed">#F7DC5C</color>
+    <color name="ds_live">#5BD68A</color>
+    <color name="ds_warn">#F2994A</color>
+    <color name="ds_error">#EB5757</color>
+    <color name="ds_scrim">#B80F1115</color>
+</resources>
