@@ -50,7 +50,10 @@ private:
     std::mutex encode_mutex_;
 
     /// Extract SPS/PPS from the format description and emit as config packet.
-    void emit_config(CMFormatDescriptionRef fmt, int64_t timestamp_us,
+    /// Burst budget (DataRateLimits) for the given average bitrate.
+    void apply_data_rate_limits(int32_t bitrate_bps);
+    /// Sends VPS/SPS/PPS. False (and a keyframe re-armed) if any set is missing.
+    bool emit_config(CMFormatDescriptionRef fmt, int64_t timestamp_us,
                      const std::function<void(const EncodedPacket&)>& on_packet);
 
     /// Convert AVCC-formatted sample buffer to Annex B and emit.

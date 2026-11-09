@@ -202,23 +202,7 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
         kVTCompressionPropertyKey_AverageBitRate, br);
     CFRelease(br);
 
-    // Data rate limits: allow 1.5x burst over a tight 100ms window.
-    // A short window prevents the encoder from front-loading large frames
-    // and then going silent — keeps output uniform for low-latency streaming.
-    int64_t byte_limit = (int64_t)(bitrate_bps * 1.5 * 0.1 / 8);
-    double duration_s = 0.1;
-    CFNumberRef limit_bytes = CFNumberCreate(kCFAllocatorDefault,
-        kCFNumberSInt64Type, &byte_limit);
-    CFNumberRef limit_dur = CFNumberCreate(kCFAllocatorDefault,
-        kCFNumberFloat64Type, &duration_s);
-    CFNumberRef limits[] = { limit_bytes, limit_dur };
-    CFArrayRef limit_array = CFArrayCreate(kCFAllocatorDefault,
-        (const void**)limits, 2, &kCFTypeArrayCallBacks);
-    VTSessionSetProperty(session_,
-        kVTCompressionPropertyKey_DataRateLimits, limit_array);
-    CFRelease(limit_array);
-    CFRelease(limit_bytes);
-    CFRelease(limit_dur);
+    apply_data_rate_limits(bitrate_bps);
 
     // Expected frame rate hint.
     int32_t fps_val = (int32_t)fps;
@@ -235,18 +219,47 @@ bool VTEncoder::init(uint32_t width, uint32_t height,
 #endif
     CFRelease(fr);
 
-    // Keyframe interval: every 2 seconds.
-    int32_t kf_interval = (int32_t)(fps * 2);
+    // No periodic keyframes. At 2560x1600 a keyframe is 20-40x a normal frame
+    // and the old 2 s interval caused a visible hitch every 2 s on Wi-Fi. TCP
+    // doesn't lose data; the tablet requests a keyframe (DS_CTRL_REQUEST_KEYFRAME)
+    // whenever its decoder needs one (session start, a dropped/failed packet),
+    // retries, and reconnects if recovery doesn't complete. A large positive
+    // maximum (not 0, which only means "encoder chooses") removes the cadence;
+    // VT may still pick an occasional keyframe on its own, which is harmless.
+    int32_t kf_interval = INT32_MAX;
     CFNumberRef kfi = CFNumberCreate(kCFAllocatorDefault,
                                       kCFNumberSInt32Type, &kf_interval);
-    VTSessionSetProperty(session_,
+    OSStatus kf_status = VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_MaxKeyFrameInterval, kfi);
     CFRelease(kfi);
+    double kf_duration = 0.0;  // 0 = no time-based limit
+    CFNumberRef kfd = CFNumberCreate(kCFAllocatorDefault,
+                                      kCFNumberFloat64Type, &kf_duration);
+    OSStatus kfd_status = VTSessionSetProperty(session_,
+        kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kfd);
+    CFRelease(kfd);
+    // Keyframes must be clean decoder entry points (HEVC defaults to open GOP).
+    OSStatus gop_status = noErr;
+    if (codec_ == DS_CODEC_HEVC) {
+        gop_status = VTSessionSetProperty(session_,
+            kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
+    }
+    if (kf_status != noErr || kfd_status != noErr) {
+        fprintf(stderr, "[vt] keyframe interval not applied: interval=%d duration=%d\n",
+                (int)kf_status, (int)kfd_status);
+    }
+    if (gop_status != noErr) {
+        // The low-latency HW encoder rejects AllowOpenGOP (-12900): it uses
+        // no B-frames, so there is no open GOP to turn off.
+        fprintf(stderr, "[vt] AllowOpenGOP not supported by this encoder (%d); fine without B-frames\n",
+                (int)gop_status);
+    }
 
     VTCompressionSessionPrepareToEncodeFrames(session_);
 
     config_sent_ = false;
-    keyframe_pending_.store(false);
+    // The first frame of every session is a keyframe (with parameter sets).
+    keyframe_pending_.store(true);
 
     fprintf(stderr, "[vt] encoder initialized: %ux%u@%u, %u kbps "
             "(low-latency, HW, codec=%s)\n",
@@ -268,7 +281,8 @@ bool VTEncoder::encode(void* native_frame, int64_t timestamp_us,
 
     // Force keyframe if requested.
     CFDictionaryRef frame_props = nullptr;
-    if (keyframe_pending_.exchange(false)) {
+    const bool forced = keyframe_pending_.exchange(false);
+    if (forced) {
         const void* keys[] = { kVTEncodeFrameOptionKey_ForceKeyFrame };
         const void* vals[] = { kCFBooleanTrue };
         frame_props = CFDictionaryCreate(
@@ -288,6 +302,8 @@ bool VTEncoder::encode(void* native_frame, int64_t timestamp_us,
 
     if (status != noErr) {
         fprintf(stderr, "[vt] EncodeFrame failed: %d\n", (int)status);
+        // Don't lose a keyframe request: the next frame carries it.
+        if (forced) keyframe_pending_.store(true);
         delete ctx;
         return false;
     }
@@ -339,17 +355,20 @@ void VTEncoder::output_callback(void* refcon,
     bool emit_config = is_keyframe;
     {
         std::lock_guard<std::mutex> lock(self->encode_mutex_);
-        if (!self->config_sent_) {
-            self->config_sent_ = true;
-            emit_config = true;
-        }
+        if (!self->config_sent_) emit_config = true;
     }
     if (emit_config) {
         CMFormatDescriptionRef fmt =
             CMSampleBufferGetFormatDescription(sample_buf);
-        if (fmt && ctx && ctx->on_packet) {
-            self->emit_config(fmt, timestamp_us, ctx->on_packet);
+        bool config_ok = fmt && ctx && ctx->on_packet &&
+                         self->emit_config(fmt, timestamp_us, ctx->on_packet);
+        if (!config_ok) {
+            // The decoder couldn't use this frame without its parameter sets;
+            // drop it (emit_config re-armed a keyframe for the next frame).
+            return;
         }
+        std::lock_guard<std::mutex> lock(self->encode_mutex_);
+        self->config_sent_ = true;
     }
 
     if (ctx && ctx->on_packet) {
@@ -357,12 +376,13 @@ void VTEncoder::output_callback(void* refcon,
     }
 }
 
-void VTEncoder::emit_config(CMFormatDescriptionRef fmt,
+bool VTEncoder::emit_config(CMFormatDescriptionRef fmt,
                             int64_t timestamp_us,
                             const std::function<void(const EncodedPacket&)>& on_packet) {
     std::vector<uint8_t> config_data;
 
     int param_count = codec_ == DS_CODEC_HEVC ? 3 : 2;
+    int extracted = 0;
     for (int i = 0; i < param_count; i++) {
         const uint8_t* param_ptr = nullptr;
         size_t param_len = 0;
@@ -375,6 +395,7 @@ void VTEncoder::emit_config(CMFormatDescriptionRef fmt,
                 fmt, i, &param_ptr, &param_len, nullptr, nullptr);
         }
         if (status == noErr && param_ptr && param_len > 0) {
+            extracted++;
             config_data.insert(config_data.end(),
                                kAnnexBStartCode, kAnnexBStartCode + 4);
             config_data.insert(config_data.end(),
@@ -382,7 +403,14 @@ void VTEncoder::emit_config(CMFormatDescriptionRef fmt,
         }
     }
 
-    if (config_data.empty()) return;
+    if (config_data.empty() || extracted < param_count) {
+        // Incomplete parameter sets would leave the decoder unable to use the
+        // keyframe that follows: skip it and make the next frame a keyframe.
+        fprintf(stderr, "[vt] incomplete parameter sets (%d/%d), retrying on next frame\n",
+                extracted, param_count);
+        keyframe_pending_.store(true);
+        return false;
+    }
 
     EncodedPacket pkt;
     pkt.data         = config_data.data();
@@ -391,6 +419,7 @@ void VTEncoder::emit_config(CMFormatDescriptionRef fmt,
     pkt.is_config    = true;
     pkt.timestamp_us = timestamp_us;
     on_packet(pkt);
+    return true;
 }
 
 void VTEncoder::emit_frame(
@@ -447,12 +476,34 @@ bool VTEncoder::set_bitrate(uint32_t bitrate_kbps) {
     int32_t bitrate_bps = (int32_t)(bitrate_kbps * 1000);
     CFNumberRef br = CFNumberCreate(kCFAllocatorDefault,
                                      kCFNumberSInt32Type, &bitrate_bps);
-    VTSessionSetProperty(session_,
+    OSStatus status = VTSessionSetProperty(session_,
         kVTCompressionPropertyKey_AverageBitRate, br);
     CFRelease(br);
+    // Keep the burst budget in step with the bitrate the AIMD controller chose.
+    apply_data_rate_limits(bitrate_bps);
 
-    fprintf(stderr, "[vt] bitrate -> %u kbps\n", bitrate_kbps);
-    return true;
+    fprintf(stderr, "[vt] bitrate -> %u kbps%s\n", bitrate_kbps,
+            status == noErr ? "" : " (rejected)");
+    return status == noErr;
+}
+
+void VTEncoder::apply_data_rate_limits(int32_t bitrate_bps) {
+    // Allow a 1.5x burst over a tight 100 ms window. A short window keeps the
+    // encoder from front-loading large frames and then going silent.
+    int64_t byte_limit = (int64_t)(bitrate_bps * 1.5 * 0.1 / 8);
+    double duration_s = 0.1;
+    CFNumberRef limit_bytes = CFNumberCreate(kCFAllocatorDefault,
+        kCFNumberSInt64Type, &byte_limit);
+    CFNumberRef limit_dur = CFNumberCreate(kCFAllocatorDefault,
+        kCFNumberFloat64Type, &duration_s);
+    CFNumberRef limits[] = { limit_bytes, limit_dur };
+    CFArrayRef limit_array = CFArrayCreate(kCFAllocatorDefault,
+        (const void**)limits, 2, &kCFTypeArrayCallBacks);
+    VTSessionSetProperty(session_,
+        kVTCompressionPropertyKey_DataRateLimits, limit_array);
+    CFRelease(limit_array);
+    CFRelease(limit_bytes);
+    CFRelease(limit_dur);
 }
 
 bool VTEncoder::force_keyframe() {

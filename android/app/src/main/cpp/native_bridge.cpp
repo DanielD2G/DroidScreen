@@ -30,6 +30,7 @@
 #include "touch_sender.h"
 #include "deck_sender.h"
 #include "key_sender.h"
+#include <sys/socket.h>
 #include "sps_patch.h"
 
 extern "C" {
@@ -62,6 +63,7 @@ extern "C" {
 typedef struct {
     ds_video_telemetry_t telemetry;
     int64_t recv_us;
+    uint64_t rx_seq;   /* receive order, for loss recovery (see enter_recovery) */
 } AndroidFrameTelemetry;
 
 /* Internal ring-buffer message size: [flags:u8][telemetry][nal payload] */
@@ -169,18 +171,37 @@ static int64_t now_us() {
 }
 
 /* ---- Loss recovery ----
- * A dropped P-frame breaks every later frame until the next IDR. When we
- * have to drop one we stop feeding P-frames (frozen image beats corrupted
- * image) and ask the desktop for a keyframe, rate-limited because the
- * desktop needs a frame interval or two to produce it. */
-static std::atomic<bool>    g_awaiting_keyframe{false};
+ * The desktop sends keyframes only on request: periodic ones were 20-40x a
+ * normal frame at 2560x1600 and caused a hitch every 2 s on Wi-Fi. So every
+ * way the decoder can lose references enters recovery here: session start,
+ * and any dropped or failed video *or config* packet. While recovering,
+ * dependent frames are skipped (a frozen picture beats a corrupted one) and a
+ * keyframe is requested. Requests are retried by a timer even if no video
+ * arrives, and if recovery doesn't complete in time the connection is dropped
+ * so a fresh handshake rebuilds encoder and decoder.
+ *
+ * Every video message gets a receive sequence (rx_seq). Recovery ends only
+ * when config and then a keyframe received *after* the newest loss were fed
+ * successfully, so a keyframe already queued before the loss can't end it. */
+static std::mutex           g_recovery_mutex;
+static bool                 g_recovering = false;        /* guarded */
+static uint64_t             g_loss_seq = 0;              /* guarded */
+static bool                 g_config_since_loss = false; /* guarded: decoder has usable config */
+static uint64_t             g_config_loss_seq = 0;       /* guarded: newest config loss / session start */
+static int64_t              g_recovery_start_us = 0;     /* guarded */
+static std::atomic<bool>    g_recovering_hint{false};    /* lock-free hot-path read */
 static std::atomic<int64_t> g_last_keyframe_request_us{0};
+static std::atomic<uint64_t> g_rx_seq{0};
+static constexpr int64_t kKeyframeRequestMinGapUs = 100000;   /* 100 ms */
+static constexpr int64_t kKeyframeRetryUs         = 250000;   /* 250 ms */
+static constexpr int64_t kRecoveryDeadlineUs      = 3000000;  /* 3 s */
 
 static void request_keyframe(const char* why) {
     int64_t now = now_us();
     int64_t last = g_last_keyframe_request_us.load(std::memory_order_relaxed);
-    if (now - last < 100000) return;
-    g_last_keyframe_request_us.store(now, std::memory_order_relaxed);
+    if (now - last < kKeyframeRequestMinGapUs) return;
+    /* One caller wins the slot; concurrent callers don't double-send. */
+    if (!g_last_keyframe_request_us.compare_exchange_strong(last, now)) return;
 
     int fd = g_client_fd;
     if (fd < 0) return;
@@ -191,26 +212,90 @@ static void request_keyframe(const char* why) {
     hdr.length = 1;
     ds_header_serialize(buf, &hdr);
     buf[DS_HEADER_SIZE] = DS_CTRL_REQUEST_KEYFRAME;
-    tcp_send_all(fd, buf, sizeof(buf));
-    LOGW("requesting keyframe (%s)", why);
+    if (tcp_send_all(fd, buf, sizeof(buf)) == 0) {
+        LOGW("requesting keyframe (%s)", why);
+    } else {
+        LOGE("keyframe request failed to send (%s)", why);
+    }
 }
 
-static void on_frame_dropped(const char* why) {
-    g_awaiting_keyframe.store(true, std::memory_order_release);
+/* A packet at or before receive sequence `seq` was lost or failed to decode. */
+static void enter_recovery(uint64_t seq, bool config_lost, const char* why) {
+    {
+        std::lock_guard<std::mutex> lock(g_recovery_mutex);
+        if (!g_recovering) {
+            g_recovering = true;
+            g_recovery_start_us = now_us();
+        }
+        if (seq > g_loss_seq) g_loss_seq = seq;
+        /* Only a lost config packet requires fresh parameter sets: the decoder
+         * keeps the ones it has otherwise (and Windows sends them only once). */
+        if (config_lost) {
+            g_config_since_loss = false;
+            if (seq > g_config_loss_seq) g_config_loss_seq = seq;
+        }
+        g_recovering_hint.store(true, std::memory_order_release);
+    }
     request_keyframe(why);
 }
 
-/* Returns true when this frame must be skipped because we are waiting for
- * a keyframe after a loss. Keyframes clear the wait. */
-static bool skip_until_keyframe(uint32_t mc_flags, int is_config) {
-    if (is_config) return false;
-    if (mc_flags & MC_BUFFER_FLAG_KEY_FRAME) {
-        g_awaiting_keyframe.store(false, std::memory_order_release);
-        return false;
+/* New session: the decoder has nothing yet; wait for config + keyframe. */
+static void reset_recovery_for_session() {
+    std::lock_guard<std::mutex> lock(g_recovery_mutex);
+    g_recovering = true;
+    g_recovery_start_us = now_us();
+    /* Anything still in flight from an older session can't end recovery. */
+    g_loss_seq = g_rx_seq.load(std::memory_order_acquire);
+    g_config_since_loss = false;   /* a new decoder has no parameter sets */
+    g_config_loss_seq = g_loss_seq;
+    g_last_keyframe_request_us.store(0, std::memory_order_relaxed);
+    g_recovering_hint.store(true, std::memory_order_release);
+}
+
+/* A packet was fed to the decoder successfully. */
+static void on_packet_fed(uint64_t seq, bool is_config, bool is_keyframe) {
+    if (!g_recovering_hint.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_recovery_mutex);
+    if (!g_recovering) return;
+    if (is_config) {
+        /* Config validity has its own watermark: an ordinary frame loss after
+         * this config was queued doesn't make it unusable. */
+        if (seq > g_config_loss_seq) g_config_since_loss = true;
+        return;
     }
-    if (!g_awaiting_keyframe.load(std::memory_order_acquire)) return false;
-    request_keyframe("waiting for keyframe");
-    return true;
+    if (seq <= g_loss_seq) return;
+    if (is_keyframe && g_config_since_loss) {
+        g_recovering = false;
+        g_recovering_hint.store(false, std::memory_order_release);
+        LOGI("recovered at keyframe (rx_seq=%llu) after %.0f ms",
+             (unsigned long long)seq, (now_us() - g_recovery_start_us) / 1000.0);
+    }
+}
+
+/* Called from the decode loop on every iteration: retries the request even if
+ * no video arrives, and gives up on the connection after the deadline. */
+static void recovery_tick() {
+    if (!g_recovering_hint.load(std::memory_order_acquire)) return;
+    bool deadline = false;
+    {
+        std::lock_guard<std::mutex> lock(g_recovery_mutex);
+        if (!g_recovering) return;
+        int64_t now = now_us();
+        if (now - g_recovery_start_us >= kRecoveryDeadlineUs) {
+            deadline = true;
+            g_recovery_start_us = now;  /* one shutdown per deadline */
+        }
+    }
+    if (deadline) {
+        int fd = g_client_fd;
+        LOGE("no keyframe within %lld ms; dropping the connection to resync",
+             (long long)(kRecoveryDeadlineUs / 1000));
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+        return;
+    }
+    if (now_us() - g_last_keyframe_request_us.load(std::memory_order_relaxed) >= kKeyframeRetryUs) {
+        request_keyframe("waiting for keyframe");
+    }
 }
 
 static uint8_t codec_cap_for_codec(uint8_t codec) {
@@ -782,17 +867,15 @@ static void* recv_thread_func(void* /*arg*/) {
             continue;
         }
 
-        g_decoder_direct_submit.store(
-            selection.hints.direct_submit && decoder_is_async(g_decoder),
-            std::memory_order_release);
+        /* Direct submit bypasses the decode thread's loss-recovery gate; all
+         * packets go through the ring so recovery has a single owner. */
+        g_decoder_direct_submit.store(false, std::memory_order_release);
         g_active_codec_id.store(selection.codec_id, std::memory_order_release);
         g_h264_constraints_only_sps.store(
             selection.hints.has_android_low_latency ||
                 selection.hints.is_qcom_c2 ||
                 selection.hints.is_qcom_omx,
             std::memory_order_release);
-        g_awaiting_keyframe.store(false, std::memory_order_release);
-        g_decoder_configured.store(true, std::memory_order_release);
         LOGI("recv_thread: accepted codec=%d direct_submit=%d",
              selection.codec_id,
              g_decoder_direct_submit.load(std::memory_order_relaxed) ? 1 : 0);
@@ -824,6 +907,11 @@ static void* recv_thread_func(void* /*arg*/) {
             continue;
         }
         LOGI("recv_thread: handshake complete");
+
+        /* Only now let the decode thread run: its first act is a keyframe
+         * request, and the desktop expects HANDSHAKE_RESP as the first message. */
+        reset_recovery_for_session();
+        g_decoder_configured.store(true, std::memory_order_release);
 
         /* Notify Java: connected and streaming */
         notify_status(STATUS_CONNECTED);
@@ -898,6 +986,8 @@ static void* recv_thread_func(void* /*arg*/) {
                     AndroidFrameTelemetry android_telemetry;
                     android_telemetry.telemetry = wire_telemetry;
                     android_telemetry.recv_us = recv_us;
+                    android_telemetry.rx_seq =
+                        g_rx_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
                     memcpy(video_msg_buf + 1, &android_telemetry,
                            sizeof(android_telemetry));
                     if (nal_len > 0) {
@@ -930,7 +1020,8 @@ static void* recv_thread_func(void* /*arg*/) {
                     if (!consumed && ring_buffer_write_message(
                             g_ring_buf, video_msg_buf, msg_len) != 0) {
                         LOGW("recv_thread: ring buffer full, dropping frame");
-                        on_frame_dropped("ring buffer full");
+                        enter_recovery(android_telemetry.rx_seq,
+                                       (hdr.flags & DS_FLAG_CONFIG) != 0, "ring buffer full");
                     } else {
                         /* Wake decode thread — new data available */
                         g_decode_cv.notify_one();
@@ -1212,7 +1303,7 @@ static bool feed_video_message_direct(const uint8_t* msg, size_t msg_len,
 
     if (!is_config) {
         remove_pending_telemetry(pts_us);
-        on_frame_dropped("direct feed failed");
+        enter_recovery(g_rx_seq.load(std::memory_order_acquire), false, "direct feed failed");
     }
     g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -1288,6 +1379,7 @@ static void* decode_thread_func(void* /*arg*/) {
 
         bool is_async = decoder_is_async(g_decoder);
         bool any_work = false;
+        recovery_tick();
 
         /* ---- 1. Drain output (both modes) ---- */
         int64_t rendered_pts_us = -1;
@@ -1339,7 +1431,9 @@ static void* decode_thread_func(void* /*arg*/) {
                 if (is_config) {
                     patch_h264_config_for_decoder(video_data, &nal_len);
                 }
-                if (skip_until_keyframe(mc_flags, is_config)) {
+                const bool is_key = (mc_flags & MC_BUFFER_FLAG_KEY_FRAME) != 0;
+                if (!is_config && !is_key &&
+                        g_recovering_hint.load(std::memory_order_acquire)) {
                     held_async_input_idx = input_idx;  /* reuse for the next NAL */
                     frames_skipped++;
                     g_stats_frames_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -1360,6 +1454,7 @@ static void* decode_thread_func(void* /*arg*/) {
                 if (ret == 0) {
                     frames_fed++;
                     g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
+                    on_packet_fed(frame_meta.rx_seq, is_config != 0, is_key);
                     if (!is_config) {
                         int64_t feed_us = now_us();
                         record_feed_latency(&frame_meta, feed_us);
@@ -1367,8 +1462,10 @@ static void* decode_thread_func(void* /*arg*/) {
                 } else {
                     if (!is_config) {
                         remove_pending_telemetry(pts_us);
-                        on_frame_dropped("async feed failed");
                     }
+                    /* Config loss too: later frames can't decode without it. */
+                    enter_recovery(frame_meta.rx_seq, is_config != 0,
+                                   is_config ? "async config feed failed" : "async feed failed");
                     feed_errors++;
                     g_stats_feed_errors.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -1395,7 +1492,9 @@ static void* decode_thread_func(void* /*arg*/) {
                 if (is_config) {
                     patch_h264_config_for_decoder(video_data, &nal_len);
                 }
-                if (skip_until_keyframe(mc_flags, is_config)) {
+                const bool is_key = (mc_flags & MC_BUFFER_FLAG_KEY_FRAME) != 0;
+                if (!is_config && !is_key &&
+                        g_recovering_hint.load(std::memory_order_acquire)) {
                     frames_skipped++;
                     g_stats_frames_skipped.fetch_add(1, std::memory_order_relaxed);
                     continue;
@@ -1429,12 +1528,15 @@ static void* decode_thread_func(void* /*arg*/) {
                         record_release_latency(rp, now_us());
                     }
                 }
-                if (ret != 0 && !is_config) {
-                    on_frame_dropped("decoder input busy");
+                if (ret != 0) {
+                    /* Config loss too: later frames can't decode without it. */
+                    enter_recovery(frame_meta.rx_seq, is_config != 0,
+                                   is_config ? "config feed failed" : "decoder input busy");
                 }
                 if (ret == 0) {
                     frames_fed++;
                     g_stats_frames_fed.fetch_add(1, std::memory_order_relaxed);
+                    on_packet_fed(frame_meta.rx_seq, is_config != 0, is_key);
                     if (!is_config) {
                         int64_t feed_us = now_us();
                         record_feed_latency(&frame_meta, feed_us);
